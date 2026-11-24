@@ -50,7 +50,7 @@ export function Button({
       {...rest}
     >
       {loading ? (
-        <Icon name="Loader2" size={16} className="animate-spin" />
+        <Icon name="Loader2" size={16} className="motion-safe:animate-spin" />
       ) : icon ? (
         <Icon name={icon} size={16} />
       ) : null}

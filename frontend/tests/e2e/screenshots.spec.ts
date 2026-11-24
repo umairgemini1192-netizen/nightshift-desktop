@@ -76,6 +76,7 @@ for (const mod of MODULES) {
 
 test("interactive shell: command palette and theme switching", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/settings?scenario=idle", { waitUntil: "networkidle" });
   await page.locator("main h1").waitFor({ state: "visible" });
 

@@ -50,7 +50,7 @@ export function StatusPill({ state, label }: StatusPillProps) {
       role="status"
       className={`inline-flex items-center gap-2 rounded-pill border px-3 py-1 text-xs font-medium ns-tabular ${cfg.toneClass}`}
     >
-      <Icon name={cfg.icon} size={16} className={cfg.pulse ? "animate-pulse" : undefined} />
+      <Icon name={cfg.icon} size={16} className={cfg.pulse ? "motion-safe:animate-pulse" : undefined} />
       <span>{label ?? cfg.text}</span>
     </span>
   );
