@@ -7,13 +7,14 @@ import { Shell } from "../src/app/Shell";
 import { useAppStore } from "../src/app/store";
 
 describe("Module registry and shell", () => {
-  it("discovers all five core module manifests dynamically", () => {
+  it("discovers all core module manifests dynamically (plus dev gallery in dev mode)", () => {
     const ids = MODULES.map((m) => m.id);
     expect(ids).toEqual([
       "mission-control",
       "plan-builder",
       "runs-history",
       "engines-quota",
+      "gallery",
       "settings",
     ]);
   });

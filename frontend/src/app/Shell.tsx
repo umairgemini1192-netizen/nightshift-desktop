@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
-import { motion, MotionConfig } from "framer-motion";
+import { motion, MotionConfig, useReducedMotion } from "framer-motion";
+import { GlassCard, Skeleton } from "../design";
 import { AuroraCanvas } from "./AuroraCanvas";
 import { CommandPalette } from "./CommandPalette";
 import { MODULES } from "./registry";
@@ -11,6 +12,7 @@ import { TopBar } from "./TopBar";
 
 export function Shell() {
   const location = useLocation();
+  const prefersReduced = useReducedMotion();
   const reinitializeBridge = useAppStore((s) => s.reinitializeBridge);
   const setSidebarCollapsedAuto = useAppStore((s) => s.setSidebarCollapsedAuto);
   const syncSystemTheme = useAppStore((s) => s.syncSystemTheme);
@@ -59,16 +61,16 @@ export function Shell() {
             <div className="mx-auto w-full max-w-content">
               <Suspense
                 fallback={
-                  <div className="ns-glass rounded-lg p-6 text-sm text-text-secondary">
-                    Loading module...
-                  </div>
+                  <GlassCard>
+                    <Skeleton lines={3} />
+                  </GlassCard>
                 }
               >
                 <motion.div
                   key={location.pathname}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.24 }}
+                  initial={prefersReduced ? { opacity: 0 } : { opacity: 0, y: 8 }}
+                  animate={prefersReduced ? { opacity: 1 } : { opacity: 1, y: 0 }}
+                  transition={{ duration: 0.24, ease: [0.16, 1, 0.3, 1] }}
                 >
                   <Routes>
                     {lazyPages.map(({ manifest, Component }) => (

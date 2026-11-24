@@ -1,7 +1,7 @@
 import type { ModuleManifest, ModuleSection } from "./moduleTypes";
 
 interface ManifestExport {
-  manifest: ModuleManifest;
+  manifest: ModuleManifest | null;
 }
 
 const rawModules = import.meta.glob<ManifestExport>("../modules/*/manifest.ts", {

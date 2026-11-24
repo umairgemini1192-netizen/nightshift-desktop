@@ -31,7 +31,7 @@ export function ToastHost() {
               transition={{ duration: 0.24 }}
               className="ns-glass-strong pointer-events-auto flex items-start gap-3 rounded-lg p-4"
             >
-              <Icon name={meta.icon} size={20} className={`mt-0.5 shrink-0 ${meta.cls}`} />
+              <Icon name={meta.icon} size={20} className={`mt-1 shrink-0 ${meta.cls}`} />
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium text-text-primary">{toast.title}</p>
                 {toast.description && (
