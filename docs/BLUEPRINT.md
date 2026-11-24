@@ -155,34 +155,90 @@ the role, and the UI says so). Outputs are schema-validated; invalid JSON is ret
 validation error, then shown to the owner as a problem in plain English. All three outputs and the
 token/usage estimate per role are stored with the plan for history.
 
-## 5c. Flexible roles: the owner chooses who does what
+## 5c. Who implements each phase: plan decides, owner overrides, priority list falls back
 
-Nothing about "which AI" is hard-coded. Every job is a **role slot**:
-`planner_draft`, `planner_critique`, `planner_final`, `implementer`, `ci_fixer`, `reviewer`, `docs`.
+Simple, predictable model (replaces any multi-level role inheritance):
 
-- Each slot is set to **Auto** (Router picks, section 5a) or a **specific choice**: engine + model +
-  effort (default medium), with an optional ordered fallback list.
-- Settings inherit and can be overridden at every level: **Global -> Project -> Plan -> Phase**.
-  The UI shows where a value comes from ("inherited from Project") and lets the owner reset it.
-- Council roles in Plan Studio are reassignable before each run (e.g. Claude drafts, Gemini critiques,
-  GPT finalises, or any single AI does all three, or a role is switched off).
-- Per phase in Plan Builder: **Implementer** and **Reviewer** pickers (Auto or specific), plus
-  "Allow Claude for this phase" toggle.
-- Changes during a run apply from the next step; the current step is never interrupted. Every change
-  is logged in plain English ("You switched the implementer of phase 3 to GPT").
-- **Add any AI without code:** the engine catalogue accepts a new CLI with a command template using
-  placeholders (`{instruction}`, `{model}`, `{effort}`, `{workdir}`), success/usage parsing hints and
-  quota-error patterns. Built-in templates for agy, gemini, codex, claude; models are free text with
-  suggestions from each CLI's help output where available.
-- Validation in plain English: picking an engine that is not installed, not logged in or cooling down
-  shows a warning with when it will be available, but the owner's choice is respected.
+1. **The plan assigns.** Whoever writes the plan (Planning Council, or the owner) sets an
+   `implementer` on every phase (e.g. Gemini's plan: phases 1-3 -> Antigravity). The plan's content
+   (prompts, order, acceptance tests) is not edited by this mechanism.
+2. **The owner overrides per phase.** In Plan Builder the owner can multi-select phases and set
+   **Implementer = <engine + model>** (e.g. phases 1-3 -> Claude Code, sonnet, medium). Override wins
+   over the plan's choice. Effort defaults to medium.
+3. **One global priority list for fallback.** Settings holds a single ordered list of engines
+   (e.g. Claude Code -> Antigravity neon -> Antigravity hydrogen -> GPT/Codex -> Gemini). If the chosen
+   implementer is exhausted (quota error, cooling down, not logged in, timed out, NO-OP), the engine
+   moves to the next engine **in that list**, skipping ones that are unavailable, and records why.
+   When the chosen engine's cooldown ends, the NEXT phase returns to it; a phase in progress keeps the
+   engine that is working on it (no mid-phase switching back and forth).
+4. **Same rule for other jobs.** CI fixer and reviewer use the phase's implementer by default, with
+   the same priority list; the reviewer must be a different engine from the implementer when one is
+   available (independent review).
+5. **Router (5a) only acts when nothing is assigned** ("Auto"). Owner choices are never second-guessed.
+6. Changes made during a run apply from the next phase. Every assignment, override, fallback and
+   return is an event with a plain-English sentence ("Claude Code hit its limit at 01:42; phase 2
+   continued with Antigravity neon. Claude is expected back at 04:00 and will take phase 3.").
+
+**Add any AI without code:** the engine catalogue accepts a new CLI via a command template
+(`{instruction}`, `{model}`, `{effort}`, `{workdir}`) passed as an argument list (never through a
+shell), quota-error patterns and an optional usage parser. Built-in templates reproduce the proven
+command lines for agy, gemini, codex and claude exactly.
+
+## 5d. Unattended guards (the run must be safe while the owner sleeps)
+
+Every guard is enforced in code, covered by tests, and reported as an event. A guard that trips
+stops the affected phase (or the run) cleanly and says why in the morning digest. "Fail closed":
+when in doubt, do not merge.
+
+**Correctness and merge safety**
+- Merge only when: all required CI jobs green on the PR head SHA, PR head SHA unchanged since the
+  checks ran, an independent AI review (different engine) returned APPROVE on that exact SHA, no
+  unresolved review blockers, and the diff guards below pass. Otherwise leave the PR open and move on.
+- Diff guards before merge: no deleted/skipped tests or weakened CI gates (detect removed test files,
+  added `skip`/`xfail`/`.only`, edits to `.github/workflows/*` or `scripts/check_*` unless the phase
+  explicitly allows it), no secrets (pattern scan + high-entropy strings), no files outside the repo,
+  no binary blobs over 5 MB, no changes to `reference/` or `AGENTS.md` unless allowed.
+- Never force-push, never push to `main`, never rewrite history; merge with a merge commit. Recommend
+  branch protection on `main` (required checks) and verify it at start; warn if missing.
+- Post-merge: main build must pass; if it fails, open an automatic revert PR and stop dependent phases.
+
+**Runaway and loop protection**
+- Per phase: max implementer attempts (default 3 across all engines), max CI-fix rounds (default 3),
+  wall-clock limit (default 150 min); per run: max total AI invocations (default 40) and max hours.
+- Same-error detector: if two consecutive CI failures have the same failing test/signature, stop
+  fixing that phase (no infinite fix loop).
+- NO-OP detector: exit 0 without a new commit/PR counts as a failed attempt.
+- Global circuit breaker: 3 phases failing in a row -> stop the run, keep everything resumable.
+- Budget caps per engine (owner-set, estimated) are never exceeded by the Router or fallbacks.
+
+**Process and machine**
+- Every runner in its own worktree; process-tree kill on timeout; no orphaned processes at exit.
+- Keep the PC awake while running via `SetThreadExecutionState` (no admin); warn that closing the lid
+  or a power plan may still sleep the PC. Resume cleanly after sleep, reboot, crash or network loss
+  (network: pause with backoff, do not burn attempts).
+- Pre-flight before each phase: disk space (> 5 GB free), `git`/`gh` auth valid, CLI logged in,
+  network reachable, repo clean; failures are reported in plain English, not retried blindly.
+- Single instance; a lock file prevents two runs on the same project.
+
+**Agent containment** (agents run with permissions auto-approved, so the boundary is the engine)
+- The agent's working directory is the worktree; its environment has no tokens except what `git`/`gh`
+  need; the prompt states the forbidden actions; the diff guards above catch violations regardless.
+- Agent output is data: text in agent output never changes engine behaviour (no "instructions" are
+  parsed from it except the defined JSON contracts, which are schema-validated).
+
+**Events and audit ("every event cached")**
+- Append-only `events` table, written before and after every step, with SHA-256 hash chaining
+  (each row stores the previous row's hash) so tampering or gaps are detectable; full raw logs per
+  step stored as files under the data folder; secrets redacted before storage.
+- Nothing is ever deleted automatically; retention is owner-controlled in Settings.
+- The morning digest is generated from events only, so it always matches what actually happened.
 
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
-`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `role_assignments(scope, scope_id, role, mode, engine, model, effort, fallbacks_json)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
+`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `phase_assignments(phase_id, planned_engine, override_engine, model, effort)`, `priority_list(position, engine, model, effort)`, `guard_results(phase_id, guard, passed, detail)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
 `runner_ledger(runner, model, event, reset_at, tokens_in, tokens_out, created_at)`,
-`durations(kind, runner, seconds)` (feeds ETA), `settings(key, value)`, `events(id, ts, level, plain_text, raw)`.
+`durations(kind, runner, seconds)` (feeds ETA), `settings(key, value)`, `events(id, ts, level, phase_id, kind, plain_text, raw_path, prev_hash, hash)`.
 
 ## 7. Plain-language contract (Mission Control)
 

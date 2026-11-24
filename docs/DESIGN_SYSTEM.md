@@ -79,7 +79,7 @@ A `/gallery` route (dev builds and CI only) renders every component in every sta
 AI: Antigravity (Gemini is cooling down until 03:10)", and the always-visible **Stop After Current Phase**
 button (secondary; becomes "Will stop after this phase - Undo" when armed). Right column (span 4):
 Quota card ("~65% left, estimate from local ledger") per engine, and Problems card (plain English + what
-the app is doing). Row 2: `PhaseTimeline` (span 5) + `StepFeed` (span 7). Nothing else.
+the app is doing). Row 2: `PhaseTimeline` (span 5) + `StepFeed` (span 7). A Guards strip under the hero shows green checks (CI, review, diff guards, budget) for the current phase and turns amber/red in plain English when one trips. Nothing else.
 
 **Plan Studio (AI Planning Council).** Step 1: a large "Describe what you want built" text area plus
 project picker. Step 2: three role cards side by side (Draft - Gemini, Critique - GPT, Final - Claude),
@@ -88,7 +88,7 @@ estimate; the active card has the breathing glow. Step 3: plan diff view (draft 
 notes as margin comments, inline edit, plain-English trade-off summary, and **Approve and send to Plan
 Builder** (primary) / Regenerate (secondary).
 
-**Plan Builder.** Left: phase list (drag to reorder, dependency chips, ladder chip, timeout). Right:
+**Plan Builder.** Left: phase list (drag to reorder, dependency chips, timeout) with an **Implementer** column showing the plan's choice and, when overridden, the owner's choice with an "Overridden" badge; multi-select phases -> "Set implementer" (engine + model + effort) / "Reset to plan". Right:
 editor for the selected phase (title, prompt in CodeEditor, ladder select, branch auto-filled,
 auto-merge / release toggles). Top: Validate (shows plain-English problems) and Start run. Import /
 export legacy `queue.json`.
@@ -99,7 +99,7 @@ digest, per-phase timeline, PR links, artifacts.
 **AI Engines & Quota.** `EngineCard` grid with skill scores and budget sliders; a "Router decisions" list showing who was chosen for each recent step and why; ladder editor per category (drag order, Claude pinned last
 with a note); effort default "medium"; ledger history chart (estimates).
 
-**Settings.** Projects (repo, local path, build rules text, artifact glob, output folder), theme,
+**Settings.** Fallback priority list (drag to order engines; shows live availability and "back at HH:MM"), guard limits (attempts, CI-fix rounds, per-run AI calls, hours) with safe defaults, projects (repo, local path, build rules text, artifact glob, output folder), theme,
 autostart (per-user), notifications, keep-awake while running, data folder, about/version.
 
 ## 5. Writing (UX copy)
