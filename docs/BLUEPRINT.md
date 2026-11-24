@@ -107,7 +107,7 @@ Per project (a project = repo + local path + build rules + artifact rules + ladd
 5. Run the ladder: for each runner, run with timeout (kill the whole process tree on timeout), then
    verify the deliverable. Quota/rate errors -> record in ledger with reset time -> cooldown -> next runner.
 6. Watch CI; on failure, ask the ladder to fix (max N retries), verify that a new commit was pushed.
-7. Merge (if auto_merge), wait for post-merge main build, release (if release_after_merge) by
+7. Merge per section 5d (risk-based review, self-healing; never waits idle) (if auto_merge), wait for post-merge main build, release (if release_after_merge) by
    downloading the build artifact matching the project's `artifact_glob`, publishing a GitHub release
    with SHA256SUMS, copying it to the project's output folder.
 8. Write a plain-language morning digest.
@@ -155,88 +155,140 @@ the role, and the UI says so). Outputs are schema-validated; invalid JSON is ret
 validation error, then shown to the owner as a problem in plain English. All three outputs and the
 token/usage estimate per role are stored with the plan for history.
 
-## 5c. Who implements each phase: plan decides, owner overrides, priority list falls back
+## 5c. Who implements each phase: plan decides, owner overrides, priority list keeps it moving
 
-Simple, predictable model (replaces any multi-level role inheritance):
+Owner's principle: **no time is ever lost waiting for one AI.** The run keeps moving all night.
 
-1. **The plan assigns.** Whoever writes the plan (Planning Council, or the owner) sets an
-   `implementer` on every phase (e.g. Gemini's plan: phases 1-3 -> Antigravity). The plan's content
-   (prompts, order, acceptance tests) is not edited by this mechanism.
-2. **The owner overrides per phase.** In Plan Builder the owner can multi-select phases and set
-   **Implementer = <engine + model>** (e.g. phases 1-3 -> Claude Code, sonnet, medium). Override wins
-   over the plan's choice. Effort defaults to medium.
-3. **One global priority list for fallback.** Settings holds a single ordered list of engines
-   (e.g. Claude Code -> Antigravity neon -> Antigravity hydrogen -> GPT/Codex -> Gemini). If the chosen
-   implementer is exhausted (quota error, cooling down, not logged in, timed out, NO-OP), the engine
-   moves to the next engine **in that list**, skipping ones that are unavailable, and records why.
-   When the chosen engine's cooldown ends, the NEXT phase returns to it; a phase in progress keeps the
-   engine that is working on it (no mid-phase switching back and forth).
-4. **Same rule for other jobs.** CI fixer and reviewer use the phase's implementer by default, with
-   the same priority list; the reviewer must be a different engine from the implementer when one is
-   available (independent review).
-5. **Router (5a) only acts when nothing is assigned** ("Auto"). Owner choices are never second-guessed.
-6. Changes made during a run apply from the next phase. Every assignment, override, fallback and
-   return is an event with a plain-English sentence ("Claude Code hit its limit at 01:42; phase 2
-   continued with Antigravity neon. Claude is expected back at 04:00 and will take phase 3.").
+1. **The plan assigns** an `implementer` per phase (e.g. Gemini's plan: phases 1-3 -> Antigravity).
+   The plan's content is not edited by this mechanism.
+2. **The owner overrides per phase** in Plan Builder (multi-select -> Set implementer, e.g. phases 1-3
+   -> Claude Code, sonnet, medium). Override wins. Effort defaults to medium.
+3. **One global priority list** in Settings (e.g. Claude Code -> Antigravity neon -> Antigravity
+   hydrogen -> GPT/Codex -> Gemini) decides who takes over, skipping unavailable engines.
+4. **Mid-phase handoff (switch immediately, lose nothing).** When the working AI is exhausted
+   (quota error, cooling down, timeout, NO-OP, crash) in the middle of a phase:
+   - The engine checkpoints first: commits all work in the worktree as a WIP commit
+     (`nightshift: checkpoint <phase> <engine> <time>`) and pushes it to the phase branch.
+   - It writes `.nightshift/handoff.md` in the worktree (excluded from the PR diff via
+     `.git/info/exclude`): goal, done so far (from `git diff --stat` and the AI's last output tail),
+     remaining acceptance tests, last CI failure if any.
+   - The next available engine on the priority list continues **the same phase on the same branch**
+     with the original prompt + the handoff note. WIP commits are squashed by the merge-commit PR.
+5. **Fast switch-back.** The preferred engine (owner override, else plan choice) is re-checked at every
+   invocation boundary (each implement attempt, each CI-fix round, each review-fix round). As soon as
+   its cooldown has ended it takes over again via the same checkpoint + handoff. A working process is
+   never killed just to switch back (that would waste the tokens already spent); boundaries come
+   often because each fix round is a separate invocation. Optional setting "aggressive switch-back":
+   cap a fallback engine's single invocation at 30 min while the preferred engine is cooling down,
+   so control returns sooner.
+6. **Same rule for other jobs.** CI fixer and reviewer follow the priority list; the reviewer is a
+   different engine from the last implementer when one is available.
+7. **Router (5a) only acts when nothing is assigned** ("Auto"). Owner choices are never second-guessed.
+8. Every assignment, override, handoff and switch-back is an event with a plain-English sentence
+   ("Claude Code hit its limit at 01:42; Antigravity continued phase 2 from Claude's checkpoint.
+   Claude came back at 04:00 and took over at the next fix round.").
 
 **Add any AI without code:** the engine catalogue accepts a new CLI via a command template
 (`{instruction}`, `{model}`, `{effort}`, `{workdir}`) passed as an argument list (never through a
 shell), quota-error patterns and an optional usage parser. Built-in templates reproduce the proven
 command lines for agy, gemini, codex and claude exactly.
 
-## 5d. Unattended guards (the run must be safe while the owner sleeps)
+## 5d. Self-healing delivery and guards (speed first, maximum caution where it matters)
 
-Every guard is enforced in code, covered by tests, and reported as an event. A guard that trips
-stops the affected phase (or the run) cleanly and says why in the morning digest. "Fail closed":
-when in doubt, do not merge.
+Principle: **solve, don't wait.** A problem triggers an automatic fix path; the run only parks a phase
+after every fix path is exhausted, and even then keeps working on everything that does not depend on it.
 
-**Correctness and merge safety**
-- Merge only when: all required CI jobs green on the PR head SHA, PR head SHA unchanged since the
-  checks ran, an independent AI review (different engine) returned APPROVE on that exact SHA, no
-  unresolved review blockers, and the diff guards below pass. Otherwise leave the PR open and move on.
-- Diff guards before merge: no deleted/skipped tests or weakened CI gates (detect removed test files,
-  added `skip`/`xfail`/`.only`, edits to `.github/workflows/*` or `scripts/check_*` unless the phase
-  explicitly allows it), no secrets (pattern scan + high-entropy strings), no files outside the repo,
-  no binary blobs over 5 MB, no changes to `reference/` or `AGENTS.md` unless allowed.
-- Never force-push, never push to `main`, never rewrite history; merge with a merge commit. Recommend
-  branch protection on `main` (required checks) and verify it at start; warn if missing.
-- Post-merge: main build must pass; if it fails, open an automatic revert PR and stop dependent phases.
+**Self-healing merge pipeline**
+- CI fails -> CI fixer (priority list) gets the failing log and fixes; repeat up to the limit,
+  rotating to a different engine after 2 failed rounds by the same engine (fresh eyes).
+- Merge conflict with `main` -> automatic rebase-free update: merge `origin/main` into the branch,
+  let the implementer resolve conflicts, re-run CI.
+- Review (when required, see risk-based review) returns CHANGES -> the implementer fixes exactly those
+  findings, then a quick re-review of the new diff only.
+- Flaky test (fails then passes on re-run with no code change) -> re-run once automatically, record
+  it as flaky in the digest, do not burn a fix round.
+- **Never block the night:** if a phase is still not mergeable after all fix paths, it is **parked**
+  (PR left open with a plain-English reason and the best next step), and:
+  - independent phases continue immediately;
+  - dependent phases continue as **stacked PRs** on top of the parked branch (based on it, not on
+    `main`), so work keeps progressing; they merge automatically, in order, once the parked phase is
+    fixed (by a later fix round, the next night, or the owner).
 
-**Runaway and loop protection**
-- Per phase: max implementer attempts (default 3 across all engines), max CI-fix rounds (default 3),
-  wall-clock limit (default 150 min); per run: max total AI invocations (default 40) and max hours.
-- Same-error detector: if two consecutive CI failures have the same failing test/signature, stop
-  fixing that phase (no infinite fix loop).
+**Risk-based review (fast by default, careful where it counts)**
+- Every diff gets a risk score from changed paths and content. Project setting
+  `critical_paths` (glob list) plus built-in critical signals: auth/login, encryption/keys,
+  permissions (e.g. AndroidManifest permissions), payments, data deletion/migrations, file-system
+  writes outside app data, network/security config, build and CI config, dependency additions.
+- **Low risk** (no critical signal): merge as soon as all required CI checks are green on the head SHA
+  and the diff guards pass. No AI review, no waiting.
+- **Critical**: one independent AI review (single call, medium effort, different engine) limited to the
+  critical files; APPROVE -> merge; CHANGES -> self-heal loop above.
+- The digest and the deck list every critical change and its review result in one line each.
+
+**Hard guards (always on, never skipped)**
+- Nothing pushes to `main` directly; no force-push; no history rewrite. GitHub branch protection on
+  `main` (required CI checks, no force-push, no deletion) is verified at start; the run warns on the
+  deck if it is missing.
+- Merge only with all required checks green on the exact head SHA.
+- Diff guards: no deleted/skipped tests or weakened CI gates (removed test files, new
+  `skip`/`xfail`/`.only`, edits to `.github/workflows/*` or `scripts/check_*` unless the phase allows
+  it), no secrets (patterns + high entropy), no files outside the repo, no binaries over 5 MB.
+  A tripped diff guard sends the phase back to the implementer with the exact finding (self-heal),
+  it is not silently merged.
+- Post-merge `main` build fails -> automatic revert PR (merged on green) + the phase re-queued with
+  the failure log; dependent phases rebase onto the reverted `main`.
+
+**Runaway protection**
+- Per phase: max implementer attempts across all engines (default 4), max CI-fix rounds (default 4),
+  wall-clock limit (default 180 min); per run: max total AI invocations (default 60) and max hours.
+- Same-error detector: identical failure signature twice in a row from the same engine -> rotate engine;
+  identical across 3 engines -> park the phase.
 - NO-OP detector: exit 0 without a new commit/PR counts as a failed attempt.
-- Global circuit breaker: 3 phases failing in a row -> stop the run, keep everything resumable.
-- Budget caps per engine (owner-set, estimated) are never exceeded by the Router or fallbacks.
+- Circuit breaker: 3 phases parked in a row -> stop starting new phases (stacked work stays resumable).
+- Owner-set budget caps per engine (estimated) are never exceeded by the Router or fallbacks.
 
 **Process and machine**
 - Every runner in its own worktree; process-tree kill on timeout; no orphaned processes at exit.
-- Keep the PC awake while running via `SetThreadExecutionState` (no admin); warn that closing the lid
-  or a power plan may still sleep the PC. Resume cleanly after sleep, reboot, crash or network loss
-  (network: pause with backoff, do not burn attempts).
+- Keep the PC awake while running via `SetThreadExecutionState` (no admin); the deck warns that closing
+  the lid may still sleep the PC. Resume cleanly after sleep, reboot, crash or network loss
+  (network loss: pause with backoff, does not burn attempts).
 - Pre-flight before each phase: disk space (> 5 GB free), `git`/`gh` auth valid, CLI logged in,
-  network reachable, repo clean; failures are reported in plain English, not retried blindly.
+  network reachable, repo clean.
 - Single instance; a lock file prevents two runs on the same project.
 
 **Agent containment** (agents run with permissions auto-approved, so the boundary is the engine)
-- The agent's working directory is the worktree; its environment has no tokens except what `git`/`gh`
-  need; the prompt states the forbidden actions; the diff guards above catch violations regardless.
-- Agent output is data: text in agent output never changes engine behaviour (no "instructions" are
-  parsed from it except the defined JSON contracts, which are schema-validated).
+- Working directory = the worktree; environment carries only what `git`/`gh` need; forbidden actions
+  stated in the prompt; diff guards catch violations regardless.
+- Agent output is data: only the defined JSON contracts are parsed (schema-validated); free text in
+  agent output never changes engine behaviour.
 
-**Events and audit ("every event cached")**
-- Append-only `events` table, written before and after every step, with SHA-256 hash chaining
-  (each row stores the previous row's hash) so tampering or gaps are detectable; full raw logs per
-  step stored as files under the data folder; secrets redacted before storage.
-- Nothing is ever deleted automatically; retention is owner-controlled in Settings.
-- The morning digest is generated from events only, so it always matches what actually happened.
+**Events and audit**
+- Append-only `events` table, written before and after every step, SHA-256 hash-chained; full raw logs
+  per step as files; secrets redacted; nothing deleted automatically.
+- The morning digest is generated from events only.
+
+## 5e. The deck: what the owner sees (simple words, no reading required)
+
+The owner has no time to review details. Mission Control and the morning digest show only what
+matters, in plain words, in this order:
+
+1. **One-line headline**: "All good - 4 of 6 phases merged, 2 still running, finishing ~05:30 (estimate)."
+   or "Needs you - 1 phase parked: login change failed review twice."
+2. **Needs your attention** (only if non-empty, max 3 items, each one sentence + one button):
+   parked phases, critical changes merged, budget caps reached, machine warnings.
+3. **Done tonight**: one line per merged phase ("Phase 3 Widget fixes - merged, built by Claude +
+   Antigravity, release preview.44 ready").
+4. **Now / Next / ETA** with the working AI and why.
+5. **AI usage tonight**: per engine one bar + "~% of budget used (estimate)" and handoff count.
+6. Everything else (raw logs, every event, every guard result) sits behind "Details".
+
+Notifications (Windows toast) only for: run finished, a phase parked, circuit breaker tripped, PC about
+to lose power or network for more than 10 min. Never for routine progress.
 
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
-`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `phase_assignments(phase_id, planned_engine, override_engine, model, effort)`, `priority_list(position, engine, model, effort)`, `guard_results(phase_id, guard, passed, detail)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
+`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `phase_assignments(phase_id, planned_engine, override_engine, model, effort)`, `priority_list(position, engine, model, effort)`, `guard_results(phase_id, guard, passed, detail)`, `handoffs(phase_id, from_engine, to_engine, reason, checkpoint_sha, ts)`, `parked(phase_id, reason, next_step, stacked_children_json)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
 `runner_ledger(runner, model, event, reset_at, tokens_in, tokens_out, created_at)`,
 `durations(kind, runner, seconds)` (feeds ETA), `settings(key, value)`, `events(id, ts, level, phase_id, kind, plain_text, raw_path, prev_hash, hash)`.
 

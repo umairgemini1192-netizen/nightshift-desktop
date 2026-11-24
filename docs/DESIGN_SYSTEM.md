@@ -74,12 +74,16 @@ A `/gallery` route (dev builds and CI only) renders every component in every sta
 
 ## 4. Key screens
 
-**Mission Control (home).** Row 1: hero `GlassCard` (span 8) with `ProgressRing` (overall %),
-"Now doing" sentence (lg), "Next" line, ETA line "~1 h 20 m left (estimate from past runs)", "Working
-AI: Antigravity (Gemini is cooling down until 03:10)", and the always-visible **Stop After Current Phase**
-button (secondary; becomes "Will stop after this phase - Undo" when armed). Right column (span 4):
-Quota card ("~65% left, estimate from local ledger") per engine, and Problems card (plain English + what
-the app is doing). Row 2: `PhaseTimeline` (span 5) + `StepFeed` (span 7). A Guards strip under the hero shows green checks (CI, review, diff guards, budget) for the current phase and turns amber/red in plain English when one trips. Nothing else.
+**Mission Control (home).** Content and order follow BLUEPRINT section 5e exactly. Top: one-line
+headline (display, xl) with a StatusPill ("All good" / "Needs you" / "Working"). Then, only when
+non-empty, a **Needs your attention** card (max 3 one-sentence items, each with one action button).
+Row: hero `GlassCard` (span 8) with `ProgressRing` (overall %), Now doing, Next, ETA "(estimate)" when
+estimated, Working AI + why (including handoffs: "Antigravity continuing from Claude's checkpoint"),
+and the always-visible **Stop After Current Phase** button (armed state with Undo); right column
+(span 4): AI usage tonight (bar per engine, "~% of budget used (estimate)", handoff count).
+Row: **Done tonight** list (one line per merged/parked phase) (span 5) + `StepFeed` (span 7) whose
+plain-English lines hide raw logs behind "Details". A slim Guards strip under the hero shows checks
+for the current phase and turns amber/red in plain English when one trips. Nothing else.
 
 **Plan Studio (AI Planning Council).** Step 1: a large "Describe what you want built" text area plus
 project picker. Step 2: three role cards side by side (Draft - Gemini, Critique - GPT, Final - Claude),
