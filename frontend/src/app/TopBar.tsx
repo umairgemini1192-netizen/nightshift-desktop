@@ -7,11 +7,17 @@ export function TopBar() {
   const selectProject = useAppStore((s) => s.selectProject);
   const openCommandPalette = useAppStore((s) => s.openCommandPalette);
 
+  const isLive = snapshot.runState === "running";
+
   return (
     <header className="pywebview-drag-region ns-glass-strong z-20 flex h-topbar shrink-0 items-center justify-between gap-4 border-b border-border-subtle px-4">
-      <div className="flex items-center gap-4 min-w-0">
-        <div className="flex items-center gap-2 shrink-0">
-          <span className="flex h-8 w-8 items-center justify-center rounded-md bg-accent-primary-soft text-accent-primary">
+      <div className="flex min-w-0 items-center gap-4">
+        <div className="flex shrink-0 items-center gap-2">
+          <span
+            className={`flex h-8 w-8 items-center justify-center rounded-md border border-border-subtle bg-accent-primary-soft text-accent-primary ${
+              isLive ? "ns-live-glow shadow-glow-accent" : ""
+            }`}
+          >
             <Icon name="Radar" size={20} />
           </span>
           <span className="font-display text-md font-semibold tracking-tight text-text-primary">

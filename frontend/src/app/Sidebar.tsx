@@ -1,4 +1,5 @@
 import { NavLink, useLocation } from "react-router-dom";
+import { motion, useReducedMotion } from "framer-motion";
 import { Badge, Icon } from "../design";
 import type { ModuleManifest, ModuleSection } from "./moduleTypes";
 import { getModulesBySection, MODULES } from "./registry";
@@ -15,8 +16,12 @@ export function Sidebar() {
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const snapshot = useAppStore((s) => s.snapshot);
   const location = useLocation();
+  const prefersReduced = useReducedMotion();
 
   const settingsModules = getModulesBySection(MODULES, "settings");
+  const layoutTransition = prefersReduced
+    ? { duration: 0 }
+    : { duration: 0.24, ease: [0.16, 1, 0.3, 1] as const };
 
   const renderItem = (mod: ModuleManifest) => {
     const badge = mod.statusBadge?.(snapshot) ?? null;
@@ -29,30 +34,44 @@ export function Sidebar() {
         end={mod.route === "/"}
         title={collapsed ? mod.title : undefined}
         className={({ isActive }) =>
-          `group flex items-center gap-3 rounded-pill px-3 py-2 text-sm font-medium transition-all duration-fast ease-out ${
+          `group relative flex items-center gap-3 rounded-pill px-3 py-2 text-sm font-medium transition-colors duration-fast ease-out focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring ${
             isActive
-              ? "bg-accent-primary-soft text-accent-primary shadow-glow-accent"
+              ? "text-accent-primary"
               : "text-text-secondary hover:bg-surface-raised hover:text-text-primary"
           } ${collapsed ? "justify-center px-2" : "justify-between"}`
         }
       >
-        <span className="flex items-center gap-3 min-w-0">
-          <Icon name={mod.icon} size={20} className="shrink-0" />
-          {!collapsed && <span className="truncate">{mod.title}</span>}
-        </span>
-        {!collapsed && badge && (
-          <Badge tone={badge.tone} className="shrink-0">
-            {badge.label}
-          </Badge>
+        {({ isActive }) => (
+          <>
+            {isActive && (
+              <motion.span
+                layoutId="sidebar-active-pill"
+                transition={layoutTransition}
+                aria-hidden="true"
+                className="absolute inset-0 rounded-pill bg-accent-primary-soft shadow-glow-accent"
+              />
+            )}
+            <span className="relative z-10 flex min-w-0 items-center gap-3">
+              <Icon name={mod.icon} size={20} className="shrink-0" />
+              {!collapsed && <span className="truncate">{mod.title}</span>}
+            </span>
+            {!collapsed && badge && (
+              <Badge tone={badge.tone} className="relative z-10 shrink-0">
+                {badge.label}
+              </Badge>
+            )}
+          </>
         )}
       </NavLink>
     );
   };
 
   return (
-    <aside
+    <motion.aside
+      layout={!prefersReduced}
+      transition={layoutTransition}
       aria-label="Sidebar"
-      className={`ns-glass z-10 flex shrink-0 flex-col justify-between border-r border-border-subtle transition-all duration-base ease-out ${
+      className={`ns-glass z-10 flex shrink-0 flex-col justify-between border-r border-border-subtle ${
         collapsed ? "w-sidebar-collapsed" : "w-sidebar"
       }`}
     >
@@ -81,7 +100,7 @@ export function Sidebar() {
           onClick={toggleSidebar}
           aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           aria-expanded={!collapsed}
-          className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm text-text-secondary transition-colors duration-fast hover:bg-surface-raised hover:text-text-primary ${
+          className={`flex items-center gap-3 rounded-md px-3 py-2 text-sm text-text-secondary transition-colors duration-fast hover:bg-surface-raised hover:text-text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus-ring ${
             collapsed ? "justify-center px-2" : ""
           }`}
         >
@@ -89,6 +108,6 @@ export function Sidebar() {
           {!collapsed && <span>Collapse</span>}
         </button>
       </div>
-    </aside>
+    </motion.aside>
   );
 }

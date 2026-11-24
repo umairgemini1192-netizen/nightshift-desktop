@@ -100,6 +100,16 @@
   }
 }
 
+@keyframes ns-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.85;
+  }
+}
+
 .ns-aurora-orb-a {
   background: radial-gradient(circle at center, var(--aurora-a) 0%, transparent 70%);
   animation: ns-aurora-drift-a var(--duration-ambient) var(--easing-inOut) infinite;
@@ -125,6 +135,10 @@
   animation: ns-breath-glow 2.4s var(--easing-inOut) infinite;
 }
 
+.ns-skeleton {
+  animation: ns-skeleton-pulse 1.6s var(--easing-inOut) infinite;
+}
+
 .pywebview-drag-region {
   -webkit-app-region: drag;
 }
@@ -137,7 +151,8 @@
   .ns-aurora-orb-a,
   .ns-aurora-orb-b,
   .ns-aurora-orb-c,
-  .ns-live-glow {
+  .ns-live-glow,
+  .ns-skeleton {
     animation: none;
   }
 }

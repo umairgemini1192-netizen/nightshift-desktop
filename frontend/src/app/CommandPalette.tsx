@@ -150,7 +150,12 @@ export function CommandPalette() {
           <Kbd>Esc</Kbd>
         </div>
 
-        <ul role="listbox" aria-label="Commands" className="max-h-64 overflow-y-auto p-2">
+        <ul
+          role="listbox"
+          aria-label="Commands"
+          className="overflow-y-auto p-2"
+          style={{ maxHeight: "16rem" }}
+        >
           {filtered.length === 0 ? (
             <li className="px-4 py-6 text-center text-sm text-text-muted">
               No matching commands.
