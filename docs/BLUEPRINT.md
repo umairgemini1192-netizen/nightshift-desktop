@@ -163,8 +163,7 @@ Owner's principle: **no time is ever lost waiting for one AI.** The run keeps mo
    The plan's content is not edited by this mechanism.
 2. **The owner overrides per phase** in Plan Builder (multi-select -> Set implementer, e.g. phases 1-3
    -> Claude Code, sonnet, medium). Override wins. Effort defaults to medium.
-3. **One global priority list** in Settings (e.g. Claude Code -> Antigravity neon -> Antigravity
-   hydrogen -> GPT/Codex -> Gemini) decides who takes over, skipping unavailable engines.
+3. **One global priority list** in Settings (default follows the tiers of 5h: Economy -> Standard -> Gold) decides who takes over, skipping unavailable engines.
 4. **Mid-phase handoff (switch immediately, lose nothing).** When the working AI is exhausted
    (quota error, cooling down, timeout, NO-OP, crash) in the middle of a phase:
    - The engine checkpoints first: commits all work in the worktree as a WIP commit
@@ -356,10 +355,59 @@ isolated, and kept only if measurement on the owner's own runs proves a net savi
 command output, not the total bill; agy-fast's -31% is the author's small-sample claim. The deck shows
 "tokens saved (estimate)" per tool and per night.
 
+## 5h. Economy first: small jobs never burn the gold (owner rule, 2026-11-25)
+
+Owner's principle: **use the cheapest capable AI for each job; premium quota is gold and is spent
+only where it is needed.** Sending code to Chinese-hosted model services is explicitly allowed by the
+owner. The machine has 8 GB RAM, so no local models (Ollama) are used.
+
+**Engine tiers** (owner can re-order inside a tier; defaults below, all effort medium):
+
+| Tier | Engines | Use for |
+|---|---|---|
+| **Economy** | Qwen Code (Qwen Coder, free sign-in tier), DeepSeek, Kimi K2, GLM, MiniMax | Small and medium jobs (see sizing) |
+| **Standard** | Antigravity (neon, hydrogen), Gemini CLI, Codex/GPT | Large jobs, and escalation from Economy |
+| **Gold** | Claude Code | Only critical/large jobs that Standard could not finish, or final plan review |
+
+**How economy engines run (no admin, per-run only):**
+- Qwen Code: its own CLI (`qwen -p ...` headless, YOLO approval), installed by the app's tool manager
+  into `%LOCALAPPDATA%\NightShift\tools\` at a pinned version (rules of section 5g); free-tier login is
+  done once by the owner via the Logins "Fix" button.
+- DeepSeek, Kimi, GLM, MiniMax: run through the already-installed Claude Code CLI pointed at the
+  provider's Anthropic-compatible endpoint **for that one process only** via environment variables
+  (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`).
+  Never written to `~/.claude` settings, so the owner's normal Claude Code is untouched. Endpoint and
+  model names are entries in the engine catalogue (editable, verified with the Test button); API keys
+  are entered by the owner in Settings and stored with Windows DPAPI (current user), never in the repo,
+  logs or prompts.
+- Each economy engine is checked by Login health (5f) like any other.
+
+**Job sizing (decides the starting tier):**
+- **Small** -> Economy: CI-fix rounds with a short failing log; diff-guard findings; review-findings
+  fixes; docs, copy and PR-description fixes; UI-contract evidence; a phase whose plan estimates
+  <= 3 files or <= ~200 changed lines; low-risk reviews; plan critique.
+- **Medium** -> Economy first, escalate on failure: phases estimating <= 8 files with no critical paths.
+- **Large / critical** -> Standard first: multi-module features, UI overhauls, anything touching
+  critical paths (5d risk list), dependency or build-system changes, security-sensitive code.
+- The planner writes `size` (small/medium/large) per phase; the engine re-estimates from the actual
+  diff after the first attempt. Owner override per phase (5c) always wins.
+
+**Escalation ladder (no time lost):** start tier -> next engine in the same tier -> next tier.
+Escalate immediately on: quota/limit, NO-OP, the same failure twice, a tripped diff guard that the
+economy engine could not fix, or wall-clock budget for that tier (default 45 min for small, 90 min for
+medium). Escalation uses the checkpoint + handoff of 5c, so the stronger engine continues from the
+economy engine's work. Gold is reached only after Standard is exhausted or failed, or for final plan
+review, and only within the owner's Gold budget.
+
+**Measured, not assumed:** per engine the ledger tracks success rate, attempts, time and estimated cost
+per job size. If an economy engine's success rate for a size falls below 60% over the last 10 jobs,
+the Router starts that size one tier higher and says so on the deck. The deck shows
+"gold saved tonight (estimate)": jobs finished by Economy that would otherwise have used Standard/Gold.
+
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
-`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `phase_assignments(phase_id, planned_engine, override_engine, model, effort)`, `priority_list(position, engine, model, effort)`, `guard_results(phase_id, guard, passed, detail)`, `handoffs(phase_id, from_engine, to_engine, reason, checkpoint_sha, ts)`, `parked(phase_id, reason, next_step, stacked_children_json)`, `login_checks(tool, state, detail, back_at, checked_at)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
+`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `phase_assignments(phase_id, planned_engine, override_engine, model, effort)`, `priority_list(position, engine, model, effort)`, `guard_results(phase_id, guard, passed, detail)`, `handoffs(phase_id, from_engine, to_engine, reason, checkpoint_sha, ts)`, `parked(phase_id, reason, next_step, stacked_children_json)`, `login_checks(tool, state, detail, back_at, checked_at)`, `engine_stats(engine, size, attempts, successes, minutes, est_cost)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
 `runner_ledger(runner, model, event, reset_at, tokens_in, tokens_out, created_at)`,
 `durations(kind, runner, seconds)` (feeds ETA), `settings(key, value)`, `events(id, ts, level, phase_id, kind, plain_text, raw_path, prev_hash, hash)`.
 
