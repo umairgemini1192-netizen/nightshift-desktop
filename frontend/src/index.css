@@ -1,0 +1,143 @@
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/jetbrains-mono";
+@import "@fontsource-variable/space-grotesk";
+@import "./design/tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  body {
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--size-md);
+    overflow-x: hidden;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 2px;
+  }
+}
+
+.ns-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.ns-glass {
+  background-color: var(--surface-glass);
+  backdrop-filter: blur(var(--component-card-blur)) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--component-card-blur)) saturate(140%);
+  border: 1px solid var(--border-subtle);
+  box-shadow: inset 0 1px 0 0 var(--surface-highlight);
+}
+
+.ns-glass-strong {
+  background-color: var(--surface-glass-strong);
+  backdrop-filter: blur(var(--component-card-blur)) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--component-card-blur)) saturate(150%);
+  border: 1px solid var(--border-strong);
+  box-shadow: inset 0 1px 0 0 var(--surface-highlight);
+}
+
+.ns-grid-overlay {
+  background-image:
+    linear-gradient(to right, var(--border-subtle) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--border-subtle) 1px, transparent 1px);
+  background-size: var(--space-8) var(--space-8);
+  mask-image: linear-gradient(to bottom, black 0%, transparent 85%);
+  -webkit-mask-image: linear-gradient(to bottom, black 0%, transparent 85%);
+  opacity: 0.4;
+}
+
+@keyframes ns-aurora-drift-a {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(4%, 3%, 0) scale(1.08);
+  }
+}
+
+@keyframes ns-aurora-drift-b {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(-4%, -3%, 0) scale(1.06);
+  }
+}
+
+@keyframes ns-aurora-drift-c {
+  0%,
+  100% {
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(3%, -4%, 0) scale(1.05);
+  }
+}
+
+@keyframes ns-breath-glow {
+  0%,
+  100% {
+    border-color: var(--border-subtle);
+  }
+  50% {
+    border-color: var(--border-glow);
+  }
+}
+
+.ns-aurora-orb-a {
+  background: radial-gradient(circle at center, var(--aurora-a) 0%, transparent 70%);
+  animation: ns-aurora-drift-a var(--duration-ambient) var(--easing-inOut) infinite;
+}
+
+.ns-aurora-orb-b {
+  background: radial-gradient(circle at center, var(--aurora-b) 0%, transparent 70%);
+  animation: ns-aurora-drift-b var(--duration-ambient) var(--easing-inOut) infinite;
+}
+
+.ns-aurora-orb-c {
+  background: radial-gradient(circle at center, var(--aurora-c) 0%, transparent 70%);
+  animation: ns-aurora-drift-c var(--duration-ambient) var(--easing-inOut) infinite;
+}
+
+.ns-aurora-paused .ns-aurora-orb-a,
+.ns-aurora-paused .ns-aurora-orb-b,
+.ns-aurora-paused .ns-aurora-orb-c {
+  animation-play-state: paused;
+}
+
+.ns-live-glow {
+  animation: ns-breath-glow 2.4s var(--easing-inOut) infinite;
+}
+
+.pywebview-drag-region {
+  -webkit-app-region: drag;
+}
+
+.pywebview-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ns-aurora-orb-a,
+  .ns-aurora-orb-b,
+  .ns-aurora-orb-c,
+  .ns-live-glow {
+    animation: none;
+  }
+}
