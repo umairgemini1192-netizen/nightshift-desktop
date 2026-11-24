@@ -1,0 +1,87 @@
+{
+  "colors": {
+    "transparent": "transparent",
+    "current": "currentColor",
+    "text-on-accent": "var(--text-on-accent)",
+    "bg-canvas": "var(--bg-canvas)",
+    "bg-base": "var(--bg-base)",
+    "surface-glass": "var(--surface-glass)",
+    "surface-glass-strong": "var(--surface-glass-strong)",
+    "surface-raised": "var(--surface-raised)",
+    "border-subtle": "var(--border-subtle)",
+    "border-strong": "var(--border-strong)",
+    "border-glow": "var(--border-glow)",
+    "text-primary": "var(--text-primary)",
+    "text-secondary": "var(--text-secondary)",
+    "text-muted": "var(--text-muted)",
+    "accent-primary": "var(--accent-primary)",
+    "accent-primary-soft": "var(--accent-primary-soft)",
+    "accent-secondary": "var(--accent-secondary)",
+    "accent-secondary-soft": "var(--accent-secondary-soft)",
+    "status-success": "var(--status-success)",
+    "status-warning": "var(--status-warning)",
+    "status-danger": "var(--status-danger)",
+    "status-info": "var(--status-info)",
+    "focus-ring": "var(--focus-ring)",
+    "aurora-a": "var(--aurora-a)",
+    "aurora-b": "var(--aurora-b)",
+    "aurora-c": "var(--aurora-c)"
+  },
+  "spacing": {
+    "0": "var(--space-0)",
+    "1": "var(--space-1)",
+    "2": "var(--space-2)",
+    "3": "var(--space-3)",
+    "4": "var(--space-4)",
+    "5": "var(--space-5)",
+    "6": "var(--space-6)",
+    "8": "var(--space-8)",
+    "10": "var(--space-10)",
+    "12": "var(--space-12)",
+    "16": "var(--space-16)",
+    "topbar": "var(--component-topbar-height)",
+    "sidebar": "var(--component-sidebar-width)",
+    "sidebar-collapsed": "var(--component-sidebar-width-collapsed)",
+    "btn-sm": "var(--component-button-height-sm)",
+    "btn-md": "var(--component-button-height-md)",
+    "btn-lg": "var(--component-button-height-lg)",
+    "ring-hero": "var(--component-ring-size-hero)"
+  },
+  "borderRadius": {
+    "sm": "var(--radius-sm)",
+    "md": "var(--radius-md)",
+    "lg": "var(--radius-lg)",
+    "xl": "var(--radius-xl)",
+    "pill": "var(--radius-pill)"
+  },
+  "fontFamily": {
+    "sans": "var(--font-sans)",
+    "mono": "var(--font-mono)",
+    "display": "var(--font-display)"
+  },
+  "fontSize": {
+    "xs": "var(--size-xs)",
+    "sm": "var(--size-sm)",
+    "md": "var(--size-md)",
+    "lg": "var(--size-lg)",
+    "xl": "var(--size-xl)",
+    "2xl": "var(--size-2xl)",
+    "3xl": "var(--size-3xl)"
+  },
+  "transitionDuration": {
+    "instant": "var(--duration-instant)",
+    "fast": "var(--duration-fast)",
+    "base": "var(--duration-base)",
+    "slow": "var(--duration-slow)",
+    "ambient": "var(--duration-ambient)"
+  },
+  "transitionTimingFunction": {
+    "out": "var(--easing-out)",
+    "in-out": "var(--easing-inOut)"
+  },
+  "boxShadow": {
+    "none": "none",
+    "glow-accent": "var(--component-glow-accent)",
+    "glow-danger": "var(--component-glow-danger)"
+  }
+}
