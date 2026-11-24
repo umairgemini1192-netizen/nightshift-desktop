@@ -285,10 +285,49 @@ matters, in plain words, in this order:
 Notifications (Windows toast) only for: run finished, a phase parked, circuit breaker tripped, PC about
 to lose power or network for more than 10 min. Never for routine progress.
 
+## 5f. Login health: every CLI and account is checked, all night
+
+The app checks every tool it depends on and never discovers a logged-out AI halfway through the night
+by surprise.
+
+**What is checked and how** (verified against the CLIs installed on the owner's PC, 2026-11-24):
+
+| Tool | Free check (no quota used) | Tiny probe (only when no free check exists) |
+|---|---|---|
+| git | `git ls-remote <repo> HEAD` succeeds (auth + network) | - |
+| GitHub CLI | `gh auth status` and `gh api user` | - |
+| Claude Code | `claude auth status` -> JSON `loggedIn: true` | - |
+| Codex (GPT) | `codex login status` -> "Logged in" | - |
+| Gemini CLI | binary present + Gemini config files exist (names only, contents never read or logged) | `gemini -p "Reply with OK" --output-format json`, short timeout |
+| Antigravity (agy) | binary present + `~/.gemini/antigravity-cli` exists | `agy -p "Reply with OK" --output-format json --print-timeout 60s` |
+
+- Each result is classified as **Ready**, **Logged out**, **Limit reached (back at HH:MM)**,
+  **Not installed**, or **Unknown (network)**. A quota/limit error during a probe is a cooldown, never
+  "logged out". Probe outputs are parsed by known patterns only; tokens and credential contents are
+  never read, stored or shown.
+- **When:** at app start; right before a run starts; before each phase for the engines that phase may
+  use (cached for 60 min, so probes cost almost nothing); and every 30 min during a run for engines in
+  the priority list. A probe for an engine with an active cooldown is skipped.
+- **During the night:** if an engine becomes logged out or its login expires, it is marked
+  unavailable, the priority list takes over immediately (5c handoff), and the deck gets one
+  "Needs your attention" line. If `git` or `gh` fails (nothing can be pushed or merged), the run
+  pauses with network/auth backoff instead of burning attempts, and a Windows toast is shown.
+
+**On the deck**
+- A compact **Logins** row on Mission Control: one chip per tool (icon + name + state in words, e.g.
+  "Claude: ready", "Gemini: limit reached, back 03:10", "Antigravity: logged out"). Never colour alone.
+- Each problem chip has a **Fix** button that opens a terminal window with the right login command
+  (`claude` then `/login`; `gemini`; `agy`; `codex login`; `gh auth login`), then re-checks when the
+  owner returns to the app. The app never types or stores passwords itself.
+- **Before you sleep:** pressing Start shows a one-screen readiness summary: "Ready to run all night:
+  5 of 6 tools ready. Gemini is logged out; the night will continue with Antigravity, GPT and Claude.
+  Fix now or Start anyway." Start anyway is always allowed when at least one implementer is ready.
+- AI Engines & Quota shows the full history of checks per tool (Details).
+
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
-`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `phase_assignments(phase_id, planned_engine, override_engine, model, effort)`, `priority_list(position, engine, model, effort)`, `guard_results(phase_id, guard, passed, detail)`, `handoffs(phase_id, from_engine, to_engine, reason, checkpoint_sha, ts)`, `parked(phase_id, reason, next_step, stacked_children_json)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
+`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `phase_assignments(phase_id, planned_engine, override_engine, model, effort)`, `priority_list(position, engine, model, effort)`, `guard_results(phase_id, guard, passed, detail)`, `handoffs(phase_id, from_engine, to_engine, reason, checkpoint_sha, ts)`, `parked(phase_id, reason, next_step, stacked_children_json)`, `login_checks(tool, state, detail, back_at, checked_at)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
 `runner_ledger(runner, model, event, reset_at, tokens_in, tokens_out, created_at)`,
 `durations(kind, runner, seconds)` (feeds ETA), `settings(key, value)`, `events(id, ts, level, phase_id, kind, plain_text, raw_path, prev_hash, hash)`.
 
