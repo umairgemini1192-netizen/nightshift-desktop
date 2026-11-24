@@ -155,10 +155,32 @@ the role, and the UI says so). Outputs are schema-validated; invalid JSON is ret
 validation error, then shown to the owner as a problem in plain English. All three outputs and the
 token/usage estimate per role are stored with the plan for history.
 
+## 5c. Flexible roles: the owner chooses who does what
+
+Nothing about "which AI" is hard-coded. Every job is a **role slot**:
+`planner_draft`, `planner_critique`, `planner_final`, `implementer`, `ci_fixer`, `reviewer`, `docs`.
+
+- Each slot is set to **Auto** (Router picks, section 5a) or a **specific choice**: engine + model +
+  effort (default medium), with an optional ordered fallback list.
+- Settings inherit and can be overridden at every level: **Global -> Project -> Plan -> Phase**.
+  The UI shows where a value comes from ("inherited from Project") and lets the owner reset it.
+- Council roles in Plan Studio are reassignable before each run (e.g. Claude drafts, Gemini critiques,
+  GPT finalises, or any single AI does all three, or a role is switched off).
+- Per phase in Plan Builder: **Implementer** and **Reviewer** pickers (Auto or specific), plus
+  "Allow Claude for this phase" toggle.
+- Changes during a run apply from the next step; the current step is never interrupted. Every change
+  is logged in plain English ("You switched the implementer of phase 3 to GPT").
+- **Add any AI without code:** the engine catalogue accepts a new CLI with a command template using
+  placeholders (`{instruction}`, `{model}`, `{effort}`, `{workdir}`), success/usage parsing hints and
+  quota-error patterns. Built-in templates for agy, gemini, codex, claude; models are free text with
+  suggestions from each CLI's help output where available.
+- Validation in plain English: picking an engine that is not installed, not logged in or cooling down
+  shows a warning with when it will be available, but the owner's choice is respected.
+
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
-`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned)`, `router_decisions(step_id, chosen, reason, scores_json)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
+`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json)`, `router_decisions(step_id, chosen, reason, scores_json)`, `role_assignments(scope, scope_id, role, mode, engine, model, effort, fallbacks_json)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
 `runner_ledger(runner, model, event, reset_at, tokens_in, tokens_out, created_at)`,
 `durations(kind, runner, seconds)` (feeds ETA), `settings(key, value)`, `events(id, ts, level, plain_text, raw)`.
 
