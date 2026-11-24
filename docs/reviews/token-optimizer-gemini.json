@@ -7,4 +7,6 @@
     "All three previously raised gaps (rtk savings scope vs total bill and retry turn impact, pinned portable binary with SHA-256 verification, and strict per-run isolation gating for agy) have been thoroughly addressed.",
     "The measurement-first rule, telemetry disabling, and automatic shutoff on turn or failure regressions provide solid safeguards for unattended runs."
   ]
+,
+  "sign_off": "Gemini (chat) signed off 2026-11-25: '5g is clean, realistic, and locks down every security and measurement requirement.' Added note: rtk filters may need ripgrep; Claude verified the release assets and corrected the asset name to the rtk-oss build."
 }
