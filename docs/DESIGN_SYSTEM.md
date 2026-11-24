@@ -82,7 +82,7 @@ estimated, Working AI + why (including handoffs: "Antigravity continuing from Cl
 and the always-visible **Stop After Current Phase** button (armed state with Undo); right column
 (span 4): AI usage tonight (bar per engine, "~% of budget used (estimate)", handoff count).
 Row: **Done tonight** list (one line per merged/parked phase) (span 5) + `StepFeed` (span 7) whose
-plain-English lines hide raw logs behind "Details". A slim Guards strip under the hero shows checks
+plain-English lines hide raw logs behind "Details". A compact **Logins** row (one chip per tool with state in words and a Fix button, BLUEPRINT 5f) and a slim Guards strip under the hero shows checks
 for the current phase and turns amber/red in plain English when one trips. Nothing else.
 
 **Plan Studio (AI Planning Council).** Step 1: a large "Describe what you want built" text area plus
