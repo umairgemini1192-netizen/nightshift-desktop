@@ -27,39 +27,41 @@ jobs:
   backend:
     name: Engine tests
     runs-on: windows-latest
-    if: ${{ hashFiles('backend/pyproject.toml') != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: hashFiles('backend/pyproject.toml') != ''
         with:
           python-version: "3.12"
-      - run: python -m pip install -e "backend[dev]"
-      - run: python -m pytest -q backend/tests
+      - if: hashFiles('backend/pyproject.toml') != ''
+        run: python -m pip install -e "backend[dev]"
+      - if: hashFiles('backend/pyproject.toml') != ''
+        run: python -m pytest -q backend/tests
 
   frontend:
     name: UI tests and screenshots
     runs-on: windows-latest
-    if: ${{ hashFiles('frontend/package.json') != '' }}
-    defaults:
-      run:
-        working-directory: frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
+        if: hashFiles('frontend/package.json') != ''
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-      - run: npm ci
-      - run: npm run tokens
-      - run: npm run lint
-      - run: npm run typecheck
-      - run: npm test
-      - run: npm run build
-      - run: npx playwright install --with-deps chromium
-      - run: npm run e2e
+      - name: Install, lint, typecheck, test, build, screenshots
+        if: hashFiles('frontend/package.json') != ''
+        working-directory: frontend
+        shell: pwsh
+        run: |
+          npm ci
+          npm run tokens
+          npm run lint
+          npm run typecheck
+          npm test
+          npm run build
+          npx playwright install --with-deps chromium
+          npm run e2e
       - name: Upload UI screenshots
-        if: always()
+        if: always() && hashFiles('frontend/package.json') != ''
         uses: actions/upload-artifact@v4
         with:
           name: ui-screenshots
@@ -70,22 +72,26 @@ jobs:
     name: Windows package
     runs-on: windows-latest
     needs: [gates, backend, frontend]
-    if: ${{ hashFiles('backend/packaging/nightshift.spec') != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         with:
           python-version: "3.12"
       - uses: actions/setup-node@v4
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         with:
           node-version: "22"
-      - run: npm ci && npm run tokens && npm run build
-        working-directory: frontend
-      - run: python -m pip install -e "backend[dev,package]"
-      - run: python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
-      - run: Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip
+      - name: Build NightShift.exe
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         shell: pwsh
+        run: |
+          Push-Location frontend; npm ci; npm run tokens; npm run build; Pop-Location
+          python -m pip install -e "backend[dev,package]"
+          python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
+          Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip
       - uses: actions/upload-artifact@v4
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         with:
           name: nightshift-windows
           path: NightShift-windows.zip
