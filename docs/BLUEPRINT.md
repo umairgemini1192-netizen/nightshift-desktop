@@ -324,6 +324,38 @@ by surprise.
   Fix now or Start anyway." Start anyway is always allowed when at least one implementer is ready.
 - AI Engines & Quota shows the full history of checks per tool (Details).
 
+## 5g. Token optimizer (agreed stance: Claude + Gemini, Gemini verdict AGREE 2026-11-25, see docs/reviews/token-optimizer-gemini.json)
+
+Goal: cut tokens per phase without hurting unattended reliability. Every tool is opt-in, pinned,
+isolated, and kept only if measurement on the owner's own runs proves a net saving.
+
+**Rules for every tool**
+1. Pinned exact version or commit; no self-update; upgrades only when the owner approves in the app.
+2. No `curl | sh` / `irm | iex`. The app downloads each artifact once into
+   `%LOCALAPPDATA%\NightShift\tools\<name>\<version>\`, verifies a recorded SHA-256, then always runs
+   that local copy. Hash mismatch = tool disabled + plain-English warning.
+3. No global installs or global config edits (no `rtk init -g`, no writes to
+   `~/.gemini/config/plugins` or `~/.gemini/config/mcp_config.json`). Config is per run / per worktree,
+   git-excluded like `.nightshift_prompt.md`. The owner's IDE and desktop apps stay untouched.
+4. No telemetry: `DO_NOT_TRACK=1` and offline flags where supported.
+5. Measure first, then enable one tool at a time with an A/B comparison (same phase type, multiple runs,
+   tokens AND turns AND success rate). A tool that does not cut net tokens, or that raises retry turns
+   or failure rate, is switched off automatically and reported on the deck.
+
+**Rollout order (highest ROI first)**
+
+| # | Tool | Role | Keep only if |
+|---|---|---|---|
+| 1 | ccusage (pinned, `--offline --json`) | Per-engine, per-model usage from local logs; feeds the quota ledger and A/B numbers. Antigravity support must be verified with a real run before the Router relies on it. | Always kept if its numbers match the CLIs' own usage output within a reasonable margin; otherwise the ledger falls back to CLI JSON usage + run counts |
+| 2 | repomix (pinned, `--compress` + token budget) | Compact repo map injected into the prompt at phase start, replacing the agent's first exploration turns | Measured first-phase turns/tokens go down without more failed phases |
+| 3 | agy-fast (pinned commit, auto-update OFF) | Batched search/outline/edit/check tools for agy runners | **Gate:** only if agy can load it per run without touching global config. Verified on this PC 2026-11-24: `agy mcp add` and `agy plugin install` have no project/per-run scope (they write global config). Remaining candidates to test: `agy --settings <session-only json>`, a project-local plugin/MCP folder, or a scoped config dir that keeps the login. If none works, agy-fast is skipped (repomix covers most of the cold-start saving). If it works: keep only if agy turns drop by at least 15% with no rise in failed edits |
+| 4 | rtk-oss (pinned portable Windows binary from GitHub Releases + SHA-256, not winget) | Compresses shell output (test/build/git) for Gemini CLI, Claude and Codex runners | Net tokens drop AND retry turns do not rise. Expect a small saving on DriveLift (builds run on GitHub) and possibly more on the Windows app (local `npm test` / `pytest` output). Confirm a Windows release binary exists before building this step |
+| 5 | ast-grep-mcp (pinned) | Structural code search with compact output | Only added if ccusage shows search is still a top cost after 1-4 |
+
+**Expectations (to avoid over-promising):** savings are estimates until measured; rtk's 60-90% applies to
+command output, not the total bill; agy-fast's -31% is the author's small-sample claim. The deck shows
+"tokens saved (estimate)" per tool and per night.
+
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
