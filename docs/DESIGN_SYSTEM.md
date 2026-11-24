@@ -81,6 +81,13 @@ button (secondary; becomes "Will stop after this phase - Undo" when armed). Righ
 Quota card ("~65% left, estimate from local ledger") per engine, and Problems card (plain English + what
 the app is doing). Row 2: `PhaseTimeline` (span 5) + `StepFeed` (span 7). Nothing else.
 
+**Plan Studio (AI Planning Council).** Step 1: a large "Describe what you want built" text area plus
+project picker. Step 2: three role cards side by side (Draft - Gemini, Critique - GPT, Final - Claude),
+each showing the engine actually used (and why, if substituted), live status, elapsed time and usage
+estimate; the active card has the breathing glow. Step 3: plan diff view (draft -> final) with per-AI
+notes as margin comments, inline edit, plain-English trade-off summary, and **Approve and send to Plan
+Builder** (primary) / Regenerate (secondary).
+
 **Plan Builder.** Left: phase list (drag to reorder, dependency chips, ladder chip, timeout). Right:
 editor for the selected phase (title, prompt in CodeEditor, ladder select, branch auto-filled,
 auto-merge / release toggles). Top: Validate (shows plain-English problems) and Start run. Import /
@@ -89,7 +96,7 @@ export legacy `queue.json`.
 **Runs & History.** Table of runs (date, phases done/failed, duration, AI used) -> run detail with the
 digest, per-phase timeline, PR links, artifacts.
 
-**AI Engines & Quota.** `EngineCard` grid; ladder editor per category (drag order, Claude pinned last
+**AI Engines & Quota.** `EngineCard` grid with skill scores and budget sliders; a "Router decisions" list showing who was chosen for each recent step and why; ladder editor per category (drag order, Claude pinned last
 with a note); effort default "medium"; ledger history chart (estimates).
 
 **Settings.** Projects (repo, local path, build rules text, artifact glob, output folder), theme,

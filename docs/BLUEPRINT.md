@@ -90,7 +90,7 @@ class Module(ModuleBase):
 Modules are discovered from `frontend/src/modules/*/manifest.ts` (Vite glob import) and
 `backend/nightshift/modules/*.py`. Adding a module = adding one folder on each side + tests.
 
-**v1 modules (core):** Mission Control, Plan Builder, Runs & History, AI Engines & Quota, Settings.
+**v1 modules (core):** Mission Control, Plan Studio (AI Planning Council), Plan Builder, Runs & History, AI Engines & Quota, Settings.
 **Planned later (owner will queue them):** CI Monitor, APK/Build Artifacts, Device Installer (adb),
 Logcat Viewer, Release Notes Writer, Play Console Upload, Repo Health, Cost/Token Analytics.
 
@@ -116,10 +116,49 @@ Per project (a project = repo + local path + build rules + artifact rules + ladd
 Runner command lines must match legacy exactly where proven (e.g. `agy -p ... --dangerously-skip-permissions`,
 gemini `--skip-trust`, medium effort).
 
+## 5a. Smart, quota-aware routing (every model is used according to its quota)
+
+Ladders are a fallback; the **Router** decides who works on each step.
+
+- **Engine catalogue** (`engines` table, editable in AI Engines & Quota): runner (`agy`, `gemini`,
+  `codex` = GPT, `claude`), model, effort (default medium), capabilities with a 1-5 skill score
+  (`plan`, `review`, `ui`, `backend`, `fix_ci`, `docs`), cost tier, and an owner-entered budget
+  (e.g. "Claude Pro: use at most 20% of the weekly limit for Night-Shift").
+- **Availability** per engine: CLI installed + logged in, cooling down until (from the ledger's parsed
+  quota errors and reset times), recent NO-OP/failure rate, and estimated budget used (from per-run
+  usage in JSON output where the CLI provides it, else run counts x historical average). All estimates.
+- **Score** = skill for the step kind x reliability x (1 - budget pressure) - cost tier penalty.
+  Claude carries a strong cost penalty so it is chosen only when it is clearly best for the step
+  (e.g. final plan review) and its budget allows, or everything else is unavailable.
+- Deterministic and explainable: every choice is logged with a one-line reason shown in the UI
+  ("GPT chosen: Gemini cooling down until 03:10, Antigravity used 80% of tonight's budget").
+- Owner can pin an engine for a phase or exclude an engine globally; pins override the score.
+
+## 5b. AI Planning Council (Gemini, GPT and Claude write the plan)
+
+The owner describes the goal in plain words in **Plan Studio**; three AIs turn it into a phased plan:
+
+1. **Draft - Gemini** (Gemini CLI, medium): reads the goal + a compact repo snapshot (repomix
+   `--compress`, token budget capped) and drafts phases (id, title, prompt, depends_on, ladder/kind,
+   acceptance tests, timeout) as JSON matching the plan schema.
+2. **Critique - GPT** (Codex CLI, medium): reviews the draft for missing steps, unsafe ordering,
+   phases too big for one PR (>~1 day of work), vague acceptance tests; returns a JSON list of issues
+   and a revised plan.
+3. **Final review - Claude** (Claude CLI, medium, single short call, skipped automatically when its
+   budget is low): resolves disagreements, checks against BLUEPRINT/AGENTS rules, returns the final
+   plan + a plain-English summary of trade-offs.
+4. The owner sees a side-by-side diff (draft -> critique -> final) with each AI's notes, edits
+   anything, then **Approve** sends it to Plan Builder. Nothing runs without approval.
+
+Each council role is routed through 5a (if an assigned AI is unavailable the next best planner takes
+the role, and the UI says so). Outputs are schema-validated; invalid JSON is retried once with the
+validation error, then shown to the owner as a problem in plain English. All three outputs and the
+token/usage estimate per role are stored with the plan for history.
+
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
-`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`,
+`steps(phase_id, kind, runner, rc, verified, detail, started_at, finished_at)`, `engines(runner, model, effort, skills_json, cost_tier, budget_json, enabled, pinned)`, `router_decisions(step_id, chosen, reason, scores_json)`, `council_runs(plan_id, role, engine, input, output, usage_estimate)`,
 `runner_ledger(runner, model, event, reset_at, tokens_in, tokens_out, created_at)`,
 `durations(kind, runner, seconds)` (feeds ETA), `settings(key, value)`, `events(id, ts, level, plain_text, raw)`.
 
