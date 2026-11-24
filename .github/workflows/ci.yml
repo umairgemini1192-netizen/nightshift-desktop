@@ -1,0 +1,91 @@
+name: Desktop build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: Design gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_tokens.py
+      - run: python scripts/check_ui_rules.py
+
+  backend:
+    name: Engine tests
+    runs-on: windows-latest
+    if: ${{ hashFiles('backend/pyproject.toml') != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e "backend[dev]"
+      - run: python -m pytest -q backend/tests
+
+  frontend:
+    name: UI tests and screenshots
+    runs-on: windows-latest
+    if: ${{ hashFiles('frontend/package.json') != '' }}
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run tokens
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run e2e
+      - name: Upload UI screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-screenshots
+          path: frontend/screenshots/
+          if-no-files-found: ignore
+
+  package:
+    name: Windows package
+    runs-on: windows-latest
+    needs: [gates, backend, frontend]
+    if: ${{ hashFiles('backend/packaging/nightshift.spec') != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci && npm run tokens && npm run build
+        working-directory: frontend
+      - run: python -m pip install -e "backend[dev,package]"
+      - run: python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
+      - run: Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nightshift-windows
+          path: NightShift-windows.zip
