@@ -131,7 +131,7 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS router_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            step_id INTEGER NOT NULL,
+            step_id INTEGER,
             chosen TEXT NOT NULL,
             reason TEXT NOT NULL,
             scores_json TEXT NOT NULL DEFAULT '{}',
@@ -770,7 +770,8 @@ class Store:
             row = self._conn.execute(
                 """
                 SELECT reset_at FROM runner_ledger
-                WHERE runner = ? AND model = ? AND reset_at IS NOT NULL AND reset_at > ?
+                WHERE runner = ? AND (model = ? OR model = 'default' OR model = '')
+                  AND reset_at IS NOT NULL AND reset_at > ?
                 ORDER BY id DESC LIMIT 1
                 """,
                 (runner, model, now),
@@ -921,9 +922,9 @@ class Store:
 
     def record_router_decision(
         self,
-        step_id: int,
         chosen: str,
         reason: str,
+        step_id: int | None = None,
         scores_json: str = "{}",
     ) -> int:
         now = _utc_now()
@@ -942,6 +943,37 @@ class Store:
         rows = self._conn.execute(
             "SELECT * FROM router_decisions ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_council_run(
+        self,
+        plan_id: str,
+        role: str,
+        engine: str,
+        input_text: str = "",
+        output_text: str = "",
+        usage_estimate: dict[str, Any] | str = "{}",
+    ) -> int:
+        now = _utc_now()
+        usage_json = json.dumps(usage_estimate) if isinstance(usage_estimate, dict) else str(usage_estimate)
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO council_runs (plan_id, role, engine, input, output, usage_estimate, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (plan_id, role, engine, input_text, output_text, usage_json, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_council_runs(self, plan_id: str | None = None) -> list[dict[str, Any]]:
+        if plan_id:
+            rows = self._conn.execute(
+                "SELECT * FROM council_runs WHERE plan_id = ? ORDER BY id ASC", (plan_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM council_runs ORDER BY id ASC").fetchall()
         return [dict(r) for r in rows]
 
     def update_engine_stats(

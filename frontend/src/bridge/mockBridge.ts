@@ -232,6 +232,98 @@ export class MockBridge implements Bridge {
         return { valid: true, problems: [] } as T;
       }
 
+      case "council.run":
+      case "council.session": {
+        const goal = String(args?.goal ?? "Add offline status caching and auto-sync to the mobile app");
+        const isSub = this.scenario === "council-substitution";
+        const isDrafting = this.scenario === "council-drafting";
+        const isCritique = this.scenario === "council-critique";
+
+        const draftPhases = [
+          { id: "p1", title: "Cache schema & SQLite store", prompt: "Build offline storage table and migration", branch: "feat/p1-cache", depends_on: [], size: "medium", timeout_minutes: 90 },
+          { id: "p2", title: "Background sync worker", prompt: "Implement network listener and sync loop", branch: "feat/p2-sync", depends_on: ["p1"], size: "medium", timeout_minutes: 120 },
+        ];
+
+        const critiquePhases = [
+          { id: "p1", title: "Cache schema & SQLite store", prompt: "Build offline storage table and migration with retry guard", branch: "feat/p1-cache", depends_on: [], size: "medium", timeout_minutes: 90 },
+          { id: "p2", title: "Network connectivity monitor", prompt: "Detect network restoration before triggering sync worker", branch: "feat/p2-monitor", depends_on: ["p1"], size: "small", timeout_minutes: 60 },
+          { id: "p3", title: "Background sync worker", prompt: "Execute sync loop with backoff exponential guards", branch: "feat/p3-sync", depends_on: ["p2"], size: "medium", timeout_minutes: 120 },
+        ];
+
+        const finalPhases = [
+          { id: "p1", title: "Cache schema & SQLite store", prompt: "Build offline storage table and migration with retry guard", branch: "feat/p1-cache", depends_on: [], size: "medium", timeout_minutes: 90 },
+          { id: "p2", title: "Network connectivity monitor", prompt: "Detect network restoration before triggering sync worker", branch: "feat/p2-monitor", depends_on: ["p1"], size: "small", timeout_minutes: 60 },
+          { id: "p3", title: "Background sync worker & conflict resolution", prompt: "Execute sync loop with backoff exponential guards and server timestamp wins resolution", branch: "feat/p3-sync", depends_on: ["p2"], size: "medium", timeout_minutes: 120 },
+        ];
+
+        const session = {
+          goal,
+          planId: "council-plan-101",
+          diffSummary: isDrafting
+            ? "Gemini is currently drafting initial phases from your goal and repo structure."
+            : isCritique
+              ? "Draft completed 2 phases. Codex is critiquing missing network monitor boundary."
+              : "Draft created 2 phases. Critique added connectivity monitor (3 phases). Final review confirmed conflict resolution policy.",
+          tradeoffSummary: "Separated network monitoring from sync worker to prevent unbounded retries during intermittent connectivity. Preserves gold quota.",
+          roles: {
+            draft: {
+              role: "draft",
+              engineId: isSub ? "codex" : "gemini",
+              name: isSub ? "Codex CLI" : "Gemini CLI",
+              model: isSub ? "o3-mini" : "gemini-2.5-pro",
+              state: isDrafting ? "active" : "done",
+              substituted: isSub,
+              substitutionReason: isSub ? "Gemini cooling down until 03:45; Codex substituted" : undefined,
+              elapsedSeconds: isDrafting ? 4.2 : 14.5,
+              tokensEstimate: 14200,
+              costUsdEstimate: 0.02,
+              notes: ["Identified core caching and worker requirements from codebase."],
+              phases: draftPhases,
+            },
+            critique: {
+              role: "critique",
+              engineId: "codex",
+              name: "Codex CLI",
+              model: "o3-mini",
+              state: isDrafting ? "waiting" : isCritique ? "active" : "done",
+              substituted: false,
+              elapsedSeconds: isDrafting ? 0 : isCritique ? 3.8 : 11.2,
+              tokensEstimate: isDrafting ? 0 : 18500,
+              costUsdEstimate: isDrafting ? 0 : 0.05,
+              notes: ["Phase 2 was too large and lacked network state verification."],
+              issues: ["Missing connectivity monitor step", "Unbounded retry loop risk on network drop"],
+              phases: isDrafting ? [] : critiquePhases,
+            },
+            final: {
+              role: "final",
+              engineId: "claude",
+              name: "Claude Code",
+              model: "claude-3-7-sonnet",
+              state: isDrafting || isCritique ? "waiting" : "done",
+              substituted: false,
+              elapsedSeconds: isDrafting || isCritique ? 0 : 6.1,
+              tokensEstimate: isDrafting || isCritique ? 0 : 8400,
+              costUsdEstimate: isDrafting || isCritique ? 0 : 0.09,
+              notes: ["Resolved dispute by adding server timestamp conflict resolution."],
+              tradeoffSummary: "Separated network monitoring from sync worker to prevent unbounded retries during intermittent connectivity. Preserves gold quota.",
+              phases: isDrafting || isCritique ? [] : finalPhases,
+            },
+          },
+        };
+
+        return session as T;
+      }
+
+      case "council.approve":
+        return { ok: true, planId: "council-plan-101" } as T;
+
+      case "engines.test":
+        return { ok: true, output: "CLI test OK (v2.5.0)" } as T;
+
+      case "engines.saveKey":
+      case "engines.addEngine":
+        return { ok: true } as T;
+
       case "plan.save":
       case "plan.setImplementer":
         return { ok: true, saved: true } as T;

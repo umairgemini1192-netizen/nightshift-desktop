@@ -11,6 +11,7 @@ describe("Module registry and shell", () => {
     const ids = MODULES.map((m) => m.id);
     expect(ids).toEqual([
       "mission-control",
+      "plan-studio",
       "plan-builder",
       "runs-history",
       "engines-quota",

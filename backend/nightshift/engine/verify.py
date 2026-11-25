@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nightshift.engine.credentials import redact_known_secrets
 from nightshift.engine.vcs import GitGhClient
 
 SECRET_PATTERNS = [
@@ -59,7 +60,7 @@ class RiskAssessment:
 
 def redact_secrets(text: str) -> str:
     """Redact known secret patterns and credentials from logs, events, and diffs."""
-    redacted = text
+    redacted = redact_known_secrets(text)
     for pattern in SECRET_PATTERNS:
         redacted = pattern.sub("[REDACTED_SECRET]", redacted)
     return redacted

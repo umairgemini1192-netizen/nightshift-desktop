@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nightshift.quota.ledger import QuotaLedger
+from nightshift.quota.usage import record_cli_usage
 from nightshift.runners.base import RunnerResult, run_subprocess_with_timeout
 
 
@@ -49,7 +50,7 @@ class AgyRunner:
         if self._quota_ledger is not None:
             is_quota = self._quota_ledger.is_quota_or_transient_error(rc, out, err)
             if rc == 0 and not timed_out and not is_quota:
-                self._quota_ledger.record_usage(self.name, model or "default")
+                record_cli_usage(self._quota_ledger, self.name, model or "default", out)
             if is_quota:
                 reset_at = self._quota_ledger.record_quota_error(self.name, model or "default", f"{out}\n{err}")
 

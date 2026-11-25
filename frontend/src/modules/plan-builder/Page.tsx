@@ -25,7 +25,9 @@ const LADDER_OPTIONS = [
 ];
 
 const ENGINE_OPTIONS = [
-  { value: "Antigravity", label: "Antigravity (Economy)" },
+  { value: "Qwen Code", label: "Qwen Code (Economy)" },
+  { value: "DeepSeek", label: "DeepSeek (Economy)" },
+  { value: "Antigravity", label: "Antigravity (Standard)" },
   { value: "Gemini CLI", label: "Gemini CLI (Standard)" },
   { value: "Codex CLI", label: "Codex CLI (Standard)" },
   { value: "Claude Code", label: "Claude Code (Gold, Token-Metered)" },
@@ -59,6 +61,7 @@ export default function PlanBuilderPage() {
 
   // Bulk implementer assignment
   const [bulkEngine, setBulkEngine] = useState("Antigravity");
+  const [bulkModel, setBulkModel] = useState("gemini-4-neon");
   const [bulkEffort, setBulkEffort] = useState("medium");
 
   const loadPlan = useCallback(async () => {
@@ -288,7 +291,7 @@ export default function PlanBuilderPage() {
       setPlan(savedPlan);
       await bridge.call("plan.setImplementer", reset
         ? { phaseIds: ids, reset: true }
-        : { phaseIds: ids, engine: bulkEngine, effort: bulkEffort });
+        : { phaseIds: ids, engine: bulkEngine, model: bulkModel, effort: bulkEffort });
       setPhases((prev) => prev.map((p) => ids.includes(p.id)
         ? reset
           ? { ...p, overrideImplementer: undefined, implementer: "Antigravity" }
@@ -428,6 +431,14 @@ export default function PlanBuilderPage() {
                       onChange={(val) => setBulkEngine(val)}
                       options={ENGINE_OPTIONS}
                       className="min-w-36 text-xs"
+                    />
+                    <TextField
+                      id="bulk-model-input"
+                      label="Model"
+                      value={bulkModel}
+                      onChange={(e) => setBulkModel(e.target.value)}
+                      placeholder="auto"
+                      className="min-w-32 text-xs"
                     />
                     <Select
                       id="bulk-effort-select"

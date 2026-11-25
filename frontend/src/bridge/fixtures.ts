@@ -11,6 +11,10 @@ export const SCENARIO_NAMES: readonly ScenarioName[] = [
   "handoff",
   "ci-healing",
   "finished",
+  "council-drafting",
+  "council-critique",
+  "council-final-ready",
+  "council-substitution",
 ] as const;
 
 const DEFAULT_READY_LOGINS: Record<string, LoginCheckItem> = {
@@ -521,6 +525,74 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
       handoff_count: 1,
       updated_at: new Date().toISOString(),
     },
+  },
+  "council-drafting": {
+    scenario: "council-drafting",
+    runState: "idle",
+    headline: "AI Planning Council is actively drafting your implementation plan.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: "Gemini CLI",
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Drafting", tone: "info" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+  },
+  "council-critique": {
+    scenario: "council-critique",
+    runState: "idle",
+    headline: "Codex CLI is critiquing the draft and refining dependency boundaries.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: "Codex CLI",
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Critique", tone: "warning" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+  },
+  "council-final-ready": {
+    scenario: "council-final-ready",
+    runState: "idle",
+    headline: "Planning Council complete. Review plan diff and trade-offs before approving.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: null,
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Ready", tone: "success" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+  },
+  "council-substitution": {
+    scenario: "council-substitution",
+    runState: "idle",
+    headline: "Gemini is cooling down; Codex substituted for Draft role automatically.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: null,
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Substituted", tone: "warning" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
   },
 };
 
