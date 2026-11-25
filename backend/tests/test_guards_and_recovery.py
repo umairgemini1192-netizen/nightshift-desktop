@@ -251,7 +251,8 @@ async def test_parking_continues_independent_and_stacks_dependent_phases(tmp_pat
 
         by_id = {r["phase_id"]: r["status"] for r in rows}
         assert by_id["p1"] == "PARKED"
-        assert by_id["p2"] == "COMPLETED"
+        assert by_id["p2"] == "PARKED"
+        assert "feat/p2" not in vcs.merged_prs
         assert by_id["p3"] == "COMPLETED"
         assert prepared_bases["feat/p2"] == "feat/p1"
         assert prepared_bases["feat/p3"] == "main"

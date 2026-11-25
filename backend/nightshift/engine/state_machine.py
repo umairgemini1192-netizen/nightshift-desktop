@@ -253,6 +253,7 @@ class EngineStateMachine:
             # Persist plan in store
             self.store.create_plan(plan_id, project.id, f"Run for {project.name}")
             for p in ordered_phases:
+                previous = self.store.get_phase(p.id) or {}
                 self.store.upsert_phase(
                     p.id,
                     plan_id,
@@ -262,6 +263,9 @@ class EngineStateMachine:
                     depends_on_json=json.dumps(p.depends_on),
                     size=p.size,
                     position=p.position,
+                    status=previous.get("status", "pending"),
+                    attempt=previous.get("attempt", 0),
+                    pr_number=previous.get("pr_number"),
                 )
 
             completed_ids: set[str] = set()
@@ -292,6 +296,15 @@ class EngineStateMachine:
                 if not phase.force_rerun:
                     merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch)
                     if merged_pr:
+                        prior = self.store.get_phase(phase.id) or {}
+                        if phase.release_after_merge and prior.get("status") in ("merging", "merged", "releasing"):
+                            row = self._finish_merged_delivery(project, phase, merged_pr, "none")
+                            summary_rows.append(row)
+                            if row["status"] == "COMPLETED":
+                                completed_ids.add(phase.id)
+                            else:
+                                parked_ids.add(phase.id)
+                            continue
                         self.store.update_phase(phase.id, status="merged", pr_number=merged_pr["number"])
                         completed_ids.add(phase.id)
                         summary_rows.append({
@@ -348,11 +361,14 @@ class EngineStateMachine:
                                     )
 
                 # 6. Execute single phase through state machine
-                row = await self._execute_phase(project, phase, plan_id, base_branch)
+                row = await self._execute_phase(project, phase, plan_id, base_branch, dependencies_merged=all(dep in completed_ids for dep in phase.depends_on))
                 summary_rows.append(row)
 
                 if row["status"] in ("COMPLETED", "MERGED"):
-                    completed_ids.add(phase.id)
+                    if self.vcs.find_merged_pr(project.repo, phase.branch):
+                        completed_ids.add(phase.id)
+                    else:
+                        parked_ids.add(phase.id)
                     self.scheduler.circuit_breaker.record_phase_result(parked=False)
                 elif row["status"] == "PARKED":
                     parked_ids.add(phase.id)
@@ -375,6 +391,7 @@ class EngineStateMachine:
         phase: PhaseDefinition,
         plan_id: str,
         base_branch: str,
+        dependencies_merged: bool = True,
     ) -> dict[str, Any]:
         """Execute a single phase from worktree preparation through delivery and release."""
         if phase.branch.strip().lower() in ("main", "master"):
@@ -436,6 +453,7 @@ class EngineStateMachine:
 
             implement_attempts = 0
             delivered = False
+            pending_choice = None
 
             while implement_attempts < self.scheduler.max_implement_attempts:
                 if not self.scheduler.has_run_budget_remaining():
@@ -455,11 +473,12 @@ class EngineStateMachine:
                 implement_attempts += 1
                 self.store.update_phase(phase.id, attempt=implement_attempts)
 
-                choice = self.scheduler.select_engine(
+                choice = pending_choice or self.scheduler.select_engine(
                     phase_id=phase.id,
                     step_kind="implement",
                     current_engine=active_runner_name if active_runner_name != "unknown" else None,
                 )
+                pending_choice = None
                 if not choice:
                     # All engines exhausted -> cooldown wait
                     earliest = self.quota.earliest_cooldown_expiry()
@@ -562,6 +581,7 @@ class EngineStateMachine:
                     current_engine=active_runner_name,
                     exclude_engines={active_runner_name},
                 )
+                pending_choice = next_choice
                 next_engine = next_choice.engine if next_choice else "none"
 
                 self.scheduler.create_mid_phase_handoff(
@@ -645,6 +665,11 @@ class EngineStateMachine:
             detail += " [flaky test resolved]"
 
         # Step 4: Merge PR if auto_merge is enabled (verify exact head SHA match)
+        if phase.auto_merge and not dependencies_merged:
+            reason = "Waiting for dependencies to merge before merging this PR"
+            self.store.park_phase(phase.id, reason=reason, next_step="Merge dependencies and resume")
+            return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": reason}
+
         if phase.auto_merge:
             latest_pr = self.vcs.find_open_pr(project.repo, phase.branch)
             if (
@@ -680,43 +705,12 @@ class EngineStateMachine:
             self.store.update_phase(phase.id, status="merged")
             detail = f"Merged PR #{pr_number}"
 
-            # Step 5: Post-merge release if release_after_merge is enabled
             if phase.release_after_merge:
-                self.store.update_phase(phase.id, status="releasing")
-                self.events.emit(Event(
-                    kind="phase.releasing",
-                    plain_text=f"Watching post-merge main build and publishing release for {phase.title}.",
-                    phase_id=phase.id,
-                ))
-                merge_sha = None
-                try:
-                    merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch)
-                    merge_sha = (merged_pr or {}).get("mergeCommit", {}).get("oid")
-                    if not merge_sha:
-                        raise RuntimeError("Could not determine the merged commit SHA")
-                    tag, published_files = self.release_mgr.publish_verified_release(
-                        repo=project.repo,
-                        merge_sha=merge_sha,
-                        output_dir=project.output_dir,
-                        title_note=phase.title,
-                        workflow_name=project.release_workflow,
-                        artifact_glob=project.artifact_glob,
-                        tag_prefix=project.tag_prefix,
-                    )
-                    detail += f" · Released {tag} ({len(published_files)} files)"
-                    self.events.emit(Event(
-                        kind="release.published",
-                        plain_text=f"Published verified release {tag} with SHA-256 checksums.",
-                        phase_id=phase.id,
-                    ))
-                except Exception as rel_err:
-                    # Post-merge main build failure -> auto-revert (BLUEPRINT 5d)
-                    logger.error("Post-merge release failed: %s", rel_err)
-                    if merge_sha:
-                        self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, str(rel_err))
-                    else:
-                        self.store.park_phase(phase.id, reason=str(rel_err), next_step="Find the merged commit and inspect the release")
-                    return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": f"Post-merge failure: {rel_err}"}
+                merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
+                result = self._finish_merged_delivery(project, phase, merged_pr, ci_res.last_engine)
+                if result["status"] != "COMPLETED":
+                    return result
+                detail = result["detail"]
 
         # Cleanup worktree
         self.vcs.remove_worktree(project.local_path, wt_dir)
@@ -729,3 +723,28 @@ class EngineStateMachine:
             "status": "COMPLETED",
             "detail": detail,
         }
+
+    def _finish_merged_delivery(
+        self, project: ProjectConfig, phase: PhaseDefinition, merged_pr: dict[str, Any], runner: str
+    ) -> dict[str, Any]:
+        """Resume post-merge delivery without repeating implementation or merge."""
+        self.store.update_phase(phase.id, status="releasing", pr_number=merged_pr.get("number"))
+        merge_sha = (merged_pr.get("mergeCommit") or {}).get("oid")
+        try:
+            if not merge_sha:
+                raise RuntimeError("Could not determine the merged commit SHA")
+            tag, files = self.release_mgr.publish_verified_release(
+                repo=project.repo, merge_sha=merge_sha, output_dir=project.output_dir,
+                title_note=phase.title, workflow_name=project.release_workflow,
+                artifact_glob=project.artifact_glob, tag_prefix=project.tag_prefix,
+            )
+            self.store.update_phase(phase.id, status="completed")
+            self.events.emit(Event(kind="release.published", plain_text=f"Published verified release {tag} with SHA-256 checksums.", phase_id=phase.id))
+            return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')} ? Released {tag} ({len(files)} files)"}
+        except Exception as rel_err:
+            logger.error("Post-merge release failed: %s", rel_err)
+            if merge_sha:
+                self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, str(rel_err))
+            else:
+                self.store.park_phase(phase.id, reason=str(rel_err), next_step="Find the merged commit and inspect the release")
+            return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": f"Post-merge failure: {rel_err}"}

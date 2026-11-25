@@ -245,3 +245,41 @@ def test_single_instance_lock(tmp_path: Path) -> None:
     # Now lock2 can acquire
     assert lock2.acquire() is True
     lock2.release()
+
+
+@pytest.mark.asyncio
+async def test_handoff_uses_selected_fallback_on_next_attempt(tmp_path: Path) -> None:
+    with Store(tmp_path / "handoff.db") as store:
+        store.migrate()
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        first = FakeRunner.no_op("agy")
+        second = FakeRunner(name="gemini", on_call=lambda *args: vcs.add_pr("feat/p1", number=501))
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=lambda cmd, to: (0, "OK", "", False))
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={"agy": first, "gemini": second}, login_checker=logins)
+        project = ProjectConfig(id="handoff", name="Handoff", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"):
+            rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")])
+        assert rows[0]["status"] == "COMPLETED"
+        assert sum("Read and execute every instruction" in str(call["prompt"]) for call in first.calls) == 1
+        assert sum("Read and execute every instruction" in str(call["prompt"]) for call in second.calls) == 1
+        assert store.list_handoffs("p1")[0]["to_engine"] == "gemini"
+
+
+@pytest.mark.asyncio
+async def test_merged_phase_resumes_pending_release(tmp_path: Path) -> None:
+    with Store(tmp_path / "release.db") as store:
+        store.migrate()
+        store.create_project("resume", "Resume", "o/r", str(tmp_path))
+        store.create_plan("plan_default", "resume", "Plan")
+        store.upsert_phase("p1", "plan_default", "P1", "feat/p1", status="releasing", pr_number=502)
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.merged_prs["feat/p1"] = {"number": 502, "mergeCommit": {"oid": "merge-sha"}}
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs)
+        project = ProjectConfig(id="resume", name="Resume", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        with patch.object(engine.release_mgr, "publish_verified_release", return_value=("v1", [])) as publish:
+            rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1", release_after_merge=True)])
+        assert rows[0]["status"] == "COMPLETED"
+        assert store.get_phase("p1")["status"] == "completed"
+        assert publish.call_args.kwargs["merge_sha"] == "merge-sha"
