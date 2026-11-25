@@ -224,7 +224,12 @@ after every fix path is exhausted, and even then keeps working on everything tha
   1. **Codex first, once.** If Codex already reviewed this head, use it. Otherwise post `@codex review`
      once and wait up to 15 min. Codex automatic review on every push stays **off** (it burns the free
      quota: three full reviews in one hour on DriveLift PR #99).
-  2. **Free fallback.** Codex silent for 15 min or reporting a usage/quota limit -> the Economy engines
+  2. **Gemini CLI second.** Codex silent for 15 min or reporting a usage/quota limit -> one Gemini CLI
+     review (read-only plan mode, empty temp folder, own Google free daily limit, separate from
+     Antigravity), posted as `[GEMINI-REVIEW]`; counts as a full review. Measured 2026-11-25 on PR #99:
+     found a real P1 Codex missed in five reviews (live speeds hid call/recording/navigation info).
+     Runs vary, so findings are checked against the code before being acted on by a human reviewer.
+  3. **Free fallback.** Gemini CLI unavailable too -> the Economy engines
      (5h, in order) review the diff in the same P1/P2 format; the result is posted on the PR as
      `[FREE-REVIEW]`. The diff is packed by priority (app code, then resources, then tests; full hunks,
      never trimmed context, which made free models report false syntax-error P1s; every file gets a
@@ -232,12 +237,12 @@ after every fix path is exhausted, and even then keeps working on everything tha
      DriveLift PR #99 commit where Codex found a real P1, and GLM/Ling hit free-tier rate limits. A
      free-only review is therefore labelled **LIGHT review** on the deck, phone Doc and digest, never
      "reviewed". Its P1s still block the merge.
-  3. **P1 gate.** P1 = user-visible bug, crash, data loss, security/privacy issue, broken accessibility
+  4. **P1 gate.** P1 = user-visible bug, crash, data loss, security/privacy issue, broken accessibility
      (touch target under 48 dp, unlabeled control) or behaviour against the phase goal. Any open P1 ->
      one fix round (Economy first, 5h ladder) -> CI -> one re-review. Still P1 -> **parked** with the
      finding as the reason on the deck's "Needs your attention" and the phone Doc (5i). P2 never blocks;
      it is listed on the PR and in the digest.
-  4. **No reviewer at all** (Codex and every free engine failed) -> merge on green CI but mark the phase
+  5. **No reviewer at all** (Codex, Gemini CLI and every free engine failed) -> merge on green CI but mark the phase
      **UNREVIEWED** on the deck, the phone Doc and the morning digest.
 - **Critical** changes (signals above) additionally require the review to come from a Standard-tier or
   better engine when one has quota; a free-only review of a critical change is flagged on the deck.
