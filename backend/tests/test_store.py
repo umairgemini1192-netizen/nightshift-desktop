@@ -35,8 +35,8 @@ def test_store_migrations_create_full_schema_and_are_idempotent(tmp_path: Path) 
     with Store(db_file) as store:
         assert store.current_schema_version() == 0
         applied_first = store.migrate()
-        assert applied_first == [1, 2]
-        assert store.current_schema_version() == 2
+        assert applied_first == [1, 2, 3]
+        assert store.current_schema_version() == 3
         assert EXPECTED_TABLES.issubset(store.list_tables())
 
         # Re-running migrate must be a safe no-op.
@@ -133,7 +133,7 @@ def test_upgrade_existing_project_columns(tmp_path: Path) -> None:
             CREATE TABLE projects (id TEXT PRIMARY KEY, output_folder TEXT NOT NULL DEFAULT '');
             INSERT INTO projects VALUES ('old', 'saved');
         """)
-        assert store.migrate() == [2]
+        assert store.migrate() == [2, 3]
         row = store.connection.execute("SELECT * FROM projects").fetchone()
         assert row["output_dir"] == "saved"
         assert row["release_workflow"] == "Android build"
@@ -149,3 +149,24 @@ def test_events_imports_in_fresh_interpreter() -> None:
         capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_migration_preserves_existing_router_decisions(tmp_path: Path) -> None:
+    with Store(tmp_path / "old.db") as store:
+        store.migrate()
+        conn = store.connection
+        conn.execute("PRAGMA foreign_keys = OFF")
+        with conn:
+            conn.execute("DROP TABLE router_decisions")
+            conn.execute("""CREATE TABLE router_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, step_id INTEGER NOT NULL,
+                chosen TEXT NOT NULL, reason TEXT NOT NULL, scores_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL, FOREIGN KEY (step_id) REFERENCES steps(id) ON DELETE CASCADE)""")
+            conn.execute("INSERT INTO router_decisions VALUES (7, 1, 'engine', 'reason', '{}', 'now')")
+            conn.execute("DELETE FROM schema_migrations WHERE version = 3")
+        assert store.migrate() == [3]
+        assert conn.execute("SELECT chosen FROM router_decisions WHERE id = 7").fetchone()[0] == "engine"
+        with conn:
+            conn.execute("INSERT INTO router_decisions (step_id, chosen, reason, created_at) VALUES (NULL, 'other', 'reason', 'now')")
+        assert conn.execute("SELECT COUNT(*) FROM router_decisions").fetchone()[0] == 2
+

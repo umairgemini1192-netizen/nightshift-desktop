@@ -540,6 +540,7 @@ class EngineStateMachine:
                             quota_patterns=patterns,
                             env=env,
                         )
+                        self.runners[active_runner_name] = runner_obj
                     else:
                         raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
 

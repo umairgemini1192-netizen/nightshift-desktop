@@ -276,9 +276,31 @@ def _migration_002_project_columns(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE projects SET output_dir = output_folder WHERE output_dir = ''")
 
 
+def _migration_003_nullable_router_step(conn: sqlite3.Connection) -> None:
+    """Allow decisions made before a step exists while preserving prior decisions."""
+    columns = {row[1]: row for row in conn.execute("PRAGMA table_info(router_decisions)")}
+    if not columns or not columns["step_id"][3]:
+        return
+    conn.execute("""CREATE TABLE router_decisions_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step_id INTEGER,
+        chosen TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        scores_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (step_id) REFERENCES steps(id) ON DELETE CASCADE
+    )""")
+    conn.execute("""INSERT INTO router_decisions_new
+        (id, step_id, chosen, reason, scores_json, created_at)
+        SELECT id, step_id, chosen, reason, scores_json, created_at FROM router_decisions""")
+    conn.execute("DROP TABLE router_decisions")
+    conn.execute("ALTER TABLE router_decisions_new RENAME TO router_decisions")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
+    (3, "003_nullable_router_step", _migration_003_nullable_router_step),
 ]
 
 
@@ -1052,3 +1074,4 @@ class Store:
                 return False
             expected_prev = row["hash"]
         return True
+
