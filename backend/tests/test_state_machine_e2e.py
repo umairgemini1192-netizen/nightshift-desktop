@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,6 +17,16 @@ from nightshift.events import EventBus
 from nightshift.quota.ledger import QuotaLedger
 from nightshift.runners import FakeRunner
 from nightshift.store import Store
+
+
+@pytest.fixture(autouse=True)
+def isolate_host_preflight() -> Iterator[None]:
+    """Use the fake command runner regardless of installed tools or disk space."""
+    with patch("nightshift.engine.logins.resolve_bin", return_value="tool.exe"), patch(
+        "nightshift.engine.state_machine.shutil.disk_usage",
+        return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+    ):
+        yield
 
 
 @pytest.mark.asyncio
@@ -83,7 +94,6 @@ async def test_full_multi_phase_execution_and_digest(tmp_path: Path) -> None:
         with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt_root"):
             results = await engine.execute_plan(project, phases, plan_id="plan_1")
 
-        print(f"DEBUG RESULTS: {results}")
         assert len(results) == 3
         # p1 completed and released
         assert results[0]["phase_id"] == "p1"
