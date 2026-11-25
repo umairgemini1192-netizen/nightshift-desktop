@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { motion, MotionConfig, useReducedMotion } from "framer-motion";
+import { isNotifiableEvent, mapEventToNotification, type NativeEventPayload } from "../bridge";
 import { GlassCard, Skeleton } from "../design";
 import { AuroraCanvas } from "./AuroraCanvas";
 import { CommandPalette } from "./CommandPalette";
@@ -13,6 +14,9 @@ import { TopBar } from "./TopBar";
 export function Shell() {
   const location = useLocation();
   const prefersReduced = useReducedMotion();
+  const bridge = useAppStore((s) => s.bridge);
+  const pushToast = useAppStore((s) => s.pushToast);
+  const refreshSnapshot = useAppStore((s) => s.refreshSnapshot);
   const reinitializeBridge = useAppStore((s) => s.reinitializeBridge);
   const setSidebarCollapsedAuto = useAppStore((s) => s.setSidebarCollapsedAuto);
   const syncSystemTheme = useAppStore((s) => s.syncSystemTheme);
@@ -29,6 +33,20 @@ export function Shell() {
   useEffect(() => {
     void reinitializeBridge(location.search);
   }, [location.search, reinitializeBridge]);
+
+  useEffect(() => {
+    const unsub = bridge.subscribe("*", (payload: unknown) => {
+      const evt = payload as NativeEventPayload;
+      if (evt && isNotifiableEvent(evt)) {
+        const toast = mapEventToNotification(evt);
+        if (toast) {
+          pushToast(toast);
+        }
+      }
+      void refreshSnapshot();
+    });
+    return unsub;
+  }, [bridge, pushToast, refreshSnapshot]);
 
   useEffect(() => {
     const onResize = () => {
