@@ -317,3 +317,42 @@ def test_worktree_exclusions_use_common_git_directory(monkeypatch, tmp_path: Pat
     monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", run)
     vcs.prepare_worktree(tmp_path, worktree, "feat/test")
     assert ".nightshift/handoff.md" in (common / "info" / "exclude").read_text()
+
+
+def test_existing_worktree_is_preserved(monkeypatch, tmp_path: Path) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    (worktree / "unfinished.txt").write_text("unfinished")
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-1] == "--show-current":
+            return 0, "feat/test", "", False
+        if cmd[-1] == "--show-toplevel":
+            return 0, str(worktree), "", False
+        return 0, str(tmp_path / ".git"), "", False
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", run)
+    assert SubprocessGitGh().prepare_worktree(tmp_path, worktree, "feat/test") == worktree
+    assert (worktree / "unfinished.txt").read_text() == "unfinished"
+    assert not any("remove" in cmd for cmd in calls)
+
+
+@pytest.mark.asyncio
+async def test_ci_fix_uses_available_fallback(tmp_path: Path) -> None:
+    with Store(tmp_path / "fallback.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=1)
+        vcs.ci_results[1] = [False, False, True]
+        sched = Scheduler(store, QuotaLedger(store))
+        original = sched.is_engine_available
+        sched.is_engine_available = lambda engine, model="": engine != "agy" and original(engine, model)
+        agy, gemini = FakeRunner.success("agy"), FakeRunner.success("gemini")
+        result = await CiPipelineManager(vcs, store, sched, {"agy": agy, "gemini": gemini}).watch_and_heal(
+            repo="o/r", local_repo=tmp_path, worktree_dir=tmp_path, phase_id="p1", phase_title="P1",
+            branch="feat/p1", pr_number=1, initial_engine="agy", risk=RiskAssessment(level="low"),
+        )
+        assert result.last_engine == "gemini"
+        assert any("CI failure" in call["prompt"] for call in gemini.calls)
+        assert not any("CI failure" in call["prompt"] for call in agy.calls)

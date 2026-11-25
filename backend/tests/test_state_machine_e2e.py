@@ -295,3 +295,24 @@ async def test_merged_phase_resumes_pending_release(tmp_path: Path) -> None:
         assert store.get_phase("p1")["status"] == "completed"
         assert publish.call_args.kwargs["merge_sha"] == "merge-sha"
         assert store.get_parked("p1") is None
+
+
+@pytest.mark.asyncio
+async def test_reverted_merge_resumes_implementation(tmp_path: Path) -> None:
+    with Store(tmp_path / "reverted.db") as store:
+        store.migrate()
+        store.create_project("resume", "Resume", "o/r", str(tmp_path))
+        store.create_plan("plan_default", "resume", "Plan")
+        store.upsert_phase("p1", "plan_default", "P1", "feat/p1", status="parked", pr_number=502)
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.merged_prs["feat/p1"] = {"number": 502, "mergeCommit": {"oid": "merge-sha"}}
+        vcs.merged_prs["nightshift/revert-merge-sha"] = {"number": 503}
+        runner = FakeRunner(name="agy", on_call=lambda *args: vcs.add_pr("feat/p1", number=504))
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=lambda cmd, to: (0, "OK", "", False))
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={"agy": runner}, login_checker=logins)
+        project = ProjectConfig(id="resume", name="Resume", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"):
+            rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")])
+        assert runner.calls
+        assert rows[0]["status"] == "COMPLETED"

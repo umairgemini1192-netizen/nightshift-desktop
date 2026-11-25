@@ -10,7 +10,7 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -295,6 +295,15 @@ class EngineStateMachine:
                 # 3. Skip already merged phases unless force_rerun
                 if not phase.force_rerun:
                     merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch)
+                    merge_sha = ((merged_pr or {}).get("mergeCommit") or {}).get("oid")
+                    if merge_sha and self.vcs.find_merged_pr(project.repo, f"nightshift/revert-{merge_sha}"):
+                        merged_pr = None
+                        parked = self.store.get_parked(phase.id) or {}
+                        phase = replace(phase, prompt=(
+                            f"{phase.prompt}\n\nThe previous merge {merge_sha} was reverted after the main build failed. "
+                            f"Restore the reverted changes on top of current main, fix the build failure, and open a new PR. "
+                            f"Failure: {parked.get('reason', 'Inspect the failed main build.')}"
+                        ))
                     if merged_pr:
                         prior = self.store.get_phase(phase.id) or {}
                         if prior.get("status") in ("merging", "merged", "releasing", "verifying_build") or (prior.get("status") == "parked" and prior.get("pr_number")):
@@ -732,7 +741,9 @@ class EngineStateMachine:
                 raise RuntimeError("Could not determine the merged commit SHA")
             ok, msg, run_id = self.vcs.watch_workflow_run(project.repo, branch="main", workflow=project.release_workflow, timeout_seconds=3600, commit_sha=merge_sha)
             if ok is False:
-                self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
+                reverted, revert_msg = self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
+                if reverted:
+                    return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": revert_msg}
                 raise RuntimeError(f"Main build failed: {msg}")
             if ok is not True or run_id is None:
                 raise RuntimeError(f"Could not verify main build: {msg}")

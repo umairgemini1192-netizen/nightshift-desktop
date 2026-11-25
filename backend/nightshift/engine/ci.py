@@ -212,9 +212,12 @@ class CiPipelineManager:
                     step_kind="fix_ci",
                     current_engine=active_engine,
                 )
-                if sb_choice and sb_choice.is_switchback:
+                if sb_choice:
+                    if sb_choice.engine != active_engine:
+                        engine_failure_count = 0
                     active_engine = sb_choice.engine
-                    engine_failure_count = 0
+                else:
+                    return CiWatchResult(passed=False, rounds_used=round_num, detail="No engine available for CI fix.", last_engine=active_engine)
 
             if not self.scheduler.has_run_budget_remaining():
                 return CiWatchResult(
@@ -243,7 +246,7 @@ class CiPipelineManager:
 
             runner = self.runners.get(active_engine)
             if not runner:
-                runner = list(self.runners.values())[0]
+                return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected CI fixer {active_engine} is unavailable.", last_engine=active_engine)
 
             sha_before = self.vcs.remote_branch_sha(local_repo, branch)
             self.scheduler.record_invocation()

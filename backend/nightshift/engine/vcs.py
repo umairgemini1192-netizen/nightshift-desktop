@@ -145,12 +145,22 @@ class SubprocessGitGh:
         self.fetch_origin(local_repo)
 
         if worktree_dir.exists():
-            run_subprocess_with_timeout(
-                ["git", "worktree", "remove", "--force", str(worktree_dir)],
-                cwd=local_repo,
-                timeout_seconds=60,
+            rc, out, err, _ = run_subprocess_with_timeout(
+                ["git", "branch", "--show-current"], cwd=worktree_dir, timeout_seconds=30,
             )
-            shutil.rmtree(worktree_dir, ignore_errors=True)
+            rc_root, root, _, _ = run_subprocess_with_timeout(
+                ["git", "rev-parse", "--show-toplevel"], cwd=worktree_dir, timeout_seconds=30,
+            )
+            rc_common, common, _, _ = run_subprocess_with_timeout(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=worktree_dir, timeout_seconds=30,
+            )
+            rc_repo, repo_common, _, _ = run_subprocess_with_timeout(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=local_repo, timeout_seconds=30,
+            )
+            if (rc != 0 or out.strip() != branch or rc_root != 0 or Path(root.strip()).resolve() != worktree_dir.resolve()
+                    or rc_common != 0 or rc_repo != 0 or Path(common.strip()).resolve() != Path(repo_common.strip()).resolve()):
+                raise RuntimeError(f"Existing worktree does not match branch {branch}: {err}")
+            return worktree_dir
         run_subprocess_with_timeout(["git", "worktree", "prune"], cwd=local_repo, timeout_seconds=60)
 
         base = f"origin/{base_branch}"
