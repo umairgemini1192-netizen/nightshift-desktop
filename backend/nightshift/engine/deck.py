@@ -71,6 +71,19 @@ def generate_deck_data(
     handoffs = store.list_handoffs()
     handoff_count = len(handoffs)
 
+    # 4b. Gold saved tonight (estimate) (BLUEPRINT 5h)
+    stats = store.get_engine_stats()
+    economy_engines = {e["id"] for e in store.list_engines() if e.get("cost_tier") == "economy"}
+    economy_successes = sum(s.get("successes", 0) for s in stats if s.get("engine") in economy_engines)
+    gold_saved_dollars = round(economy_successes * 0.30, 2)
+    gold_saved_tokens = economy_successes * 15000
+    gold_saved_tonight = {
+        "jobs_done": economy_successes,
+        "cost_saved_usd": gold_saved_dollars,
+        "tokens_saved": gold_saved_tokens,
+        "estimate_label": f"${gold_saved_dollars} gold saved tonight (estimate)",
+    }
+
     # 5. One-line plain English headline
     if needs_you:
         headline = f"{len(needs_you)} phase(s) need your attention · {len(done_tonight)} completed tonight"
@@ -101,6 +114,7 @@ def generate_deck_data(
         },
         "next": upcoming[:3],
         "usage_tonight": engine_usage,
+        "gold_saved_tonight": gold_saved_tonight,
         "handoff_count": handoff_count,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }

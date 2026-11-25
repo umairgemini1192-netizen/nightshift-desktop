@@ -162,3 +162,15 @@ async def test_agy_success_counts_towards_daily_budget(tmp_path, monkeypatch):
         monkeypatch.setattr("nightshift.runners.agy.run_subprocess_with_timeout", lambda *a, **k: (0, "done", "", False))
         await AgyRunner(ledger).run("work", tmp_path)
         assert not ledger.check_budget_cap("agy", {"max_runs_today": 1})
+
+def test_budget_percentage_preserves_caps(tmp_path):
+    with Store(tmp_path / "percentage.db") as store:
+        store.migrate()
+        ledger = QuotaLedger(store)
+        budget = {"max_runs_today": 10, "max_tokens_today": 1000, "weekly_percent": 20}
+        assert ledger.check_budget_cap("codex", budget)
+        ledger.record_usage("codex", "", tokens_in=100)
+        assert ledger.check_budget_cap("codex", budget)
+        ledger.record_usage("codex", "", tokens_in=100)
+        assert not ledger.check_budget_cap("codex", budget)
+        assert not ledger.check_budget_cap("codex", {"weekly_percent": 0})

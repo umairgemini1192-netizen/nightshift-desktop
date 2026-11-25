@@ -8,6 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCREENSHOTS_DIR = path.resolve(__dirname, "../../screenshots");
 
 const OTHER_MODULES = [
+  { id: "plan-studio", route: "/plan-studio" },
   { id: "plan-builder", route: "/plan-builder" },
   { id: "runs-history", route: "/runs" },
   { id: "engines-quota", route: "/engines" },
@@ -15,6 +16,13 @@ const OTHER_MODULES = [
 ] as const;
 
 const BASE_SCENARIOS = ["idle", "running", "failure", "empty"] as const;
+
+const PLAN_STUDIO_SCENARIOS = [
+  "council-drafting",
+  "council-critique",
+  "council-final-ready",
+  "council-substitution",
+] as const;
 
 const MISSION_CONTROL_SCENARIOS = [
   "idle",
@@ -91,6 +99,59 @@ for (const scenario of MISSION_CONTROL_SCENARIOS) {
           theme === "dark"
             ? `mission-control-${scenario}-${vp.name}.png`
             : `mission-control-${scenario}-light-${vp.name}.png`;
+        const outPath = path.join(SCREENSHOTS_DIR, filename);
+        await page.screenshot({ path: outPath, fullPage: true });
+      });
+    }
+  }
+}
+
+// Plan Studio: specialized council scenarios (drafting, critique, final ready, substitution)
+for (const scenario of PLAN_STUDIO_SCENARIOS) {
+  for (const vp of VIEWPORTS) {
+    for (const theme of THEMES) {
+      test(`plan-studio [${scenario}] @ ${vp.name} (${theme})`, async ({ page }) => {
+        await page.setViewportSize({ width: vp.width, height: vp.height });
+        await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme });
+
+        await page.goto(`/plan-studio?scenario=${scenario}`, { waitUntil: "networkidle" });
+        await page.locator("main h1").waitFor({ state: "visible" });
+
+        await page.evaluate((t) => {
+          document.documentElement.dataset.theme = t;
+        }, theme);
+
+        if (vp.fontScalePct !== 100) {
+          await page.evaluate((pct) => {
+            document.documentElement.style.fontSize = `${pct}%`;
+          }, vp.fontScalePct);
+        }
+
+        await page.evaluate(() => document.fonts.ready);
+
+        // Assert zero horizontal overflow.
+        const overflow = await page.evaluate(() => ({
+          scrollWidth: document.documentElement.scrollWidth,
+          clientWidth: document.documentElement.clientWidth,
+        }));
+        expect(
+          overflow.scrollWidth,
+          `Horizontal overflow on plan-studio (${scenario}, ${vp.name}, ${theme}): scrollWidth=${overflow.scrollWidth} > clientWidth=${overflow.clientWidth}`,
+        ).toBeLessThanOrEqual(overflow.clientWidth);
+
+        const axeResults = await new AxeBuilder({ page }).analyze();
+        const blocking = axeResults.violations.filter(
+          (v) => v.impact === "serious" || v.impact === "critical",
+        );
+        expect(
+          blocking,
+          `Accessibility violations on plan-studio (${scenario}, ${theme}, ${vp.name})`,
+        ).toEqual([]);
+
+        const filename =
+          theme === "dark"
+            ? `plan-studio-${scenario}-${vp.name}.png`
+            : `plan-studio-${scenario}-light-${vp.name}.png`;
         const outPath = path.join(SCREENSHOTS_DIR, filename);
         await page.screenshot({ path: outPath, fullPage: true });
       });

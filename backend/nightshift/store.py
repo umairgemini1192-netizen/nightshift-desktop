@@ -131,7 +131,7 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS router_decisions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            step_id INTEGER NOT NULL,
+            step_id INTEGER,
             chosen TEXT NOT NULL,
             reason TEXT NOT NULL,
             scores_json TEXT NOT NULL DEFAULT '{}',
@@ -276,9 +276,31 @@ def _migration_002_project_columns(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE projects SET output_dir = output_folder WHERE output_dir = ''")
 
 
+def _migration_003_nullable_router_step(conn: sqlite3.Connection) -> None:
+    """Allow decisions made before a step exists while preserving prior decisions."""
+    columns = {row[1]: row for row in conn.execute("PRAGMA table_info(router_decisions)")}
+    if not columns or not columns["step_id"][3]:
+        return
+    conn.execute("""CREATE TABLE router_decisions_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step_id INTEGER,
+        chosen TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        scores_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (step_id) REFERENCES steps(id) ON DELETE CASCADE
+    )""")
+    conn.execute("""INSERT INTO router_decisions_new
+        (id, step_id, chosen, reason, scores_json, created_at)
+        SELECT id, step_id, chosen, reason, scores_json, created_at FROM router_decisions""")
+    conn.execute("DROP TABLE router_decisions")
+    conn.execute("ALTER TABLE router_decisions_new RENAME TO router_decisions")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
+    (3, "003_nullable_router_step", _migration_003_nullable_router_step),
 ]
 
 
@@ -770,7 +792,8 @@ class Store:
             row = self._conn.execute(
                 """
                 SELECT reset_at FROM runner_ledger
-                WHERE runner = ? AND model = ? AND reset_at IS NOT NULL AND reset_at > ?
+                WHERE runner = ? AND (model = ? OR model = 'default' OR model = '')
+                  AND reset_at IS NOT NULL AND reset_at > ?
                 ORDER BY id DESC LIMIT 1
                 """,
                 (runner, model, now),
@@ -921,9 +944,9 @@ class Store:
 
     def record_router_decision(
         self,
-        step_id: int,
         chosen: str,
         reason: str,
+        step_id: int | None = None,
         scores_json: str = "{}",
     ) -> int:
         now = _utc_now()
@@ -942,6 +965,37 @@ class Store:
         rows = self._conn.execute(
             "SELECT * FROM router_decisions ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_council_run(
+        self,
+        plan_id: str,
+        role: str,
+        engine: str,
+        input_text: str = "",
+        output_text: str = "",
+        usage_estimate: dict[str, Any] | str = "{}",
+    ) -> int:
+        now = _utc_now()
+        usage_json = json.dumps(usage_estimate) if isinstance(usage_estimate, dict) else str(usage_estimate)
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO council_runs (plan_id, role, engine, input, output, usage_estimate, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (plan_id, role, engine, input_text, output_text, usage_json, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_council_runs(self, plan_id: str | None = None) -> list[dict[str, Any]]:
+        if plan_id:
+            rows = self._conn.execute(
+                "SELECT * FROM council_runs WHERE plan_id = ? ORDER BY id ASC", (plan_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM council_runs ORDER BY id ASC").fetchall()
         return [dict(r) for r in rows]
 
     def update_engine_stats(
@@ -1020,3 +1074,4 @@ class Store:
                 return False
             expected_prev = row["hash"]
         return True
+

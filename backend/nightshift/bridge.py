@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from nightshift import __version__
+from nightshift.engine.council import CouncilRoleResult, CouncilSessionResult, PlanningCouncil
+from nightshift.engine.credentials import get_credential_store
 from nightshift.engine.deck import generate_deck_data
 from nightshift.engine.logins import LoginHealthChecker
 from nightshift.engine.planner import (
@@ -23,6 +25,7 @@ from nightshift.engine.planner import (
     validate_plan,
     validate_plan_dag,
 )
+from nightshift.engine.router import Router, test_engine_cli_version
 from nightshift.engine.state_machine import ProjectConfig, set_keep_awake
 from nightshift.events import Event, EventBus
 from nightshift.modules.registry import ModuleRegistry
@@ -61,11 +64,68 @@ class BridgeAPI:
         self._events = events
         self._registry = registry
         self._engine = engine
-        self._logins = LoginHealthChecker(store=store, quota_ledger=QuotaLedger(store))
+        self._quota = QuotaLedger(store)
+        self._logins = LoginHealthChecker(store=store, quota_ledger=self._quota)
+        self._creds = get_credential_store()
+        self._router: Router | None = None
         self._stop_armed = False
         self._active_project_id: str | None = None
         self._run_lock = threading.Lock()
         self._run_thread: threading.Thread | None = None
+
+    def _get_router(self) -> Router:
+        if self._router is None:
+            self._router = Router(
+                self._store,
+                self._quota,
+                login_checker=self._logins,
+                cred_store=self._creds,
+            )
+        return self._router
+
+    @staticmethod
+    def _serialize_council_role(res: CouncilRoleResult) -> dict[str, Any]:
+        names = {
+            "agy": "Antigravity",
+            "gemini": "Gemini CLI",
+            "codex": "Codex CLI",
+            "claude": "Claude Code",
+            "qwen": "Qwen Code",
+            "deepseek": "DeepSeek",
+            "kimi": "Kimi K2",
+            "glm": "GLM",
+            "minimax": "MiniMax",
+        }
+        tokens = int(res.usage_estimate.get("tokens_in", 0)) + int(res.usage_estimate.get("tokens_out", 0))
+        return {
+            "role": res.role,
+            "engineId": res.engine_id,
+            "name": names.get(res.runner, res.engine_id),
+            "model": res.model,
+            "state": "skipped" if res.skipped else "done",
+            "substituted": res.substituted,
+            "substitutionReason": res.substitution_reason or None,
+            "elapsedSeconds": res.elapsed_seconds,
+            "tokensEstimate": tokens,
+            "costUsdEstimate": float(res.usage_estimate.get("cost_usd", 0.0)),
+            "notes": list(res.notes),
+            "issues": list(res.critique_issues) if res.critique_issues else None,
+            "tradeoffSummary": res.tradeoff_summary or None,
+            "phases": list(res.phases),
+        }
+
+    def _serialize_council_session(self, session: CouncilSessionResult) -> dict[str, Any]:
+        return {
+            "goal": session.goal,
+            "planId": session.plan_id,
+            "diffSummary": session.diff_summary,
+            "tradeoffSummary": session.final.tradeoff_summary or session.diff_summary,
+            "roles": {
+                "draft": self._serialize_council_role(session.draft),
+                "critique": self._serialize_council_role(session.critique),
+                "final": self._serialize_council_role(session.final),
+            },
+        }
 
     def call(self, method: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         """Dispatch a ``<module>.<action>`` or ``app.<action>`` RPC call."""
@@ -101,6 +161,7 @@ class BridgeAPI:
                 "codex": ["codex", "login"],
                 "gemini": ["gemini"],
                 "agy": ["agy"],
+                "qwen": ["qwen"],
             }
             command = commands.get(str(payload.get("tool", "")))
             if command is None:
@@ -197,7 +258,21 @@ class BridgeAPI:
                 plan_id = plans[0]["id"] if plans else ""
             plan = self._store.get_plan(plan_id) if plan_id else None
             phases = self._store.list_phases(plan_id) if plan_id else self._store.list_phases()
-            return {"ok": True, "data": {"plan": plan, "phases": phases}}
+            enriched_phases = []
+            for ph in phases:
+                assignment = self._store.get_phase_assignment(ph["id"])
+                item = dict(ph)
+                if assignment:
+                    if assignment.get("planned_engine"):
+                        item["implementer"] = assignment["planned_engine"]
+                    if assignment.get("override_engine"):
+                        item["overrideImplementer"] = assignment["override_engine"]
+                    if assignment.get("model"):
+                        item["overrideModel"] = assignment["model"]
+                    if assignment.get("effort"):
+                        item["overrideEffort"] = assignment["effort"]
+                enriched_phases.append(item)
+            return {"ok": True, "data": {"plan": plan, "phases": enriched_phases}}
 
         if method == "plan.save":
             plan_data = payload.get("plan") or {}
@@ -318,16 +393,169 @@ class BridgeAPI:
         if method == "plan.setImplementer":
             phase_ids = payload.get("phaseIds") or []
             engine = str(payload.get("engine") or "")
-            engine = {"Antigravity": "agy", "Gemini CLI": "gemini", "Codex CLI": "codex", "Claude Code": "claude"}.get(engine, engine)
+            engine = {
+                "Antigravity": "agy",
+                "Gemini CLI": "gemini",
+                "Codex CLI": "codex",
+                "Claude Code": "claude",
+                "Qwen Code": "qwen",
+                "DeepSeek": "deepseek",
+                "Kimi K2": "kimi",
+                "GLM": "glm",
+                "MiniMax": "minimax",
+            }.get(engine, engine)
             model = str(payload.get("model") or "")
             effort = str(payload.get("effort") or "medium")
             reset = bool(payload.get("reset", False))
             for pid in phase_ids:
+                existing = self._store.get_phase_assignment(pid) or {}
+                planned = existing.get("planned_engine") or "agy"
                 if reset:
-                    self._store.upsert_phase_assignment(pid, planned_engine="agy", override_engine=None, model=None, effort="medium")
+                    self._store.upsert_phase_assignment(pid, planned_engine=planned, override_engine=None, model=None, effort="medium")
                 else:
-                    self._store.upsert_phase_assignment(pid, override_engine=engine, model=model, effort=effort)
+                    self._store.upsert_phase_assignment(pid, planned_engine=planned, override_engine=engine, model=model, effort=effort)
+            if phase_ids:
+                action_text = (
+                    f"Reset implementer to plan choice for {len(phase_ids)} phase(s); applies from the next phase."
+                    if reset
+                    else f"Set implementer to {engine} ({effort} effort) for {len(phase_ids)} phase(s); applies from the next phase."
+                )
+                self._events.emit(Event(kind="phase.assignment_updated", plain_text=action_text, level="info"))
             return {"ok": True, "data": {"updated": len(phase_ids)}}
+
+        # AI Planning Council (BLUEPRINT 5b)
+        if method == "council.run":
+            goal = str(payload.get("goal") or "").strip()
+            if not goal:
+                return {"ok": False, "error": "Describe what you want built before running the Planning Council."}
+            projects = self._store.list_projects()
+            project_id = str(payload.get("projectId") or self._active_project_id or (projects[0]["id"] if projects else ""))
+            project = self._store.get_project(project_id) if project_id else None
+            repo_path = Path(project["local_path"]) if project and project.get("local_path") else Path(".")
+            plan_id = str(payload.get("planId") or "") or None
+            council = PlanningCouncil(self._store, self._get_router())
+            session = asyncio.run(
+                council.run_council(goal=goal, repo_path=repo_path, plan_id=plan_id, project_id=project_id or None)
+            )
+            self._events.emit(
+                Event(
+                    kind="council.completed",
+                    plain_text=f"Planning Council produced {len(session.approved_plan.get('phases', []))} phase(s) for review.",
+                    level="info",
+                )
+            )
+            return {"ok": True, "data": self._serialize_council_session(session)}
+
+        if method == "council.session":
+            plan_id = str(payload.get("planId") or "")
+            runs = self._store.list_council_runs(plan_id=plan_id or None)
+            if not runs:
+                return {"ok": True, "data": None}
+            target_plan_id = plan_id or str(runs[-1]["plan_id"])
+            plan_runs = [r for r in runs if str(r["plan_id"]) == target_plan_id]
+            by_role = {r["role"]: r for r in plan_runs}
+            plan_row = self._store.get_plan(target_plan_id) or {}
+
+            def _role_payload(role_name: str, default_eng: str) -> dict[str, Any]:
+                row = by_role.get(role_name)
+                if not row:
+                    return {
+                        "role": role_name,
+                        "engineId": default_eng,
+                        "name": default_eng,
+                        "model": "",
+                        "state": "waiting",
+                        "substituted": False,
+                        "elapsedSeconds": 0,
+                        "tokensEstimate": 0,
+                        "costUsdEstimate": 0.0,
+                        "notes": [],
+                        "phases": [],
+                    }
+                try:
+                    out_obj = json.loads(row.get("output") or "{}")
+                except Exception:
+                    out_obj = {}
+                try:
+                    usage_obj = json.loads(row.get("usage_estimate") or "{}")
+                except Exception:
+                    usage_obj = {}
+                tokens = int(usage_obj.get("tokens_in", 0)) + int(usage_obj.get("tokens_out", 0))
+                return {
+                    "role": role_name,
+                    "engineId": row["engine"],
+                    "name": row["engine"],
+                    "model": "",
+                    "state": "done",
+                    "substituted": False,
+                    "elapsedSeconds": 0,
+                    "tokensEstimate": tokens,
+                    "costUsdEstimate": float(usage_obj.get("cost_usd", 0.0)),
+                    "notes": [out_obj.get("tradeoff_summary")] if out_obj.get("tradeoff_summary") else [],
+                    "issues": out_obj.get("issues"),
+                    "tradeoffSummary": out_obj.get("tradeoff_summary"),
+                    "phases": out_obj.get("phases") or [],
+                }
+
+            final_role = _role_payload("final", "claude")
+            return {
+                "ok": True,
+                "data": {
+                    "goal": plan_row.get("goal") or str(payload.get("goal") or ""),
+                    "planId": target_plan_id,
+                    "diffSummary": f"Loaded council session for {target_plan_id}.",
+                    "tradeoffSummary": final_role.get("tradeoffSummary") or "",
+                    "roles": {
+                        "draft": _role_payload("draft", "gemini"),
+                        "critique": _role_payload("critique", "codex"),
+                        "final": final_role,
+                    },
+                },
+            }
+
+        if method == "council.approve":
+            plan_id = str(payload.get("planId") or f"council-{len(self._store.list_plans()) + 1}")
+            goal = str(payload.get("goal") or "")
+            projects = self._store.list_projects()
+            project_id = str(payload.get("projectId") or self._active_project_id or (projects[0]["id"] if projects else "default"))
+            title = str(payload.get("title") or (f"Council Plan: {goal[:40]}" if goal else "Council Plan"))
+            phases_data = payload.get("phases") or []
+            for phase in phases_data:
+                existing = self._store.get_phase(str(phase["id"]))
+                if existing and existing["plan_id"] != plan_id:
+                    return {"ok": False, "error": f"Phase ID {phase['id']} belongs to another plan."}
+            if not self._store.get_project(project_id):
+                self._store.create_project(project_id, project_id, "owner/repo", ".")
+            self._store.create_plan(plan_id, project_id, title, goal=goal)
+            for idx, p in enumerate(phases_data):
+                pid = str(p["id"])
+                deps = p.get("depends_on") or []
+                deps_json = json.dumps(deps) if isinstance(deps, list) else str(deps)
+                self._store.upsert_phase(
+                    phase_id=pid,
+                    plan_id=plan_id,
+                    title=str(p.get("title", pid)),
+                    branch=str(p.get("branch", f"feat/{pid}")),
+                    prompt=str(p.get("prompt", "")),
+                    depends_on_json=deps_json,
+                    size=str(p.get("size", "medium")),
+                    position=idx,
+                    ladder=str(p.get("ladder", "default")),
+                    timeout_minutes=int(p.get("timeout_minutes", 180)),
+                    auto_merge=bool(p.get("auto_merge", True)),
+                    release_after_merge=bool(p.get("release_after_merge", False)),
+                )
+                impl = p.get("implementer")
+                if impl and impl != "auto":
+                    self._store.upsert_phase_assignment(pid, planned_engine=str(impl))
+            self._events.emit(
+                Event(
+                    kind="council.approved",
+                    plain_text=f"Approved council plan '{title}' with {len(phases_data)} phase(s) and sent to Plan Builder.",
+                    level="info",
+                )
+            )
+            return {"ok": True, "data": {"approved": True, "planId": plan_id}}
 
         # Runs history
         if method == "runs.list":
@@ -430,21 +658,60 @@ class BridgeAPI:
                     {"id": "codex", "runner": "codex", "model": "o3-mini", "effort": "medium", "state": "ready", "quotaUsedPct": 20, "coolingUntil": None},
                     {"id": "claude", "runner": "claude", "model": "claude-3-7-sonnet", "effort": "medium", "state": "ready", "quotaUsedPct": 10, "coolingUntil": None},
                 ]
-            names = {"agy": "Antigravity", "gemini": "Gemini CLI", "codex": "Codex CLI", "claude": "Claude Code"}
-            engines = [{
-                **engine,
-                "name": names.get(engine["runner"], engine["runner"]),
-                "costTier": engine.get("cost_tier", "standard"),
-                "state": engine.get("state", "ready" if engine.get("enabled", 1) else "unavailable"),
-                "coolingUntil": engine.get("coolingUntil"),
-                "quotaUsedPct": engine.get("quotaUsedPct", 0),
-                "skills": json.loads(engine.get("skills_json", "{}")),
-            } for engine in engines]
-            return {"ok": True, "data": engines}
+            names = {
+                "agy": "Antigravity",
+                "gemini": "Gemini CLI",
+                "codex": "Codex CLI",
+                "claude": "Claude Code",
+                "qwen": "Qwen Code",
+                "deepseek": "DeepSeek",
+                "kimi": "Kimi K2",
+                "glm": "GLM",
+                "minimax": "MiniMax",
+            }
+            formatted = []
+            for engine in engines:
+                runner = engine["runner"]
+                model = engine.get("model", "")
+                reset_dt = self._quota.get_reset_at(runner, model)
+                cooling_until = reset_dt.strftime("%H:%M") if reset_dt else engine.get("coolingUntil")
+                if not engine.get("enabled", 1):
+                    state = "unavailable"
+                elif cooling_until:
+                    state = "cooling"
+                else:
+                    state = engine.get("state", "ready")
+                try:
+                    skills = json.loads(engine.get("skills_json", "{}"))
+                except Exception:
+                    skills = {}
+                try:
+                    budget = json.loads(engine.get("budget_json", "{}"))
+                except Exception:
+                    budget = {}
+                display_name = names.get(engine["id"], names.get(runner, runner))
+                formatted.append({
+                    **engine,
+                    "name": display_name,
+                    "costTier": engine.get("cost_tier", "standard"),
+                    "state": state,
+                    "coolingUntil": cooling_until,
+                    "quotaUsedPct": engine.get("quotaUsedPct", 0),
+                    "skills": skills,
+                    "budget": budget,
+                })
+            return {"ok": True, "data": formatted}
 
         if method == "engines.update":
             eng_id = str(payload.get("id", ""))
             existing = self._store.get_engine(eng_id) or {}
+            cmd_tmpl = existing.get("command_template", "[]")
+            if "command_template" in payload:
+                raw_t = payload["command_template"]
+                cmd_tmpl = json.dumps(raw_t) if isinstance(raw_t, list) else str(raw_t)
+            qp_json = existing.get("quota_patterns_json", "[]")
+            if "quota_patterns" in payload:
+                qp_json = json.dumps(list(payload["quota_patterns"]))
             self._store.upsert_engine(
                 engine_id=eng_id,
                 runner=str(payload.get("runner", existing.get("runner", eng_id))),
@@ -453,13 +720,108 @@ class BridgeAPI:
                 skills_json=json.dumps(payload["skills"]) if "skills" in payload else existing.get("skills_json", "{}"),
                 cost_tier=str(payload.get("costTier", existing.get("cost_tier", "standard"))),
                 budget_json=json.dumps(payload["budget"]) if "budget" in payload else existing.get("budget_json", "{}"),
-                enabled=existing.get("enabled", 1),
-                pinned=existing.get("pinned", 0),
-                command_template=existing.get("command_template", "[]"),
-                usage_parser=existing.get("usage_parser", ""),
-                quota_patterns_json=existing.get("quota_patterns_json", "[]"),
+                enabled=int(payload.get("enabled", existing.get("enabled", 1))),
+                pinned=int(payload.get("pinned", existing.get("pinned", 0))),
+                command_template=cmd_tmpl,
+                usage_parser=str(payload.get("usage_parser", existing.get("usage_parser", ""))),
+                quota_patterns_json=qp_json,
+            )
+            self._events.emit(
+                Event(
+                    kind="engine.updated",
+                    plain_text=f"Updated engine {eng_id} configuration; changes apply from the next phase.",
+                    level="info",
+                )
             )
             return {"ok": True, "data": {"updated": eng_id}}
+
+        if method == "engines.addEngine":
+            eng_id = str(payload.get("id") or "").strip().lower()
+            runner = str(payload.get("runner") or eng_id).strip()
+            model = str(payload.get("model") or "").strip()
+            if not eng_id or not runner:
+                return {"ok": False, "error": "Engine requires an ID and runner CLI name."}
+            raw_tmpl = payload.get("command_template") or [runner, "-p", "{instruction}"]
+            if isinstance(raw_tmpl, str):
+                try:
+                    parsed_tmpl = json.loads(raw_tmpl)
+                    if not isinstance(parsed_tmpl, list) or not all(isinstance(x, str) for x in parsed_tmpl):
+                        return {"ok": False, "error": "Command template must be a JSON array of strings."}
+                    tmpl_json = json.dumps(parsed_tmpl)
+                except Exception as exc:
+                    return {"ok": False, "error": f"Invalid command template JSON: {exc}"}
+            elif isinstance(raw_tmpl, list):
+                tmpl_json = json.dumps([str(x) for x in raw_tmpl])
+            else:
+                return {"ok": False, "error": "Command template must be an argument list."}
+
+            raw_patterns = payload.get("quota_patterns") or []
+            patterns_list = [str(p).strip() for p in raw_patterns if str(p).strip()]
+            skills = payload.get("skills") or {"backend": 3, "ui": 3, "fix_ci": 3, "docs": 3, "plan": 2, "review": 2}
+            budget = payload.get("budget") or {}
+            self._store.upsert_engine(
+                engine_id=eng_id,
+                runner=runner,
+                model=model,
+                effort=str(payload.get("effort") or "medium"),
+                skills_json=json.dumps(skills),
+                cost_tier=str(payload.get("costTier") or "economy"),
+                budget_json=json.dumps(budget),
+                enabled=1,
+                pinned=0,
+                command_template=tmpl_json,
+                usage_parser=str(payload.get("usage_parser") or ""),
+                quota_patterns_json=json.dumps(patterns_list),
+            )
+            if payload.get("baseUrl"):
+                self._store.set_setting(f"engine.{eng_id}.base_url", str(payload["baseUrl"]).strip())
+            self._events.emit(
+                Event(
+                    kind="engine.added",
+                    plain_text=f"Added AI engine {eng_id} ({runner}) to catalogue; changes apply from the next phase.",
+                    level="info",
+                )
+            )
+            return {"ok": True, "data": {"added": eng_id}}
+
+        if method == "engines.saveKey":
+            eng_id = str(payload.get("engineId") or payload.get("id") or "").strip().lower()
+            key = str(payload.get("key") or "")
+            if not eng_id:
+                return {"ok": False, "error": "Engine ID is required to save an API key."}
+            self._creds.set_secret(f"api_key_{eng_id}", key)
+            self._events.emit(
+                Event(
+                    kind="engine.key_saved",
+                    plain_text=f"Saved encrypted API key for {eng_id}; changes apply from the next phase.",
+                    level="info",
+                )
+            )
+            return {"ok": True, "data": {"saved": True, "engineId": eng_id}}
+
+        if method == "engines.test":
+            runner = str(payload.get("runner") or payload.get("engineId") or "").strip()
+            if not runner:
+                return {"ok": False, "error": "Specify a CLI runner to test."}
+            eng = self._store.get_engine(runner)
+            target_runner = eng["runner"] if eng else runner
+            ok, message = test_engine_cli_version(target_runner)
+            return {
+                "ok": True,
+                "data": {
+                    "ok": ok,
+                    "output": message if ok else None,
+                    "error": None if ok else message,
+                },
+            }
+
+        if method == "engines.checkLogins":
+            projects = self._store.list_projects()
+            active_id = self._active_project_id or (projects[0]["id"] if projects else "")
+            proj = self._store.get_project(active_id) if active_id else None
+            repo = str(payload.get("repo") or (proj["repo"] if proj else "owner/repo"))
+            checks = self._logins.check_all(repo=repo, force=True)
+            return {"ok": True, "data": {name: asdict(result) for name, result in checks.items()}}
 
         if method == "engines.getLadders":
             ladders_raw = self._store.get_setting("engines.ladders")
@@ -496,7 +858,17 @@ class BridgeAPI:
 
         if method == "engines.getLedger":
             entries = self._store.get_ledger_entries(limit=50)
-            decisions = self._store.list_router_decisions(limit=20)
+            raw_decisions = self._store.list_router_decisions(limit=20)
+            decisions = [
+                {
+                    "id": d["id"],
+                    "step": f"Step #{d['step_id']}" if d.get("step_id") else "Router selection",
+                    "timestamp": str(d.get("created_at", ""))[11:16] or "",
+                    "chosen": d["chosen"],
+                    "reason": d["reason"],
+                }
+                for d in raw_decisions
+            ]
             chart_data = [
                 {"runner": "agy", "name": "Antigravity", "tokens": 42000, "costEstimate": "$0.00 (Flat)", "pct": 65},
                 {"runner": "gemini", "name": "Gemini CLI", "tokens": 18500, "costEstimate": "$0.04 (Est.)", "pct": 30},
@@ -570,11 +942,35 @@ class BridgeAPI:
                     {"position": 3, "engine": "codex", "model": "o3-mini", "effort": "medium"},
                     {"position": 4, "engine": "claude", "model": "claude-3-7-sonnet", "effort": "medium"},
                 ]
-            return {"ok": True, "data": p_list}
+            latest_logins = self._store.get_latest_login_checks()
+            enriched = []
+            for item in p_list:
+                eng = item["engine"]
+                reset_dt = self._quota.get_reset_at(eng, item.get("model", ""))
+                login = latest_logins.get(eng)
+                if reset_dt:
+                    availability = "Cooling down"
+                    back_at = reset_dt.strftime("%H:%M")
+                elif login and login.get("state") != "Ready":
+                    availability = str(login["state"])
+                    back_at = login.get("back_at")
+                else:
+                    availability = "Ready"
+                    back_at = None
+                enriched.append({**item, "availability": availability, "backAt": back_at})
+            return {"ok": True, "data": enriched}
 
         if method == "settings.setPriorityList":
             items = payload.get("items") or []
             self._store.set_priority_list(items)
+            order_names = ", ".join(str(i.get("engine", "")) for i in items)
+            self._events.emit(
+                Event(
+                    kind="settings.priority_updated",
+                    plain_text=f"Updated global fallback priority order ({order_names}); changes apply from the next phase.",
+                    level="info",
+                )
+            )
             return {"ok": True, "data": items}
 
         if method == "settings.getGuardLimits":

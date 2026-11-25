@@ -374,3 +374,70 @@ def test_engine_effort_update_preserves_configuration(tmp_path):
     after = store.get_engine("custom")
     assert after == {**before, "effort": "high"}
     store.close()
+
+
+def test_bridge_council_and_custom_engine_dpapi_and_test(tmp_path, monkeypatch):
+    from nightshift.engine.credentials import MemoryCredentialStore
+
+    store = Store(tmp_path / "council_bridge.db")
+    store.migrate()
+    events = EventBus(store=store)
+    bridge = BridgeAPI(store, events, ModuleRegistry())
+    bridge._creds = MemoryCredentialStore()
+
+    store.create_project("p1", "Demo", "owner/demo", str(tmp_path))
+
+    # Add custom engine via template arg list
+    add_resp = bridge.call("engines.addEngine", {
+        "id": "deepseek-custom",
+        "runner": "claude-compatible",
+        "model": "deepseek-chat",
+        "costTier": "economy",
+        "command_template": ["claude", "-p", "{instruction}", "--model", "{model}"],
+        "quota_patterns": ["429", "insufficient_quota"],
+        "baseUrl": "https://api.deepseek.com/anthropic",
+    })
+    assert add_resp["ok"]
+    assert store.get_engine("deepseek-custom") is not None
+
+    # Save API key via DPAPI interface and assert it never leaks into events
+    secret = "sk-super-secret-deepseek-999999"
+    key_resp = bridge.call("engines.saveKey", {"engineId": "deepseek-custom", "key": secret})
+    assert key_resp["ok"]
+    assert bridge._creds.get_secret("api_key_deepseek-custom") == secret
+    for ev in store.list_events():
+        assert secret not in ev["plain_text"]
+
+    # Test CLI version safely
+    monkeypatch.setattr("nightshift.bridge.test_engine_cli_version", lambda runner: (True, f"Verified: {runner} 2.0.0"))
+    test_resp = bridge.call("engines.test", {"runner": "deepseek-custom"})
+    assert test_resp["ok"]
+    assert test_resp["data"]["ok"] is True
+    assert "claude-compatible" in test_resp["data"]["output"]
+
+    # Approve council plan and verify phases + assignments saved
+    approve_resp = bridge.call("council.approve", {
+        "planId": "council-1",
+        "projectId": "p1",
+        "goal": "Build router",
+        "phases": [
+            {"id": "cp1", "title": "Router Core", "branch": "feat/cp1", "prompt": "Build", "implementer": "codex"},
+        ],
+    })
+    assert approve_resp["ok"]
+    plan_data = bridge.call("plan.get", {"planId": "council-1"})["data"]
+    assert len(plan_data["phases"]) == 1
+    assert plan_data["phases"][0]["implementer"] == "codex"
+    store.close()
+
+def test_council_approval_rejects_phase_from_other_plan(tmp_path):
+    with Store(tmp_path / "collision.db") as store:
+        store.migrate()
+        store.create_project("p", "Project", "owner/repo", ".")
+        store.create_plan("original", "p", "Original")
+        store.upsert_phase("shared", "original", "Original phase", "feat/original")
+        bridge = BridgeAPI(store, EventBus(), ModuleRegistry())
+        result = bridge.call("council.approve", {"planId": "new", "projectId": "p", "phases": [{"id": "shared"}]})
+        assert not result["ok"]
+        assert store.get_phase("shared")["plan_id"] == "original"
+        assert not any(p["id"] == "new" for p in store.list_plans())

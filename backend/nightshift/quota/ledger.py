@@ -213,6 +213,9 @@ class QuotaLedger:
         max_runs_today = b_data.get("max_runs_today")
         max_tokens_today = b_data.get("max_tokens_today")
 
+        percent = max(0.0, min(100.0, float(b_data.get("weekly_percent", 100)))) / 100.0
+        if percent == 0:
+            return False
         if max_runs_today is None and max_tokens_today is None:
             return True
 
@@ -220,12 +223,12 @@ class QuotaLedger:
         entries = self._store.get_ledger_entries(runner=runner, limit=500)
         today_entries = [e for e in entries if str(e.get("created_at", "")) >= today_start]
 
-        if max_runs_today is not None and len(today_entries) >= int(max_runs_today):
+        if max_runs_today is not None and len(today_entries) >= float(max_runs_today) * percent:
             return False
 
         if max_tokens_today is not None:
             total_tokens = sum(int(e.get("tokens_in", 0)) + int(e.get("tokens_out", 0)) for e in today_entries)
-            if total_tokens >= int(max_tokens_today):
+            if total_tokens >= float(max_tokens_today) * percent:
                 return False
 
         return True

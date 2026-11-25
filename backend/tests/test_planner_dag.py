@@ -130,6 +130,7 @@ def test_queue_json_import_export_round_trip() -> None:
                 "prompt": "Apply schema migrations cleanly",
                 "depends_on": [],
                 "ladder": "backend",
+                "size": "small",
                 "timeout_minutes": 60,
                 "auto_merge": True,
                 "release_after_merge": False,
@@ -142,6 +143,7 @@ def test_queue_json_import_export_round_trip() -> None:
                 "prompt": "Build Compose dashboard screen",
                 "depends_on": ["p1"],
                 "ladder": "ui",
+                "size": "large",
                 "timeout_minutes": 90,
                 "auto_merge": True,
                 "release_after_merge": False,
@@ -176,4 +178,11 @@ def test_queue_json_import_export_round_trip() -> None:
     assert exported["runner_timeout_minutes"] == legacy_payload["runner_timeout_minutes"]
     assert exported["failover_ladders"] == legacy_payload["failover_ladders"]
     assert exported["phases"] == legacy_payload["phases"]
+
+
+def test_legacy_queue_defaults_phase_size_to_medium() -> None:
+    imported = import_queue_json({"phases": [{"id": "p1"}]})
+    assert imported["phases"][0].size == "medium"
+    exported = export_queue_json(imported["project"], imported["plan"], imported["phases"])
+    assert exported["phases"][0]["size"] == "medium"
 

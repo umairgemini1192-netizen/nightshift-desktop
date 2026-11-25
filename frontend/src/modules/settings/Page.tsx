@@ -27,7 +27,16 @@ interface PriorityItem {
   engine: string;
   model: string;
   effort: string;
+  availability?: string;
+  backAt?: string | null;
 }
+
+const ECONOMY_KEY_ENGINES = [
+  { id: "deepseek", label: "DeepSeek", runner: "claude-compatible", model: "deepseek-chat" },
+  { id: "kimi", label: "Kimi K2", runner: "claude-compatible", model: "kimi-k2" },
+  { id: "glm", label: "GLM", runner: "claude-compatible", model: "glm-4" },
+  { id: "minimax", label: "MiniMax", runner: "claude-compatible", model: "minimax-text-01" },
+] as const;
 
 interface GuardLimits {
   maxAttempts: number;
@@ -51,6 +60,7 @@ export default function SettingsPage() {
   const resolvedTheme = useAppStore((s) => s.resolvedTheme);
   const setThemeMode = useAppStore((s) => s.setThemeMode);
   const bridge = useAppStore((s) => s.bridge);
+  const snapshot = useAppStore((s) => s.snapshot);
   const pushToast = useAppStore((s) => s.pushToast);
 
   // Projects CRUD state
@@ -67,6 +77,11 @@ export default function SettingsPage() {
     { position: 3, engine: "codex", model: "o3-mini", effort: "medium" },
     { position: 4, engine: "claude", model: "claude-3-7-sonnet", effort: "medium" },
   ]);
+  const [draggedPriorityIdx, setDraggedPriorityIdx] = useState<number | null>(null);
+
+  // Economy API keys (Windows DPAPI)
+  const [economyKeys, setEconomyKeys] = useState<Record<string, string>>({});
+  const [testingEconomyId, setTestingEconomyId] = useState<string | null>(null);
 
   // Guard limits state
   const [guardLimits, setGuardLimits] = useState<GuardLimits>({
@@ -248,8 +263,65 @@ export default function SettingsPage() {
     }
   };
 
+  const handleSaveEconomyKey = async (engineId: string, label: string) => {
+    const key = (economyKeys[engineId] ?? "").trim();
+    if (!key) {
+      pushToast({
+        title: "API key required",
+        description: `Enter an API key for ${label} before saving.`,
+        tone: "warning",
+      });
+      return;
+    }
+    try {
+      await bridge.call("engines.saveKey", { engineId, key });
+      setEconomyKeys((prev) => ({ ...prev, [engineId]: "" }));
+      pushToast({
+        title: `${label} key saved`,
+        description: "Encrypted with Windows DPAPI for your account and redacted from logs.",
+        tone: "success",
+      });
+    } catch (err) {
+      pushToast({
+        title: `Could not save ${label} key`,
+        description: String(err),
+        tone: "danger",
+      });
+    }
+  };
+
+  const handleTestEconomyEngine = async (engineId: string, runner: string, label: string) => {
+    setTestingEconomyId(engineId);
+    try {
+      const res = await bridge.call<{ ok: boolean; output?: string; error?: string }>("engines.test", {
+        runner,
+        engineId,
+      });
+      pushToast({
+        title: res?.ok ? `${label} verified` : `${label} test failed`,
+        description: res?.ok
+          ? (res.output ?? "CLI ready for isolated execution.")
+          : (res?.error ?? "Check CLI installation and API key."),
+        tone: res?.ok ? "success" : "danger",
+      });
+    } catch (err) {
+      pushToast({
+        title: `${label} test failed`,
+        description: String(err),
+        tone: "danger",
+      });
+    } finally {
+      setTestingEconomyId(null);
+    }
+  };
+
   const engineNameMap: Record<string, string> = {
-    agy: "Antigravity (Economy)",
+    qwen: "Qwen Code (Economy)",
+    deepseek: "DeepSeek (Economy)",
+    kimi: "Kimi K2 (Economy)",
+    glm: "GLM (Economy)",
+    minimax: "MiniMax (Economy)",
+    agy: "Antigravity (Standard)",
     gemini: "Gemini CLI (Standard)",
     codex: "Codex CLI (Standard)",
     claude: "Claude Code (Gold, Token-Metered)",
@@ -355,42 +427,110 @@ export default function SettingsPage() {
       {/* Engine Fallback Priority */}
       <GlassCard title="Engine Fallback Priority" icon="Layers">
         <p className="text-xs text-text-secondary">
-          Global fallback order when an AI engine encounters a quota limit or error. Top engine is chosen first.
+          Global fallback order when an AI engine encounters a quota limit or error. Drag rows or use buttons to reorder; changes apply from the next phase.
         </p>
 
         <div className="mt-3 flex flex-col gap-2">
-          {priorityList.map((item, idx) => (
-            <div
-              key={item.engine}
-              className="ns-glass flex items-center justify-between rounded-lg p-2.5 text-xs"
-            >
-              <div className="flex items-center gap-2">
-                <span className="font-mono font-semibold text-text-muted">#{item.position}</span>
-                <span className="font-semibold text-text-primary">
-                  {engineNameMap[item.engine] || item.engine}
-                </span>
-                <Badge tone="success">Ready</Badge>
-              </div>
+          {priorityList.map((item, idx) => {
+            const loginInfo = snapshot.logins?.[item.engine];
+            const availability = item.availability ?? loginInfo?.state ?? "Ready";
+            const backAt = item.backAt ?? loginInfo?.backAt ?? null;
+            const isReady = availability === "Ready";
+            const isCooling = availability === "Cooling down" || availability === "Limit reached";
+            return (
+              <div
+                key={item.engine}
+                draggable
+                onDragStart={() => setDraggedPriorityIdx(idx)}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={() => {
+                  if (draggedPriorityIdx !== null && draggedPriorityIdx !== idx) {
+                    movePriority(draggedPriorityIdx, idx);
+                    setDraggedPriorityIdx(null);
+                  }
+                }}
+                className="ns-glass flex items-center justify-between rounded-lg p-2.5 text-xs"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono font-semibold text-text-muted">#{item.position}</span>
+                  <span className="font-semibold text-text-primary">
+                    {engineNameMap[item.engine] || item.engine}
+                  </span>
+                  <Badge tone={isReady ? "success" : isCooling ? "warning" : "danger"}>
+                    {availability}
+                    {backAt ? ` (back at ${backAt})` : ""}
+                  </Badge>
+                </div>
 
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  disabled={idx === 0}
-                  onClick={() => movePriority(idx, idx - 1)}
-                  aria-label={`Move ${item.engine} priority up`}
-                  className="rounded p-1 text-text-muted hover:text-text-primary disabled:opacity-20"
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    disabled={idx === 0}
+                    onClick={() => movePriority(idx, idx - 1)}
+                    aria-label={`Move ${item.engine} priority up`}
+                    className="rounded p-1 text-text-muted hover:text-text-primary disabled:opacity-20"
+                  >
+                    <Icon name="ChevronUp" size={16} />
+                  </button>
+                  <button
+                    type="button"
+                    disabled={idx === priorityList.length - 1}
+                    onClick={() => movePriority(idx, idx + 1)}
+                    aria-label={`Move ${item.engine} priority down`}
+                    className="rounded p-1 text-text-muted hover:text-text-primary disabled:opacity-20"
+                  >
+                    <Icon name="ChevronDown" size={16} />
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </GlassCard>
+
+      {/* Economy Engine API Keys (Windows DPAPI, BLUEPRINT 5h) */}
+      <GlassCard title="Economy Engine API Keys (Windows DPAPI)" icon="KeyRound">
+        <p className="text-xs text-text-secondary">
+          Small and medium jobs use Economy engines first so premium quota is saved for critical work. Keys are encrypted with Windows DPAPI for your user account, injected per process without modifying ~/.claude, and redacted from all logs.
+        </p>
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {ECONOMY_KEY_ENGINES.map((eng) => (
+            <div
+              key={eng.id}
+              className="ns-glass flex flex-col gap-2.5 rounded-lg p-3"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-text-primary">{eng.label}</span>
+                <Badge tone="success">Economy</Badge>
+              </div>
+              <TextField
+                id={`economy-key-${eng.id}`}
+                label={`${eng.label} API key`}
+                type="password"
+                value={economyKeys[eng.id] ?? ""}
+                onChange={(e) =>
+                  setEconomyKeys((prev) => ({ ...prev, [eng.id]: e.target.value }))
+                }
+                placeholder="Enter API key (stored encrypted)"
+              />
+              <div className="flex items-center justify-end gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon="Terminal"
+                  loading={testingEconomyId === eng.id}
+                  onClick={() => void handleTestEconomyEngine(eng.id, eng.runner, eng.label)}
                 >
-                  <Icon name="ChevronUp" size={16} />
-                </button>
-                <button
-                  type="button"
-                  disabled={idx === priorityList.length - 1}
-                  onClick={() => movePriority(idx, idx + 1)}
-                  aria-label={`Move ${item.engine} priority down`}
-                  className="rounded p-1 text-text-muted hover:text-text-primary disabled:opacity-20"
+                  Test
+                </Button>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  icon="Save"
+                  onClick={() => void handleSaveEconomyKey(eng.id, eng.label)}
                 >
-                  <Icon name="ChevronDown" size={16} />
-                </button>
+                  Save key
+                </Button>
               </div>
             </div>
           ))}

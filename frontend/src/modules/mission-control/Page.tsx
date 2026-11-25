@@ -512,14 +512,28 @@ export default function MissionControlPage() {
             })}
           </div>
 
-          <div className="mt-4 border-t border-border-subtle pt-3 flex items-center justify-between text-xs text-text-secondary">
-            <div className="flex items-center gap-1.5">
-              <Icon name="ArrowRightLeft" size={16} className="text-accent-primary" />
-              <span>Handoffs tonight:</span>
+          <div className="mt-4 border-t border-border-subtle pt-3 flex flex-col gap-2">
+            <div className="flex items-center justify-between text-xs text-text-secondary">
+              <div className="flex items-center gap-1.5">
+                <Icon name="ArrowRightLeft" size={16} className="text-accent-primary" />
+                <span>Handoffs tonight:</span>
+              </div>
+              <span className="font-mono font-semibold text-text-primary ns-tabular">
+                {deck?.handoff_count ?? 0}
+              </span>
             </div>
-            <span className="font-mono font-semibold text-text-primary ns-tabular">
-              {deck?.handoff_count ?? 0}
-            </span>
+
+            {deck?.gold_saved_tonight && (
+              <div className="flex items-center justify-between text-xs rounded border border-border-subtle bg-surface-raised px-2 py-1.5">
+                <div className="flex items-center gap-1.5 text-text-secondary">
+                  <Icon name="Coins" size={16} className="text-accent-primary" />
+                  <span>Gold saved:</span>
+                </div>
+                <span className="font-mono font-medium text-accent-primary ns-tabular">
+                  {deck.gold_saved_tonight.estimate_label ?? "$0.00 gold saved tonight (estimate)"}
+                </span>
+              </div>
+            )}
           </div>
         </GlassCard>
       </div>

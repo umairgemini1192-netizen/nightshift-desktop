@@ -8,7 +8,11 @@ export type ScenarioName =
   | "gh-logged-out"
   | "handoff"
   | "ci-healing"
-  | "finished";
+  | "finished"
+  | "council-drafting"
+  | "council-critique"
+  | "council-final-ready"
+  | "council-substitution";
 
 export type AppRunState = "idle" | "running" | "waiting" | "cooling" | "failed" | "done";
 
@@ -73,6 +77,12 @@ export interface DeckPayload {
   next: UpcomingPhaseItem[];
   usage_tonight: Record<string, EngineUsageTonight>;
   handoff_count: number;
+  gold_saved_tonight?: {
+    jobs_done: number;
+    cost_saved_usd: number;
+    tokens_saved: number;
+    estimate_label: string;
+  };
   guards?: GuardStatusItem[];
   problems?: string | null;
   updated_at: string;
@@ -167,6 +177,7 @@ export interface EngineItem {
   coolingUntil?: string | null;
   quotaUsedPct: number;
   skills: Record<string, number>;
+  budget?: Record<string, number>;
 }
 
 export interface RouterDecision {
@@ -185,6 +196,43 @@ export interface ProjectConfigItem {
   build_rules?: string;
   artifact_glob?: string;
   output_dir?: string;
+}
+
+export interface CouncilRoleState {
+  role: "draft" | "critique" | "final";
+  engineId: string;
+  name: string;
+  model: string;
+  state: "waiting" | "active" | "done" | "skipped";
+  substituted: boolean;
+  substitutionReason?: string;
+  elapsedSeconds: number;
+  tokensEstimate: number;
+  costUsdEstimate: number;
+  notes: string[];
+  issues?: string[];
+  tradeoffSummary?: string;
+  phases: Array<{
+    id: string;
+    title: string;
+    prompt: string;
+    branch: string;
+    depends_on: string[];
+    size: string;
+    timeout_minutes: number;
+  }>;
+}
+
+export interface CouncilSessionData {
+  goal: string;
+  planId: string;
+  roles: {
+    draft: CouncilRoleState;
+    critique: CouncilRoleState;
+    final: CouncilRoleState;
+  };
+  diffSummary: string;
+  tradeoffSummary: string;
 }
 
 export interface Bridge {

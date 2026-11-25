@@ -26,6 +26,7 @@ from nightshift.engine.verify import assess_diff_risk, check_diff_guards, redact
 from nightshift.events import Event, EventBus
 from nightshift.quota.ledger import QuotaLedger
 from nightshift.runners.base import Runner, RunnerResult
+from nightshift.runners.template import TemplateRunner
 from nightshift.store import Store
 
 logger = logging.getLogger(__name__)
@@ -519,7 +520,29 @@ class EngineStateMachine:
                 active_runner_name = choice.engine
                 runner_obj = self.runners.get(active_runner_name)
                 if not runner_obj:
-                    runner_obj = list(self.runners.values())[0]
+                    eng_row = next(
+                        (e for e in self.store.list_engines() if e["id"] == active_runner_name),
+                        None,
+                    ) or next(
+                        (e for e in self.store.list_engines() if e["runner"] == active_runner_name),
+                        None,
+                    )
+                    if eng_row:
+                        env = self.scheduler.router.build_isolated_environment(eng_row["id"])
+                        try:
+                            patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
+                        except Exception:
+                            patterns = []
+                        runner_obj = TemplateRunner(
+                            eng_row["runner"],
+                            eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
+                            quota_ledger=self.quota,
+                            quota_patterns=patterns,
+                            env=env,
+                        )
+                        self.runners[active_runner_name] = runner_obj
+                    else:
+                        raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
 
                 # Record step in SQLite before execution
                 step_id = self.store.record_step(phase.id, "implement", active_runner_name)
@@ -569,18 +592,27 @@ class EngineStateMachine:
                     local_repo=project.local_path,
                 )
 
-                # Run diff guards
+                # Run diff guards and re-estimate job size from actual diff (BLUEPRINT 5h)
                 diff_text = self.vcs.get_diff(wt_dir)
                 changed_files = self.vcs.list_changed_files(wt_dir)
                 findings = check_diff_guards(wt_dir, changed_files, diff_text)
+                effective_size = (
+                    self.scheduler.router.estimate_job_size(phase.prompt, changed_files, diff_text)
+                    if diff_text
+                    else phase.size
+                )
+                if effective_size != phase.size:
+                    self.store.update_phase(phase.id, size=effective_size)
 
                 for f in findings:
                     self.store.record_guard_result(phase.id, f.guard, passed=False, detail=f.message)
 
+                elapsed_min = max(0.01, (time.time() - t0) / 60.0)
                 if res.rc == 0 and ok_deliv and not findings:
                     delivered = True
                     self.store.update_step(step_id, rc=0, verified=1, detail=deliv_reason)
                     self.store.record_duration("implement", active_runner_name, time.time() - t0)
+                    self.store.update_engine_stats(active_runner_name, effective_size, success=True, minutes=elapsed_min)
                     self.events.emit(Event(
                         kind="runner.completed",
                         plain_text=f"{active_runner_name} delivered {phase.title}: {deliv_reason}",
@@ -590,6 +622,7 @@ class EngineStateMachine:
                     break
 
                 # Failure, diff-guard finding, or quota exhaustion -> self-heal / mid-phase handoff
+                self.store.update_engine_stats(active_runner_name, effective_size, success=False, minutes=elapsed_min)
                 failure_reason = "Diff guard failed: " + "; ".join(f.message for f in findings) if findings else deliv_reason if not ok_deliv else res.stderr[:200]
                 self.store.update_step(step_id, rc=res.rc, verified=0, detail=failure_reason)
                 if findings:
