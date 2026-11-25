@@ -201,4 +201,123 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert set_resp["ok"]
     assert bridge.call("settings.get", {"key": "theme"})["data"] == "dark"
 
+    # plan.validate
+    val_resp = bridge.call("plan.validate", {"phases": [{"id": "bad", "branch": "", "title": "Bad"}]})
+    assert val_resp["ok"]
+    assert val_resp["data"]["valid"] is False
+    assert any("needs a branch" in p for p in val_resp["data"]["problems"])
+
+    # plan.save
+    save_resp = bridge.call("plan.save", {
+        "plan": {"id": "plan2", "project_id": "p1", "title": "Saved Plan"},
+        "phases": [
+            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "depends_on": []},
+            {"id": "p2-2", "title": "P2-2", "branch": "feat/p2-2", "depends_on": ["p2-1"]},
+        ],
+    })
+    assert save_resp["ok"]
+    assert save_resp["data"]["planId"] == "plan2"
+
+    # plan.setImplementer
+    impl_resp = bridge.call("plan.setImplementer", {
+        "phaseIds": ["p2-1"],
+        "engine": "gemini",
+        "model": "gemini-2.5-pro",
+        "effort": "high",
+    })
+    assert impl_resp["ok"]
+    assert impl_resp["data"]["updated"] == 1
+
+    # plan.exportQueue
+    exp_resp = bridge.call("plan.exportQueue", {"planId": "plan2"})
+    assert exp_resp["ok"]
+    assert exp_resp["data"]["repo"] == "owner/repo"
+
+    # plan.importQueue
+    import_payload = {
+        "repo": "owner/imported",
+        "local_repo": "/local/imported",
+        "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1"}],
+    }
+    imp_resp = bridge.call("plan.importQueue", {"queue": import_payload})
+    assert imp_resp["ok"]
+    assert imp_resp["data"]["project"]["id"] == "imported"
+
+    # runs.get
+    run_detail = bridge.call("runs.get", {"runId": "plan1"})
+    assert run_detail["ok"]
+    assert "Morning Digest" in run_detail["data"]["digest"]
+    assert len(run_detail["data"]["phases"]) >= 1
+
+    # runs.openArtifactFolder
+    folder_resp = bridge.call("runs.openArtifactFolder", {"projectId": "p1"})
+    assert folder_resp["ok"]
+    assert folder_resp["data"]["opened"] is True
+
+    # engines.getLadders and setLadders (Claude pinned last)
+    ladders_resp = bridge.call("engines.getLadders")
+    assert ladders_resp["ok"]
+    assert "Claude is pinned last" in ladders_resp["data"]["pinnedNote"]
+
+    set_ladders = bridge.call("engines.setLadders", {
+        "ladders": {"backend": ["claude", "agy", "gemini"]}  # User put claude first
+    })
+    assert set_ladders["ok"]
+    # Verify claude was automatically pinned last!
+    assert set_ladders["data"]["ladders"]["backend"][-1] == "claude"
+
+    # engines.getLedger
+    ledger_resp = bridge.call("engines.getLedger")
+    assert ledger_resp["ok"]
+    assert ledger_resp["data"]["isEstimate"] is True
+    assert len(ledger_resp["data"]["chartData"]) == 4
+
+    # engines.update
+    eng_up = bridge.call("engines.update", {"id": "agy", "effort": "high"})
+    assert eng_up["ok"]
+
+    # settings: projects CRUD
+    proj_list = bridge.call("settings.getProjects")
+    assert proj_list["ok"]
+    assert len(proj_list["data"]) >= 1
+
+    new_proj = bridge.call("settings.saveProject", {
+        "id": "new_app",
+        "name": "New App",
+        "repo": "owner/new-app",
+        "local_path": "/path/new-app",
+        "build_rules": "gradlew assembleDebug",
+    })
+    assert new_proj["ok"]
+    assert new_proj["data"]["id"] == "new_app"
+
+    del_proj = bridge.call("settings.deleteProject", {"id": "new_app"})
+    assert del_proj["ok"]
+
+    # settings: priority list, guard limits, data folder, keep awake
+    prio_resp = bridge.call("settings.getPriorityList")
+    assert prio_resp["ok"]
+    assert len(prio_resp["data"]) == 4
+
+    prio_set = bridge.call("settings.setPriorityList", {
+        "items": [{"position": 1, "engine": "gemini", "model": "auto", "effort": "medium"}]
+    })
+    assert prio_set["ok"]
+
+    guards_get = bridge.call("settings.getGuardLimits")
+    assert guards_get["ok"]
+    assert guards_get["data"]["maxAttempts"] == 3
+
+    guards_set = bridge.call("settings.setGuardLimits", {"maxAttempts": 5})
+    assert guards_set["ok"]
+    assert bridge.call("settings.getGuardLimits")["data"]["maxAttempts"] == 5
+
+    data_folder = bridge.call("settings.openDataFolder")
+    assert data_folder["ok"]
+    assert data_folder["data"]["opened"] is True
+
+    keep_awake = bridge.call("settings.setKeepAwake", {"enabled": True})
+    assert keep_awake["ok"]
+    assert keep_awake["data"]["keepAwake"] is True
+
     store.close()
