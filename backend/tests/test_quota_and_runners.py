@@ -152,3 +152,13 @@ async def test_fake_runner_modes_and_call_tracking(tmp_path: Path) -> None:
 
     assert called_prompts == ["prompt 1", "prompt 2"]
     assert len(runner.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_agy_success_counts_towards_daily_budget(tmp_path, monkeypatch):
+    with Store(tmp_path / "budget.db") as store:
+        store.migrate()
+        ledger = QuotaLedger(store)
+        monkeypatch.setattr("nightshift.runners.agy.run_subprocess_with_timeout", lambda *a, **k: (0, "done", "", False))
+        await AgyRunner(ledger).run("work", tmp_path)
+        assert not ledger.check_budget_cap("agy", {"max_runs_today": 1})

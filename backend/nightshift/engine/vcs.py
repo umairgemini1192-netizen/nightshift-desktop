@@ -64,12 +64,7 @@ class GitGhClient(Protocol):
 
     def merge_main_into_branch(self, worktree_dir: Path) -> tuple[bool, str]: ...
 
-    def revert_commit_and_push(
-        self,
-        local_repo: Path,
-        commit_sha: str,
-        branch: str = "main",
-    ) -> tuple[bool, str]: ...
+    def revert_via_pr(self, repo: str, local_repo: Path, commit_sha: str) -> tuple[bool, str]: ...
 
     def check_branch_protection(self, repo: str, branch: str = "main") -> bool: ...
 
@@ -176,7 +171,7 @@ class SubprocessGitGh:
             raise RuntimeError(f"git worktree add failed: {err}")
 
         # Configure info/exclude to ignore .nightshift_prompt.md and .nightshift/handoff.md
-        rc_gd, out_gd, _, _ = run_subprocess_with_timeout(["git", "rev-parse", "--git-dir"], cwd=worktree_dir, timeout_seconds=30)
+        rc_gd, out_gd, _, _ = run_subprocess_with_timeout(["git", "rev-parse", "--git-common-dir"], cwd=worktree_dir, timeout_seconds=30)
         if rc_gd == 0 and out_gd:
             exclude_path = Path(out_gd) / "info" / "exclude"
             if not exclude_path.is_absolute():
@@ -298,26 +293,44 @@ class SubprocessGitGh:
         )
         return (rc == 0, out or err)
 
-    def revert_commit_and_push(
-        self,
-        local_repo: Path,
-        commit_sha: str,
-        branch: str = "main",
-    ) -> tuple[bool, str]:
-        run_subprocess_with_timeout(["git", "fetch", "origin", branch], cwd=local_repo, timeout_seconds=60)
-        rc_r, out_r, err_r, _ = run_subprocess_with_timeout(
-            ["git", "revert", "-m", "1", commit_sha, "--no-edit"],
-            cwd=local_repo,
-            timeout_seconds=60,
-        )
-        if rc_r == 0:
-            rc_p, out_p, err_p, _ = run_subprocess_with_timeout(
-                ["git", "push", "origin", branch],
-                cwd=local_repo,
-                timeout_seconds=120,
-            )
-            return (rc_p == 0, out_p or err_p)
-        return (False, out_r or err_r)
+    def revert_via_pr(self, repo: str, local_repo: Path, commit_sha: str) -> tuple[bool, str]:
+        """Create a revert on an isolated branch and merge only after its checks pass."""
+        branch = f"nightshift/revert-{commit_sha}"
+        worktree = local_repo.parent / f"nightshift-revert-{commit_sha}"
+        if self.find_merged_pr(repo, branch):
+            return True, "Revert PR already merged"
+        try:
+            self.prepare_worktree(local_repo, worktree, branch)
+            pr = self.find_open_pr(repo, branch)
+            if not pr:
+                rc, out, err, _ = run_subprocess_with_timeout(
+                    ["git", "revert", "-m", "1", commit_sha, "--no-edit"], cwd=worktree, timeout_seconds=60,
+                )
+                if rc != 0:
+                    return False, out or err
+                rc, out, err, _ = run_subprocess_with_timeout(
+                    ["git", "push", "-u", "origin", branch], cwd=worktree, timeout_seconds=120,
+                )
+                if rc != 0:
+                    return False, out or err
+                rc, out, err, _ = run_subprocess_with_timeout(
+                    ["gh", "pr", "create", "--repo", repo, "--base", "main", "--head", branch,
+                     "--title", f"Revert {commit_sha[:7]}", "--body", "Revert a merge whose main build failed."],
+                    cwd=worktree, timeout_seconds=60,
+                )
+                if rc != 0:
+                    return False, out or err
+                pr = self.find_open_pr(repo, branch)
+            if not pr or not pr.get("headRefOid"):
+                return False, "Could not verify revert PR head"
+            passed, msg = self.watch_pr_checks(repo, pr["number"], worktree)
+            latest = self.find_open_pr(repo, branch)
+            if not passed or not latest or latest.get("headRefOid") != pr["headRefOid"]:
+                return False, f"Revert PR checks failed or head changed: {msg}"
+            return self.merge_pr(repo, pr["number"], local_repo)
+        finally:
+            if worktree.exists():
+                self.remove_worktree(local_repo, worktree)
 
     def check_branch_protection(self, repo: str, branch: str = "main") -> bool:
         rc, out, _, _ = run_subprocess_with_timeout(
@@ -563,14 +576,14 @@ class FakeGitGh:
             return False, "CONFLICT (content): Merge conflict in src/App.kt"
         return True, "Already up to date."
 
-    def revert_commit_and_push(
-        self,
-        local_repo: Path,
-        commit_sha: str,
-        branch: str = "main",
-    ) -> tuple[bool, str]:
+    def revert_via_pr(self, repo: str, local_repo: Path, commit_sha: str) -> tuple[bool, str]:
+        branch = f"nightshift/revert-{commit_sha}"
         self.reverts.append({"commit_sha": commit_sha, "branch": branch})
-        return True, f"[main {commit_sha[:7]}] Revert commit"
+        pr = self.find_open_pr(repo, branch) or self.add_pr(branch)
+        passed, msg = self.watch_pr_checks(repo, pr["number"], local_repo)
+        if not passed:
+            return False, msg
+        return self.merge_pr(repo, pr["number"], local_repo)
 
     def check_branch_protection(self, repo: str, branch: str = "main") -> bool:
         return self.branch_protection.get(branch, True)

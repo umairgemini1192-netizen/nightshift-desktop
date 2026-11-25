@@ -282,7 +282,8 @@ async def test_merged_phase_resumes_pending_release(tmp_path: Path) -> None:
         store.migrate()
         store.create_project("resume", "Resume", "o/r", str(tmp_path))
         store.create_plan("plan_default", "resume", "Plan")
-        store.upsert_phase("p1", "plan_default", "P1", "feat/p1", status="releasing", pr_number=502)
+        store.upsert_phase("p1", "plan_default", "P1", "feat/p1", status="parked", pr_number=502)
+        store.park_phase("p1", "release failed", "resume")
         quota = QuotaLedger(store)
         vcs = FakeGitGh()
         vcs.merged_prs["feat/p1"] = {"number": 502, "mergeCommit": {"oid": "merge-sha"}}
@@ -293,3 +294,4 @@ async def test_merged_phase_resumes_pending_release(tmp_path: Path) -> None:
         assert rows[0]["status"] == "COMPLETED"
         assert store.get_phase("p1")["status"] == "completed"
         assert publish.call_args.kwargs["merge_sha"] == "merge-sha"
+        assert store.get_parked("p1") is None

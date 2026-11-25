@@ -274,9 +274,10 @@ class CiPipelineManager:
         merge_commit_sha: str,
         phase_id: str,
         failure_log: str,
+        repo: str,
     ) -> tuple[bool, str]:
         """Automatic revert PR on main build failure per BLUEPRINT 5d."""
-        ok, msg = self.vcs.revert_commit_and_push(local_repo, merge_commit_sha, branch="main")
+        ok, msg = self.vcs.revert_via_pr(repo, local_repo, merge_commit_sha)
         if ok:
             # Re-queue phase with failure log
             self.store.park_phase(

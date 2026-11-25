@@ -48,6 +48,8 @@ class AgyRunner:
         reset_at = None
         if self._quota_ledger is not None:
             is_quota = self._quota_ledger.is_quota_or_transient_error(rc, out, err)
+            if rc == 0 and not timed_out and not is_quota:
+                self._quota_ledger.record_usage(self.name, model or "default")
             if is_quota:
                 reset_at = self._quota_ledger.record_quota_error(self.name, model or "default", f"{out}\n{err}")
 

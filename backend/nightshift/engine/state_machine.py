@@ -297,7 +297,7 @@ class EngineStateMachine:
                     merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch)
                     if merged_pr:
                         prior = self.store.get_phase(phase.id) or {}
-                        if prior.get("status") in ("merging", "merged", "releasing", "verifying_build"):
+                        if prior.get("status") in ("merging", "merged", "releasing", "verifying_build") or (prior.get("status") == "parked" and prior.get("pr_number")):
                             row = self._finish_merged_delivery(project, phase, merged_pr, "none")
                             summary_rows.append(row)
                             if row["status"] == "COMPLETED":
@@ -732,11 +732,12 @@ class EngineStateMachine:
                 raise RuntimeError("Could not determine the merged commit SHA")
             ok, msg, run_id = self.vcs.watch_workflow_run(project.repo, branch="main", workflow=project.release_workflow, timeout_seconds=3600, commit_sha=merge_sha)
             if ok is False:
-                self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg)
+                self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
                 raise RuntimeError(f"Main build failed: {msg}")
             if ok is not True or run_id is None:
                 raise RuntimeError(f"Could not verify main build: {msg}")
             if not phase.release_after_merge:
+                self.store.unpark_phase(phase.id)
                 self.store.update_phase(phase.id, status="completed")
                 return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')}; main build passed"}
             self.store.update_phase(phase.id, status="releasing")
@@ -745,6 +746,7 @@ class EngineStateMachine:
                 title_note=phase.title, workflow_name=project.release_workflow,
                 artifact_glob=project.artifact_glob, tag_prefix=project.tag_prefix, run_id=run_id,
             )
+            self.store.unpark_phase(phase.id)
             self.store.update_phase(phase.id, status="completed")
             self.events.emit(Event(kind="release.published", plain_text=f"Published verified release {tag} with SHA-256 checksums.", phase_id=phase.id))
             return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')} ? Released {tag} ({len(files)} files)"}

@@ -197,6 +197,7 @@ def test_post_merge_failure_auto_revert(tmp_path: Path) -> None:
             merge_commit_sha="sha_merge_123",
             phase_id="p1",
             failure_log="Gradle build failed on main branch",
+            repo="owner/repo",
         )
         assert ok is True
         assert "Reverted sha_mer" in msg
@@ -272,14 +273,47 @@ def test_workflow_watch_distinguishes_failure_from_unknown(monkeypatch, conclusi
     assert SubprocessGitGh().watch_workflow_run("o/r", "main", "build", commit_sha="sha")[0] is expected
 
 
-def test_revert_merge_uses_first_parent(monkeypatch, tmp_path: Path) -> None:
+def test_revert_pr_uses_first_parent_and_checks(monkeypatch, tmp_path: Path) -> None:
     from nightshift.engine.vcs import SubprocessGitGh
-
+    vcs = SubprocessGitGh()
     calls = []
     def run(cmd, **kwargs):
         calls.append(cmd)
         return 0, "ok", "", False
-
     monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", run)
-    assert SubprocessGitGh().revert_commit_and_push(tmp_path, "merge123")[0]
-    assert calls[1] == ["git", "revert", "-m", "1", "merge123", "--no-edit"]
+    monkeypatch.setattr(vcs, "prepare_worktree", lambda *args: tmp_path)
+    monkeypatch.setattr(vcs, "find_merged_pr", lambda *args: None)
+    snapshots = iter([None, {"number": 1, "headRefOid": "sha"}, {"number": 1, "headRefOid": "sha"}])
+    monkeypatch.setattr(vcs, "find_open_pr", lambda *args: next(snapshots))
+    monkeypatch.setattr(vcs, "watch_pr_checks", lambda *args: (True, "passed"))
+    monkeypatch.setattr(vcs, "merge_pr", lambda *args: (True, "merged"))
+    monkeypatch.setattr(vcs, "remove_worktree", lambda *args: None)
+    assert vcs.revert_via_pr("o/r", tmp_path, "merge123")[0]
+    assert calls[0] == ["git", "revert", "-m", "1", "merge123", "--no-edit"]
+    assert calls[1][-1] == "nightshift/revert-merge123"
+
+
+def test_revert_pr_failed_checks_does_not_merge(monkeypatch, tmp_path: Path) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+    vcs = SubprocessGitGh()
+    monkeypatch.setattr(vcs, "find_merged_pr", lambda *args: None)
+    monkeypatch.setattr(vcs, "prepare_worktree", lambda *args: tmp_path)
+    monkeypatch.setattr(vcs, "find_open_pr", lambda *args: {"number": 1, "headRefOid": "sha"})
+    monkeypatch.setattr(vcs, "watch_pr_checks", lambda *args: (False, "failed"))
+    monkeypatch.setattr(vcs, "merge_pr", lambda *args: pytest.fail("must not merge"))
+    monkeypatch.setattr(vcs, "remove_worktree", lambda *args: None)
+    assert not vcs.revert_via_pr("o/r", tmp_path, "merge123")[0]
+
+
+def test_worktree_exclusions_use_common_git_directory(monkeypatch, tmp_path: Path) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+    vcs = SubprocessGitGh()
+    common = tmp_path / "common"
+    worktree = tmp_path / "worktree"
+    def run(cmd, **kwargs):
+        if cmd == ["git", "rev-parse", "--git-common-dir"]:
+            return 0, str(common), "", False
+        return 0, "", "", False
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", run)
+    vcs.prepare_worktree(tmp_path, worktree, "feat/test")
+    assert ".nightshift/handoff.md" in (common / "info" / "exclude").read_text()
