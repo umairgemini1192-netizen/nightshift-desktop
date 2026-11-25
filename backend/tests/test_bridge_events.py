@@ -325,3 +325,36 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert keep_awake["data"]["keepAwake"] is True
 
     store.close()
+
+def test_bridge_preserves_phase_execution_and_rejects_cross_plan_ids(tmp_path):
+    store = Store(tmp_path / "data.db")
+    store.migrate()
+    bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+    store.create_project("p", "Project", "owner/repo", "/path")
+    store.create_plan("one", "p", "One")
+    store.upsert_phase("shared", "one", "Original", "feat/shared", status="merged", attempt=3, pr_number=42)
+    saved = bridge.call("plan.save", {"plan": {"id": "one", "project_id": "p"}, "phases": [{"id": "shared", "title": "Edited"}]})
+    assert saved["ok"]
+    phase = store.get_phase("shared")
+    assert (phase["title"], phase["status"], phase["attempt"], phase["pr_number"]) == ("Edited", "merged", 3, 42)
+    rejected = bridge.call("plan.save", {"plan": {"id": "two", "project_id": "p"}, "phases": [{"id": "shared", "title": "Wrong"}]})
+    assert not rejected["ok"]
+    assert store.get_phase("shared")["title"] == "Edited"
+    assert store.get_plan("two") is None
+    imported = bridge.call("plan.importQueue", {"queue": {"repo": "owner/imported", "phases": [{"id": "shared", "title": "Wrong", "branch": "feat/shared"}]}})
+    assert not imported["ok"]
+    assert store.get_phase("shared")["title"] == "Edited"
+
+
+def test_bridge_run_detail_and_persisted_engine_contract(tmp_path):
+    store = Store(tmp_path / "data.db")
+    store.migrate()
+    bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+    store.create_project("p", "Project", "owner/repo", "/path")
+    store.create_plan("one", "p", "One")
+    store.upsert_phase("phase", "one", "Phase", "feat/phase", status="merged")
+    summary = bridge.call("runs.list")["data"][0]
+    assert bridge.call("runs.get", {"runId": "one"})["data"]["run"] == summary
+    store.upsert_engine("custom", "custom-cli", "model", skills_json='{"backend": 4}', cost_tier="economy", enabled=0)
+    engine = bridge.call("engines.list")["data"][0]
+    assert (engine["name"], engine["costTier"], engine["state"], engine["quotaUsedPct"], engine["skills"]) == ("custom-cli", "economy", "unavailable", 0, {"backend": 4})

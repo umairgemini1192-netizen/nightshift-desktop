@@ -205,11 +205,16 @@ class BridgeAPI:
             project_id = str(plan_data.get("project_id") or self._active_project_id or "default")
             title = str(plan_data.get("title") or "Plan")
             goal = str(plan_data.get("goal") or "")
-            self._store.create_plan(plan_id, project_id, title, goal)
             phases_data = payload.get("phases") or []
+            for phase in phases_data:
+                existing = self._store.get_phase(str(phase["id"]))
+                if existing and existing["plan_id"] != plan_id:
+                    return {"ok": False, "error": f"Phase ID {phase['id']} belongs to another plan."}
+            self._store.create_plan(plan_id, project_id, title, goal)
             for idx, p in enumerate(phases_data):
                 raw_deps = p.get("depends_on") or []
                 deps_json = json.dumps(raw_deps) if isinstance(raw_deps, list) else str(raw_deps)
+                existing = self._store.get_phase(str(p["id"])) or {}
                 self._store.upsert_phase(
                     phase_id=str(p["id"]),
                     plan_id=plan_id,
@@ -219,7 +224,9 @@ class BridgeAPI:
                     depends_on_json=deps_json,
                     size=str(p.get("size", "medium")),
                     position=int(p.get("position", idx)),
-                    status=str(p.get("status", "pending")),
+                    status=existing.get("status", "pending"),
+                    attempt=existing.get("attempt", 0),
+                    pr_number=existing.get("pr_number"),
                     ladder=str(p.get("ladder", "default")), timeout_minutes=int(p.get("timeout_minutes", 180)),
                     auto_merge=bool(p.get("auto_merge", True)), release_after_merge=bool(p.get("release_after_merge", False)),
                     force_rerun=bool(p.get("force_rerun", False)),
@@ -246,6 +253,10 @@ class BridgeAPI:
                 return {"ok": False, "error": "No queue data provided to import."}
             try:
                 imported = import_queue_json(queue_payload)
+                for ph in imported["phases"]:
+                    existing = self._store.get_phase(ph.id)
+                    if existing and existing["plan_id"] != imported["plan"]["id"]:
+                        return {"ok": False, "error": f"Phase ID {ph.id} belongs to another plan."}
                 proj = imported["project"]
                 if not self._store.get_project(proj["id"]):
                     self._store.create_project(
@@ -259,9 +270,13 @@ class BridgeAPI:
                 plan = imported["plan"]
                 self._store.create_plan(plan["id"], proj["id"], plan["title"], plan.get("goal", ""))
                 for idx, ph in enumerate(imported["phases"]):
+                    existing = self._store.get_phase(ph.id) or {}
                     self._store.upsert_phase(
                         phase_id=ph.id,
                         plan_id=plan["id"],
+                        status=existing.get("status", "pending"),
+                        attempt=existing.get("attempt", 0),
+                        pr_number=existing.get("pr_number"),
                         title=ph.title,
                         branch=ph.branch,
                         prompt=ph.prompt,
@@ -383,7 +398,7 @@ class BridgeAPI:
             return {
                 "ok": True,
                 "data": {
-                    "run": plan,
+                    "run": next((run for run in self.call("runs.list")["data"] if run["id"] == plan["id"]), {"id": plan["id"], "title": plan.get("title", ""), "projectId": plan.get("project_id", ""), "status": "draft", "phasesCount": 0, "phasesDone": 0, "phasesFailed": 0, "duration": "", "aiUsed": [], "createdAt": "", "updatedAt": ""}),
                     "digest": digest,
                     "phases": formatted_phases,
                     "artifacts": [
@@ -415,6 +430,16 @@ class BridgeAPI:
                     {"id": "codex", "runner": "codex", "model": "o3-mini", "effort": "medium", "state": "ready", "quotaUsedPct": 20, "coolingUntil": None},
                     {"id": "claude", "runner": "claude", "model": "claude-3-7-sonnet", "effort": "medium", "state": "ready", "quotaUsedPct": 10, "coolingUntil": None},
                 ]
+            names = {"agy": "Antigravity", "gemini": "Gemini CLI", "codex": "Codex CLI", "claude": "Claude Code"}
+            engines = [{
+                **engine,
+                "name": names.get(engine["runner"], engine["runner"]),
+                "costTier": engine.get("cost_tier", "standard"),
+                "state": engine.get("state", "ready" if engine.get("enabled", 1) else "unavailable"),
+                "coolingUntil": engine.get("coolingUntil"),
+                "quotaUsedPct": engine.get("quotaUsedPct", 0),
+                "skills": json.loads(engine.get("skills_json", "{}")),
+            } for engine in engines]
             return {"ok": True, "data": engines}
 
         if method == "engines.update":
