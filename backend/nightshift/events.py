@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from nightshift.engine.verify import redact_secrets
 from nightshift.store import Store
 
 
@@ -46,16 +47,26 @@ class EventBus:
 
     def emit(self, event: Event) -> int | None:
         """Persist the event (if a store is attached) and notify subscribers."""
+        safe_text = redact_secrets(event.plain_text)
+        safe_event = Event(
+            kind=event.kind,
+            plain_text=safe_text,
+            level=event.level,
+            phase_id=event.phase_id,
+            raw_path=event.raw_path,
+            payload=event.payload,
+            ts=event.ts,
+        )
         event_id: int | None = None
         if self._store is not None:
             event_id = self._store.append_event(
-                level=event.level,
-                phase_id=event.phase_id,
-                kind=event.kind,
-                plain_text=event.plain_text,
-                raw_path=event.raw_path,
-                ts=event.ts,
+                level=safe_event.level,
+                phase_id=safe_event.phase_id,
+                kind=safe_event.kind,
+                plain_text=safe_event.plain_text,
+                raw_path=safe_event.raw_path,
+                ts=safe_event.ts,
             )
-        for callback in list(self._subscribers.get(event.kind, [])) + list(self._subscribers.get("*", [])):
-            callback(event)
+        for callback in list(self._subscribers.get(safe_event.kind, [])) + list(self._subscribers.get("*", [])):
+            callback(safe_event)
         return event_id

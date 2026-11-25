@@ -7,6 +7,7 @@ decision, handoff, login check, guard result, and event is durable across restar
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -55,8 +56,13 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
             repo TEXT NOT NULL,
             local_path TEXT NOT NULL,
             build_rules TEXT NOT NULL DEFAULT '',
+            ui_contract TEXT NOT NULL DEFAULT '',
+            release_workflow TEXT NOT NULL DEFAULT 'Android build',
             artifact_glob TEXT NOT NULL DEFAULT '',
+            artifact_prefix TEXT NOT NULL DEFAULT '',
+            tag_prefix TEXT NOT NULL DEFAULT 'v1.0.0-preview.',
             output_folder TEXT NOT NULL DEFAULT '',
+            output_dir TEXT NOT NULL DEFAULT '',
             critical_paths_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -350,18 +356,25 @@ class Store:
         local_path: str,
         *,
         build_rules: str = "",
+        ui_contract: str = "",
+        release_workflow: str = "Android build",
         artifact_glob: str = "",
+        artifact_prefix: str = "",
+        tag_prefix: str = "v1.0.0-preview.",
         output_folder: str = "",
+        output_dir: str = "",
         critical_paths_json: str = "[]",
     ) -> dict[str, Any]:
         now = _utc_now()
+        effective_output = output_dir or output_folder
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO projects (
-                    id, name, repo, local_path, build_rules, artifact_glob,
-                    output_folder, critical_paths_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    id, name, repo, local_path, build_rules, ui_contract,
+                    release_workflow, artifact_glob, artifact_prefix, tag_prefix,
+                    output_folder, output_dir, critical_paths_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -369,8 +382,13 @@ class Store:
                     repo,
                     local_path,
                     build_rules,
+                    ui_contract,
+                    release_workflow,
                     artifact_glob,
-                    output_folder,
+                    artifact_prefix,
+                    tag_prefix,
+                    effective_output,
+                    effective_output,
                     critical_paths_json,
                     now,
                     now,
@@ -378,6 +396,27 @@ class Store:
             )
         row = self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         return dict(row)
+
+    def get_project(self, project_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def update_project(self, project_id: str, **kwargs: Any) -> dict[str, Any]:
+        if not kwargs:
+            proj = self.get_project(project_id)
+            if proj is None:
+                raise KeyError(f"Project not found: {project_id}")
+            return proj
+        kwargs["updated_at"] = _utc_now()
+        if "output_dir" in kwargs and "output_folder" not in kwargs:
+            kwargs["output_folder"] = kwargs["output_dir"]
+        elif "output_folder" in kwargs and "output_dir" not in kwargs:
+            kwargs["output_dir"] = kwargs["output_folder"]
+        fields = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [project_id]
+        with self._conn:
+            self._conn.execute(f"UPDATE projects SET {fields} WHERE id = ?", values)
+        return dict(self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone())
 
     def list_projects(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM projects ORDER BY created_at ASC").fetchall()
@@ -390,11 +429,26 @@ class Store:
                 """
                 INSERT INTO plans (id, project_id, title, goal, status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, 'draft', ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    goal = excluded.goal,
+                    updated_at = excluded.updated_at
                 """,
                 (plan_id, project_id, title, goal, now, now),
             )
         row = self._conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
         return dict(row)
+
+    def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM plans WHERE id = ?", (plan_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_plans(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        if project_id:
+            rows = self._conn.execute("SELECT * FROM plans WHERE project_id = ? ORDER BY created_at ASC", (project_id,)).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM plans ORDER BY created_at ASC").fetchall()
+        return [dict(r) for r in rows]
 
     def upsert_phase(
         self,
@@ -445,6 +499,440 @@ class Store:
             )
         row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()
         return dict(row)
+
+    def get_phase(self, phase_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_phases(self, plan_id: str | None = None) -> list[dict[str, Any]]:
+        if plan_id:
+            rows = self._conn.execute(
+                "SELECT * FROM phases WHERE plan_id = ? ORDER BY position ASC, id ASC", (plan_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM phases ORDER BY position ASC, id ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_phase(self, phase_id: str, **kwargs: Any) -> dict[str, Any]:
+        if not kwargs:
+            p = self.get_phase(phase_id)
+            if p is None:
+                raise KeyError(f"Phase not found: {phase_id}")
+            return p
+        fields = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [phase_id]
+        with self._conn:
+            self._conn.execute(f"UPDATE phases SET {fields} WHERE id = ?", values)
+        row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()
+        return dict(row)
+
+    def record_step(
+        self,
+        phase_id: str,
+        kind: str,
+        runner: str,
+        *,
+        rc: int | None = None,
+        verified: int = 0,
+        detail: str = "",
+        started_at: str | None = None,
+        finished_at: str | None = None,
+    ) -> int:
+        now = _utc_now()
+        start = started_at or now
+        fin = finished_at or now
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO steps (phase_id, kind, runner, rc, verified, detail, started_at, finished_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (phase_id, kind, runner, rc, verified, detail, start, fin),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def update_step(self, step_id: int, **kwargs: Any) -> None:
+        if not kwargs:
+            return
+        fields = ", ".join(f"{k} = ?" for k in kwargs)
+        values = list(kwargs.values()) + [step_id]
+        with self._conn:
+            self._conn.execute(f"UPDATE steps SET {fields} WHERE id = ?", values)
+
+    def get_step(self, step_id: int) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM steps WHERE id = ?", (step_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_steps(self, phase_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM steps WHERE phase_id = ? ORDER BY id ASC", (phase_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_guard_result(
+        self,
+        phase_id: str,
+        guard: str,
+        passed: bool,
+        detail: str = "",
+    ) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO guard_results (phase_id, guard, passed, detail, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (phase_id, guard, 1 if passed else 0, detail, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_guard_results(self, phase_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM guard_results WHERE phase_id = ? ORDER BY id ASC", (phase_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_handoff(
+        self,
+        phase_id: str,
+        from_engine: str,
+        to_engine: str,
+        reason: str,
+        checkpoint_sha: str,
+        ts: str | None = None,
+    ) -> int:
+        timestamp = ts or _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO handoffs (phase_id, from_engine, to_engine, reason, checkpoint_sha, ts)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (phase_id, from_engine, to_engine, reason, checkpoint_sha, timestamp),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_handoffs(self, phase_id: str | None = None) -> list[dict[str, Any]]:
+        if phase_id:
+            rows = self._conn.execute(
+                "SELECT * FROM handoffs WHERE phase_id = ? ORDER BY id ASC", (phase_id,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM handoffs ORDER BY id ASC"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def park_phase(
+        self,
+        phase_id: str,
+        reason: str,
+        next_step: str,
+        stacked_children: list[str] | None = None,
+    ) -> None:
+        now = _utc_now()
+        stacked_json = json.dumps(stacked_children or [])
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO parked (phase_id, reason, next_step, stacked_children_json, parked_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(phase_id) DO UPDATE SET
+                    reason = excluded.reason,
+                    next_step = excluded.next_step,
+                    stacked_children_json = excluded.stacked_children_json,
+                    parked_at = excluded.parked_at
+                """,
+                (phase_id, reason, next_step, stacked_json, now),
+            )
+            self._conn.execute("UPDATE phases SET status = 'parked' WHERE id = ?", (phase_id,))
+
+    def unpark_phase(self, phase_id: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM parked WHERE phase_id = ?", (phase_id,))
+
+    def get_parked(self, phase_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM parked WHERE phase_id = ?", (phase_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_parked(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM parked ORDER BY parked_at ASC").fetchall()
+        return [dict(r) for r in rows]
+
+    def record_login_check(
+        self,
+        tool: str,
+        state: str,
+        detail: str = "",
+        back_at: str | None = None,
+    ) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO login_checks (tool, state, detail, back_at, checked_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (tool, state, detail, back_at, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def get_latest_login_checks(self) -> dict[str, dict[str, Any]]:
+        rows = self._conn.execute(
+            """
+            SELECT lc.* FROM login_checks lc
+            INNER JOIN (
+                SELECT tool, MAX(id) AS max_id FROM login_checks GROUP BY tool
+            ) latest ON lc.id = latest.max_id
+            """
+        ).fetchall()
+        return {str(r["tool"]): dict(r) for r in rows}
+
+    def record_ledger_entry(
+        self,
+        runner: str,
+        model: str,
+        event: str,
+        reset_at: str | None = None,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO runner_ledger (runner, model, event, reset_at, tokens_in, tokens_out, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (runner, model, event, reset_at, tokens_in, tokens_out, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def get_ledger_entries(self, runner: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        if runner:
+            rows = self._conn.execute(
+                "SELECT * FROM runner_ledger WHERE runner = ? ORDER BY id DESC LIMIT ?",
+                (runner, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM runner_ledger ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_active_cooldown(self, runner: str, model: str = "") -> str | None:
+        now = _utc_now()
+        if model:
+            row = self._conn.execute(
+                """
+                SELECT reset_at FROM runner_ledger
+                WHERE runner = ? AND model = ? AND reset_at IS NOT NULL AND reset_at > ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (runner, model, now),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                """
+                SELECT reset_at FROM runner_ledger
+                WHERE runner = ? AND reset_at IS NOT NULL AND reset_at > ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (runner, now),
+            ).fetchone()
+        return str(row["reset_at"]) if row is not None else None
+
+    def record_duration(self, kind: str, runner: str, seconds: float) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO durations (kind, runner, seconds, recorded_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (kind, runner, float(seconds), now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def get_durations(self, kind: str | None = None, runner: str | None = None) -> list[float]:
+        if kind and runner:
+            rows = self._conn.execute(
+                "SELECT seconds FROM durations WHERE kind = ? AND runner = ? ORDER BY id ASC",
+                (kind, runner),
+            ).fetchall()
+        elif kind:
+            rows = self._conn.execute(
+                "SELECT seconds FROM durations WHERE kind = ? ORDER BY id ASC", (kind,)
+            ).fetchall()
+        elif runner:
+            rows = self._conn.execute(
+                "SELECT seconds FROM durations WHERE runner = ? ORDER BY id ASC", (runner,)
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT seconds FROM durations ORDER BY id ASC").fetchall()
+        return [float(r["seconds"]) for r in rows]
+
+    def upsert_engine(
+        self,
+        engine_id: str,
+        runner: str,
+        model: str,
+        *,
+        effort: str = "medium",
+        skills_json: str = "{}",
+        cost_tier: str = "standard",
+        budget_json: str = "{}",
+        enabled: int = 1,
+        pinned: int = 0,
+        command_template: str = "[]",
+        usage_parser: str = "",
+        quota_patterns_json: str = "[]",
+    ) -> dict[str, Any]:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO engines (
+                    id, runner, model, effort, skills_json, cost_tier,
+                    budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    runner = excluded.runner,
+                    model = excluded.model,
+                    effort = excluded.effort,
+                    skills_json = excluded.skills_json,
+                    cost_tier = excluded.cost_tier,
+                    budget_json = excluded.budget_json,
+                    enabled = excluded.enabled,
+                    pinned = excluded.pinned,
+                    command_template = excluded.command_template,
+                    usage_parser = excluded.usage_parser,
+                    quota_patterns_json = excluded.quota_patterns_json
+                """,
+                (
+                    engine_id, runner, model, effort, skills_json, cost_tier,
+                    budget_json, enabled, pinned, command_template, usage_parser, quota_patterns_json,
+                ),
+            )
+        row = self._conn.execute("SELECT * FROM engines WHERE id = ?", (engine_id,)).fetchone()
+        return dict(row)
+
+    def get_engine(self, engine_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM engines WHERE id = ?", (engine_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_engines(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM engines ORDER BY id ASC").fetchall()
+        return [dict(r) for r in rows]
+
+    def set_priority_list(self, items: list[dict[str, Any]]) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM priority_list")
+            for idx, item in enumerate(items, start=1):
+                self._conn.execute(
+                    """
+                    INSERT INTO priority_list (position, engine, model, effort)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        item.get("position", idx),
+                        item["engine"],
+                        item.get("model", ""),
+                        item.get("effort", "medium"),
+                    ),
+                )
+
+    def get_priority_list(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM priority_list ORDER BY position ASC").fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_phase_assignment(
+        self,
+        phase_id: str,
+        *,
+        planned_engine: str | None = None,
+        override_engine: str | None = None,
+        model: str | None = None,
+        effort: str = "medium",
+    ) -> dict[str, Any]:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO phase_assignments (phase_id, planned_engine, override_engine, model, effort)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(phase_id) DO UPDATE SET
+                    planned_engine = excluded.planned_engine,
+                    override_engine = excluded.override_engine,
+                    model = excluded.model,
+                    effort = excluded.effort
+                """,
+                (phase_id, planned_engine, override_engine, model, effort),
+            )
+        row = self._conn.execute("SELECT * FROM phase_assignments WHERE phase_id = ?", (phase_id,)).fetchone()
+        return dict(row)
+
+    def get_phase_assignment(self, phase_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM phase_assignments WHERE phase_id = ?", (phase_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_router_decision(
+        self,
+        step_id: int,
+        chosen: str,
+        reason: str,
+        scores_json: str = "{}",
+    ) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO router_decisions (step_id, chosen, reason, scores_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (step_id, chosen, reason, scores_json, now),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_router_decisions(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM router_decisions ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_engine_stats(
+        self,
+        engine: str,
+        size: str,
+        success: bool,
+        minutes: float,
+        est_cost: float = 0.0,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO engine_stats (engine, size, attempts, successes, minutes, est_cost)
+                VALUES (?, ?, 1, ?, ?, ?)
+                ON CONFLICT(engine, size) DO UPDATE SET
+                    attempts = attempts + 1,
+                    successes = successes + excluded.successes,
+                    minutes = minutes + excluded.minutes,
+                    est_cost = est_cost + excluded.est_cost
+                """,
+                (engine, size, 1 if success else 0, minutes, est_cost),
+            )
+
+    def get_engine_stats(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM engine_stats ORDER BY engine, size").fetchall()
+        return [dict(r) for r in rows]
 
     def append_event(
         self,
