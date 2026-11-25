@@ -217,6 +217,7 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
         prompt = str(p.get("prompt", ""))
         deps = list(p.get("depends_on", []))
         ladder = str(p.get("ladder", "default"))
+        size = str(p.get("size", "medium"))
         timeout = int(p.get("timeout_minutes", settings["runner_timeout_minutes"]))
         auto_m = bool(p.get("auto_merge", settings["auto_merge"]))
         rel = bool(p.get("release_after_merge", settings["auto_release"]))
@@ -230,6 +231,7 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
                 prompt=prompt,
                 depends_on=deps,
                 ladder=ladder,
+                size=size,
                 timeout_minutes=timeout,
                 auto_merge=auto_m,
                 release_after_merge=rel,
@@ -279,6 +281,7 @@ def export_queue_json(
             "prompt": str(p_dict.get("prompt", "")),
             "depends_on": deps,
             "ladder": str(p_dict.get("ladder", "default")),
+            "size": str(p_dict.get("size", "medium")),
             "timeout_minutes": int(p_dict.get("timeout_minutes", 180)),
             "auto_merge": bool(p_dict.get("auto_merge", True)),
             "release_after_merge": bool(p_dict.get("release_after_merge", False)),
