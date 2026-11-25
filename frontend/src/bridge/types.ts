@@ -102,6 +102,91 @@ export interface AppSnapshot {
 
 export type BridgeEventCallback = (payload: unknown) => void;
 
+export interface PlanPhase {
+  id: string;
+  title: string;
+  branch: string;
+  prompt: string;
+  depends_on: string[];
+  ladder: string;
+  timeout_minutes: number;
+  auto_merge: boolean;
+  release_after_merge: boolean;
+  force_rerun?: boolean;
+  position?: number;
+  implementer?: string;
+  overrideImplementer?: string;
+}
+
+export interface RunSummary {
+  id: string;
+  title: string;
+  projectId: string;
+  status: string;
+  phasesCount: number;
+  phasesDone: number;
+  phasesFailed: number;
+  duration: string;
+  aiUsed: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface RunPhaseItem {
+  id: string;
+  title: string;
+  status: string;
+  runner: string;
+  pr_number?: number | null;
+  pr_url?: string | null;
+  branch?: string;
+  duration?: string;
+}
+
+export interface RunArtifact {
+  name: string;
+  size: string;
+  sha256?: string;
+}
+
+export interface RunDetail {
+  run: RunSummary;
+  digest: string;
+  phases: RunPhaseItem[];
+  artifacts: RunArtifact[];
+}
+
+export interface EngineItem {
+  id: string;
+  runner: string;
+  name: string;
+  model: string;
+  effort: "low" | "medium" | "high";
+  costTier: "economy" | "standard" | "gold";
+  state: "ready" | "cooling" | "no-login" | "unavailable";
+  coolingUntil?: string | null;
+  quotaUsedPct: number;
+  skills: Record<string, number>;
+}
+
+export interface RouterDecision {
+  id: number;
+  step: string;
+  timestamp: string;
+  chosen: string;
+  reason: string;
+}
+
+export interface ProjectConfigItem {
+  id: string;
+  name: string;
+  repo: string;
+  local_path: string;
+  build_rules?: string;
+  artifact_glob?: string;
+  output_dir?: string;
+}
+
 export interface Bridge {
   call<T = unknown>(method: string, args?: Record<string, unknown>): Promise<T>;
   subscribe(event: string, cb: BridgeEventCallback): () => void;

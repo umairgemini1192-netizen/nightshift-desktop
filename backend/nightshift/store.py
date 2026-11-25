@@ -438,6 +438,10 @@ class Store:
         rows = self._conn.execute("SELECT * FROM projects ORDER BY created_at ASC").fetchall()
         return [dict(r) for r in rows]
 
+    def delete_project(self, project_id: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+
     def create_plan(self, plan_id: str, project_id: str, title: str, goal: str = "") -> dict[str, Any]:
         now = _utc_now()
         with self._conn:
@@ -465,6 +469,10 @@ class Store:
         else:
             rows = self._conn.execute("SELECT * FROM plans ORDER BY created_at ASC").fetchall()
         return [dict(r) for r in rows]
+
+    def delete_plan(self, plan_id: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
 
     def upsert_phase(
         self,
@@ -543,6 +551,10 @@ class Store:
             self._conn.execute(f"UPDATE phases SET {fields} WHERE id = ?", values)
         row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()
         return dict(row)
+
+    def delete_phase(self, phase_id: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM phases WHERE id = ?", (phase_id,))
 
     def record_step(
         self,

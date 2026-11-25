@@ -98,50 +98,56 @@ for (const scenario of MISSION_CONTROL_SCENARIOS) {
   }
 }
 
-// Other modules: primary scenarios across 3 viewports
+// Other modules: primary scenarios across 3 viewports and both themes
 for (const mod of OTHER_MODULES) {
   for (const scenario of BASE_SCENARIOS) {
     for (const vp of VIEWPORTS) {
-      test(`${mod.id} [${scenario}] @ ${vp.name}`, async ({ page }) => {
-        await page.setViewportSize({ width: vp.width, height: vp.height });
-        await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
+      for (const theme of THEMES) {
+        test(`${mod.id} [${scenario}] @ ${vp.name} (${theme})`, async ({ page }) => {
+          await page.setViewportSize({ width: vp.width, height: vp.height });
+          await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme });
 
-        await page.goto(`${mod.route}?scenario=${scenario}`, { waitUntil: "networkidle" });
-        await page.locator("main h1").waitFor({ state: "visible" });
+          await page.goto(`${mod.route}?scenario=${scenario}`, { waitUntil: "networkidle" });
+          await page.locator("main h1").waitFor({ state: "visible" });
 
-        if (vp.fontScalePct !== 100) {
-          await page.evaluate((pct) => {
-            document.documentElement.style.fontSize = `${pct}%`;
-          }, vp.fontScalePct);
-        }
+          await page.evaluate((t) => {
+            document.documentElement.dataset.theme = t;
+          }, theme);
 
-        await page.evaluate(() => document.fonts.ready);
+          if (vp.fontScalePct !== 100) {
+            await page.evaluate((pct) => {
+              document.documentElement.style.fontSize = `${pct}%`;
+            }, vp.fontScalePct);
+          }
 
-        // Assert zero horizontal overflow.
-        const overflow = await page.evaluate(() => ({
-          scrollWidth: document.documentElement.scrollWidth,
-          clientWidth: document.documentElement.clientWidth,
-        }));
-        expect(
-          overflow.scrollWidth,
-          `Horizontal overflow on ${mod.id} (${scenario}, ${vp.name}): scrollWidth=${overflow.scrollWidth} > clientWidth=${overflow.clientWidth}`,
-        ).toBeLessThanOrEqual(overflow.clientWidth);
+          await page.evaluate(() => document.fonts.ready);
 
-        // Run axe-core accessibility scan and fail on serious or critical violations.
-        const axeResults = await new AxeBuilder({ page }).analyze();
-        const blocking = axeResults.violations.filter(
-          (v) => v.impact === "serious" || v.impact === "critical",
-        );
-        expect(
-          blocking,
-          `Accessibility violations on ${mod.id} (${scenario}, ${vp.name}): ${JSON.stringify(
-            blocking.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.length })),
-          )}`,
-        ).toEqual([]);
+          // Assert zero horizontal overflow.
+          const overflow = await page.evaluate(() => ({
+            scrollWidth: document.documentElement.scrollWidth,
+            clientWidth: document.documentElement.clientWidth,
+          }));
+          expect(
+            overflow.scrollWidth,
+            `Horizontal overflow on ${mod.id} (${scenario}, ${vp.name}, ${theme}): scrollWidth=${overflow.scrollWidth} > clientWidth=${overflow.clientWidth}`,
+          ).toBeLessThanOrEqual(overflow.clientWidth);
 
-        const outPath = path.join(SCREENSHOTS_DIR, `${mod.id}-${scenario}-${vp.name}.png`);
-        await page.screenshot({ path: outPath, fullPage: true });
-      });
+          // Run axe-core accessibility scan and fail on serious or critical violations.
+          const axeResults = await new AxeBuilder({ page }).analyze();
+          const blocking = axeResults.violations.filter(
+            (v) => v.impact === "serious" || v.impact === "critical",
+          );
+          expect(
+            blocking,
+            `Accessibility violations on ${mod.id} (${scenario}, ${vp.name}, ${theme}): ${JSON.stringify(
+              blocking.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.length })),
+            )}`,
+          ).toEqual([]);
+
+          const outPath = path.join(SCREENSHOTS_DIR, `${mod.id}-${scenario}-${vp.name}-${theme}.png`);
+          await page.screenshot({ path: outPath, fullPage: true });
+        });
+      }
     }
   }
 }
