@@ -134,6 +134,12 @@ class CiPipelineManager:
                         p1_findings = [f for f in review_findings if f.priority == "P1"]
 
                         # P1 gate: any open P1 blocks merge -> trigger one fix round
+                        if p1_findings and round_num >= max_retries:
+                            return CiWatchResult(
+                                passed=False, rounds_used=round_num,
+                                detail="Unresolved P1 review findings: " + "; ".join(f.message for f in p1_findings),
+                                last_engine=active_engine, review_findings=review_findings,
+                            )
                         if p1_findings and round_num < max_retries:
                             if on_status_change:
                                 on_status_change("FIXING_REVIEW_P1")

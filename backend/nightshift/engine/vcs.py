@@ -83,6 +83,7 @@ class GitGhClient(Protocol):
         branch: str,
         workflow: str,
         timeout_seconds: int = 3600,
+        commit_sha: str = "",
     ) -> tuple[bool, str, int | None]: ...
 
     def download_run_artifact(
@@ -211,7 +212,7 @@ class SubprocessGitGh:
 
     def find_merged_pr(self, repo: str, branch: str) -> dict[str, Any] | None:
         rc, out, _, _ = run_subprocess_with_timeout(
-            ["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "merged", "--json", "number,url", "--limit", "1"],
+            ["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "merged", "--json", "number,url,mergeCommit", "--limit", "1"],
             timeout_seconds=60,
         )
         if rc == 0 and out:
@@ -343,9 +344,12 @@ class SubprocessGitGh:
         branch: str,
         workflow: str,
         timeout_seconds: int = 3600,
+        commit_sha: str = "",
     ) -> tuple[bool, str, int | None]:
+        if not commit_sha:
+            return False, "Merged commit SHA is required", None
         rc, out, err, _ = run_subprocess_with_timeout(
-            ["gh", "run", "list", "--repo", repo, "--branch", branch, "--workflow", workflow, "--limit", "1", "--json", "databaseId,status,conclusion"],
+            ["gh", "run", "list", "--repo", repo, "--branch", branch, "--workflow", workflow, "--commit", commit_sha, "--limit", "1", "--json", "databaseId,status,conclusion"],
             timeout_seconds=60,
         )
         if rc != 0 or not out:
@@ -524,6 +528,7 @@ class FakeGitGh:
     ) -> tuple[bool, str]:
         for branch, pr in list(self.prs.items()):
             if pr["number"] == pr_number:
+                pr["mergeCommit"] = {"oid": "sha_merge_123"}
                 self.merged_prs[branch] = pr
                 del self.prs[branch]
                 return True, f"Merged PR #{pr_number} cleanly into main."
@@ -579,6 +584,7 @@ class FakeGitGh:
         branch: str,
         workflow: str,
         timeout_seconds: int = 3600,
+        commit_sha: str = "",
     ) -> tuple[bool, str, int | None]:
         success = self.workflow_runs.get(workflow, True)
         return success, "Run completed" if success else "Workflow run failed", 9999

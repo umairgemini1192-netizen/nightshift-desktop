@@ -32,6 +32,7 @@ class ReleaseManager:
         output_dir: Path,
         title_note: str,
         *,
+        merge_sha: str,
         workflow_name: str = "Android build",
         artifact_glob: str = "*.apk",
         tag_prefix: str = "v1.0.0-preview.",
@@ -42,7 +43,7 @@ class ReleaseManager:
         Returns (tag, list_of_published_files).
         """
         # 1. Watch main build workflow
-        ok, msg, run_id = self.vcs.watch_workflow_run(repo, branch="main", workflow=workflow_name, timeout_seconds=3600)
+        ok, msg, run_id = self.vcs.watch_workflow_run(repo, branch="main", workflow=workflow_name, timeout_seconds=3600, commit_sha=merge_sha)
         if not ok or run_id is None:
             raise RuntimeError(f"Main workflow '{workflow_name}' failed or not found: {msg}")
 

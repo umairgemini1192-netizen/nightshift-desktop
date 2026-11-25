@@ -204,3 +204,33 @@ def test_post_merge_failure_auto_revert(tmp_path: Path) -> None:
         parked = store.get_parked("p1")
         assert parked is not None
         assert "Post-merge main build failed" in parked["reason"]
+
+
+@pytest.mark.asyncio
+async def test_p1_at_retry_limit_blocks_merge(tmp_path: Path) -> None:
+    with Store(tmp_path / "p1.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        sched = Scheduler(store, QuotaLedger(store))
+        runners = {"agy": FakeRunner.success("agy"), "codex": FakeRunner(name="codex", responses=[RunnerResult(rc=0, stdout="[P1] Broken", stderr="")])}
+        result = await CiPipelineManager(vcs, store, sched, runners).watch_and_heal(
+            repo="o/r", local_repo=tmp_path, worktree_dir=tmp_path, phase_id="p1",
+            phase_title="P1", branch="feat/p1", pr_number=1, initial_engine="agy",
+            risk=RiskAssessment(level="critical", reasons=[]), max_retries=0,
+        )
+        assert not result.passed
+        assert "P1" in result.detail
+
+
+def test_workflow_watcher_filters_by_merge_sha(monkeypatch) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[1:3] == ["run", "list"]:
+            return 0, '[{"databaseId": 42}]', "", False
+        return 0, "passed", "", False
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", run)
+    result = SubprocessGitGh().watch_workflow_run("o/r", "main", "build", commit_sha="merge123")
+    assert result[2] == 42
+    assert calls[0][calls[0].index("--commit") + 1] == "merge123"

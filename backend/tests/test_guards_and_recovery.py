@@ -492,6 +492,7 @@ def test_release_manager_sha256sums_and_output_copy(tmp_path: Path) -> None:
         workflow_name="Desktop build",
         artifact_glob="*.zip",
         tag_prefix="v1.0.0-preview.",
+        merge_sha="sha_merge_123",
     )
     assert tag == "v1.0.0-preview.1"
     assert len(files) == 2
@@ -502,3 +503,34 @@ def test_release_manager_sha256sums_and_output_copy(tmp_path: Path) -> None:
     expected_sha = compute_sha256(zip_out)
     assert f"{expected_sha}  NightShift-v1.zip" in sums_out.read_text(encoding="utf-8")
     assert len(vcs.releases) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("after_ci", [False, True])
+async def test_resumed_and_fixed_heads_obey_diff_guards(tmp_path: Path, after_ci: bool) -> None:
+    with Store(tmp_path / "guard.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=1)
+        bad_diff = "--- a/tests/t.py\n+++ b/tests/t.py\n+@pytest.mark.skip\n"
+        if not after_ci:
+            vcs.diffs["feat/p1"] = bad_diff
+            vcs.changed_files["feat/p1"] = ["tests/t.py"]
+        quota = QuotaLedger(store)
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={"agy": FakeRunner.success("agy")}, login_checker=logins)
+        original = engine.ci_pipeline.watch_and_heal
+        async def introduce_bad_diff(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            vcs.diffs["feat/p1"] = bad_diff
+            vcs.changed_files["feat/p1"] = ["tests/t.py"]
+            return result
+        if after_ci:
+            engine.ci_pipeline.watch_and_heal = introduce_bad_diff
+        project = ProjectConfig(id="guard", name="Guard", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch("nightshift.engine.state_machine.SingleInstanceLock") as lock:
+            lock.return_value.acquire.return_value = True
+            rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")], plan_id="plan")
+        assert rows[0]["status"] == "PARKED"
+        assert "Diff guard failed" in rows[0]["detail"]
+        assert not vcs.merged_prs

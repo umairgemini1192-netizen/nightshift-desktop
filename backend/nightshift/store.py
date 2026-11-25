@@ -261,8 +261,24 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_002_project_columns(conn: sqlite3.Connection) -> None:
+    """Upgrade databases created before the project release settings existed."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+    for name, definition in (
+        ("ui_contract", "TEXT NOT NULL DEFAULT ''"),
+        ("release_workflow", "TEXT NOT NULL DEFAULT 'Android build'"),
+        ("artifact_prefix", "TEXT NOT NULL DEFAULT ''"),
+        ("tag_prefix", "TEXT NOT NULL DEFAULT 'v1.0.0-preview.'"),
+        ("output_dir", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
+    conn.execute("UPDATE projects SET output_dir = output_folder WHERE output_dir = ''")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
+    (2, "002_project_columns", _migration_002_project_columns),
 ]
 
 

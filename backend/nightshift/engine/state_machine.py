@@ -594,6 +594,21 @@ class EngineStateMachine:
             pr_url = str(pr_info["url"])
             self.store.update_phase(phase.id, pr_number=pr_number)
 
+        # Check resumed PRs before CI and check the final head again after fixes.
+        def park_on_diff_guard() -> dict[str, Any] | None:
+            findings = check_diff_guards(wt_dir, self.vcs.list_changed_files(wt_dir), self.vcs.get_diff(wt_dir))
+            if not findings:
+                return None
+            for finding in findings:
+                self.store.record_guard_result(phase.id, finding.guard, passed=False, detail=finding.message)
+            reason = "Diff guard failed: " + "; ".join(f.message for f in findings)
+            self.store.park_phase(phase.id, reason=reason, next_step="Fix the diff guard findings")
+            return {"phase_id": phase.id, "title": phase.title, "runner": active_runner_name, "status": "PARKED", "detail": reason}
+
+        guard_failure = park_on_diff_guard()
+        if guard_failure:
+            return guard_failure
+
         # Step 3: CI Watch and Self-Healing Fix Loop
         self.store.update_phase(phase.id, status="watching_ci")
         diff_text = self.vcs.get_diff(wt_dir)
@@ -620,6 +635,10 @@ class EngineStateMachine:
         if not ci_res.passed:
             self.store.park_phase(phase.id, reason=ci_res.detail, next_step="Fix remaining CI failure")
             return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": ci_res.detail}
+
+        guard_failure = park_on_diff_guard()
+        if guard_failure:
+            return guard_failure
 
         detail = f"PR #{pr_number} green ({pr_url})"
         if ci_res.flaky:
@@ -669,9 +688,15 @@ class EngineStateMachine:
                     plain_text=f"Watching post-merge main build and publishing release for {phase.title}.",
                     phase_id=phase.id,
                 ))
+                merge_sha = None
                 try:
+                    merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch)
+                    merge_sha = (merged_pr or {}).get("mergeCommit", {}).get("oid")
+                    if not merge_sha:
+                        raise RuntimeError("Could not determine the merged commit SHA")
                     tag, published_files = self.release_mgr.publish_verified_release(
                         repo=project.repo,
+                        merge_sha=merge_sha,
                         output_dir=project.output_dir,
                         title_note=phase.title,
                         workflow_name=project.release_workflow,
@@ -687,8 +712,10 @@ class EngineStateMachine:
                 except Exception as rel_err:
                     # Post-merge main build failure -> auto-revert (BLUEPRINT 5d)
                     logger.error("Post-merge release failed: %s", rel_err)
-                    head_sha = self.vcs.remote_branch_sha(project.local_path, "main") or "HEAD"
-                    self.ci_pipeline.handle_post_merge_failure(project.local_path, head_sha, phase.id, str(rel_err))
+                    if merge_sha:
+                        self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, str(rel_err))
+                    else:
+                        self.store.park_phase(phase.id, reason=str(rel_err), next_step="Find the merged commit and inspect the release")
                     return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": f"Post-merge failure: {rel_err}"}
 
         # Cleanup worktree
