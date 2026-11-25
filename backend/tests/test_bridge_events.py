@@ -358,3 +358,19 @@ def test_bridge_run_detail_and_persisted_engine_contract(tmp_path):
     store.upsert_engine("custom", "custom-cli", "model", skills_json='{"backend": 4}', cost_tier="economy", enabled=0)
     engine = bridge.call("engines.list")["data"][0]
     assert (engine["name"], engine["costTier"], engine["state"], engine["quotaUsedPct"], engine["skills"]) == ("custom-cli", "economy", "unavailable", 0, {"backend": 4})
+
+
+def test_engine_effort_update_preserves_configuration(tmp_path):
+    store = Store(tmp_path / "data.db")
+    store.migrate()
+    bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+    before = store.upsert_engine(
+        "custom", "custom-cli", "custom-model", effort="low",
+        skills_json='{"backend": 5}', cost_tier="gold", budget_json='{"limit": 42}',
+        enabled=0, pinned=1, command_template='["custom", "{instruction}"]',
+        usage_parser="custom-parser", quota_patterns_json='["limit"]',
+    )
+    assert bridge.call("engines.update", {"id": "custom", "effort": "high"})["ok"]
+    after = store.get_engine("custom")
+    assert after == {**before, "effort": "high"}
+    store.close()

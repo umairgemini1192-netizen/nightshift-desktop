@@ -444,18 +444,20 @@ class BridgeAPI:
 
         if method == "engines.update":
             eng_id = str(payload.get("id", ""))
-            runner = str(payload.get("runner") or eng_id)
-            model = str(payload.get("model") or "auto")
-            effort = str(payload.get("effort") or "medium")
-            cost_tier = str(payload.get("costTier") or "standard")
-            budget = payload.get("budget") or {}
+            existing = self._store.get_engine(eng_id) or {}
             self._store.upsert_engine(
                 engine_id=eng_id,
-                runner=runner,
-                model=model,
-                effort=effort,
-                cost_tier=cost_tier,
-                budget_json=json.dumps(budget),
+                runner=str(payload.get("runner", existing.get("runner", eng_id))),
+                model=str(payload.get("model", existing.get("model", "auto"))),
+                effort=str(payload.get("effort", existing.get("effort", "medium"))),
+                skills_json=json.dumps(payload["skills"]) if "skills" in payload else existing.get("skills_json", "{}"),
+                cost_tier=str(payload.get("costTier", existing.get("cost_tier", "standard"))),
+                budget_json=json.dumps(payload["budget"]) if "budget" in payload else existing.get("budget_json", "{}"),
+                enabled=existing.get("enabled", 1),
+                pinned=existing.get("pinned", 0),
+                command_template=existing.get("command_template", "[]"),
+                usage_parser=existing.get("usage_parser", ""),
+                quota_patterns_json=existing.get("quota_patterns_json", "[]"),
             )
             return {"ok": True, "data": {"updated": eng_id}}
 

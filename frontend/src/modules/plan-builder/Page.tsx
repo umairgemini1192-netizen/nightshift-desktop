@@ -280,45 +280,28 @@ export default function PlanBuilderPage() {
     });
   };
 
-  const applyBulkImplementer = () => {
+  const updateBulkImplementer = async (reset: boolean) => {
     const ids = Array.from(selectedPhases);
-    setPhases((prev) =>
-      prev.map((p) =>
-        ids.includes(p.id)
-          ? { ...p, overrideImplementer: bulkEngine, implementer: bulkEngine }
-          : p,
-      ),
-    );
-    void bridge.call("plan.setImplementer", {
-      phaseIds: ids,
-      engine: bulkEngine,
-      effort: bulkEffort,
-    });
-    pushToast({
-      title: "Implementer overridden",
-      description: `Assigned ${bulkEngine} (${bulkEffort} effort) to ${ids.length} phase(s).`,
-      tone: "info",
-    });
-  };
-
-  const resetBulkImplementer = () => {
-    const ids = Array.from(selectedPhases);
-    setPhases((prev) =>
-      prev.map((p) =>
-        ids.includes(p.id)
+    try {
+      const savedPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      await bridge.call("plan.save", { plan: savedPlan, phases });
+      setPlan(savedPlan);
+      await bridge.call("plan.setImplementer", reset
+        ? { phaseIds: ids, reset: true }
+        : { phaseIds: ids, engine: bulkEngine, effort: bulkEffort });
+      setPhases((prev) => prev.map((p) => ids.includes(p.id)
+        ? reset
           ? { ...p, overrideImplementer: undefined, implementer: "Antigravity" }
-          : p,
-      ),
-    );
-    void bridge.call("plan.setImplementer", {
-      phaseIds: ids,
-      reset: true,
-    });
-    pushToast({
-      title: "Reset to plan",
-      description: `Restored default implementer for ${ids.length} phase(s).`,
-      tone: "info",
-    });
+          : { ...p, overrideImplementer: bulkEngine, implementer: bulkEngine }
+        : p));
+      pushToast({
+        title: reset ? "Reset to plan" : "Implementer overridden",
+        description: reset ? "The selected phases use the plan's implementer." : "The selected phases have been assigned.",
+        tone: "info",
+      });
+    } catch (err) {
+      pushToast({ title: "Could not update implementer", description: String(err), tone: "danger" });
+    }
   };
 
   return (
@@ -454,10 +437,10 @@ export default function PlanBuilderPage() {
                       options={EFFORT_OPTIONS}
                       className="min-w-32 text-xs"
                     />
-                    <Button size="sm" variant="secondary" onClick={applyBulkImplementer}>
+                    <Button size="sm" variant="secondary" onClick={() => void updateBulkImplementer(false)}>
                       Set implementer
                     </Button>
-                    <Button size="sm" variant="ghost" onClick={resetBulkImplementer}>
+                    <Button size="sm" variant="ghost" onClick={() => void updateBulkImplementer(true)}>
                       Reset to plan
                     </Button>
                   </div>

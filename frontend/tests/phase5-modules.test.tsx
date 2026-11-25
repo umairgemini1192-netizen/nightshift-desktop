@@ -1,7 +1,8 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { useAppStore } from "../src/app/store";
 import PlanBuilderPage from "../src/modules/plan-builder/Page";
 import RunsHistoryPage from "../src/modules/runs-history/Page";
 import EnginesQuotaPage from "../src/modules/engines-quota/Page";
@@ -28,6 +29,25 @@ describe("Phase 5 Core Modules UI", () => {
         screen.getByText(/Plan is valid: DAG is acyclic/i),
       ).toBeInTheDocument();
     });
+  });
+
+  it("saves new phases before setting an implementer", async () => {
+    const user = userEvent.setup();
+    const bridge = useAppStore.getState().bridge;
+    const call = vi.spyOn(bridge, "call");
+    render(<MemoryRouter><PlanBuilderPage /></MemoryRouter>);
+    await screen.findByText(/Foundation & Schema Migrations/i);
+    await user.click(screen.getByRole("button", { name: "Add phase" }));
+    await user.click(screen.getByRole("checkbox", { name: /All / }));
+    await user.click(screen.getByRole("button", { name: "Set implementer" }));
+    await waitFor(() => expect(call.mock.calls.some(([method]) => method === "plan.setImplementer")).toBe(true));
+    const saveIndex = call.mock.calls.findIndex(([method]) => method === "plan.save");
+    const overrideIndex = call.mock.calls.findIndex(([method]) => method === "plan.setImplementer");
+    expect(saveIndex).toBeGreaterThanOrEqual(0);
+    expect(saveIndex).toBeLessThan(overrideIndex);
+    const saved = call.mock.calls[saveIndex][1] as { phases: unknown[] };
+    expect(saved.phases.length).toBeGreaterThan(5);
+    call.mockRestore();
   });
 
   it("renders Runs & History page and drills down into run details with morning digest", async () => {
