@@ -37,6 +37,7 @@ async def test_ci_watch_clean_pass(tmp_path: Path) -> None:
     with Store(db) as store:
         store.migrate()
         vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=101)
         quota = QuotaLedger(store)
         sched = Scheduler(store, quota)
         runners = {"agy": FakeRunner.success("agy")}
@@ -67,6 +68,7 @@ async def test_ci_flaky_test_detection(tmp_path: Path) -> None:
     with Store(db) as store:
         store.migrate()
         vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=102)
         vcs.ci_flaky[102] = True  # First check fails, second check passes without code change
 
         quota = QuotaLedger(store)
@@ -99,6 +101,7 @@ async def test_ci_auto_fix_and_engine_rotation(tmp_path: Path) -> None:
     with Store(db) as store:
         store.migrate()
         vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=103)
         # Set checks for PR 103: Fail round 1 (with flaky re-check), Fail round 2, Pass round 3
         vcs.ci_results[103] = [False, False, False, True]
 
@@ -140,6 +143,7 @@ async def test_risk_based_review_p1_blocks_p2_passes(tmp_path: Path, risk_level:
     with Store(db) as store:
         store.migrate()
         vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=104)
         quota = QuotaLedger(store)
         sched = Scheduler(store, quota)
 
@@ -235,6 +239,37 @@ def test_workflow_watcher_filters_by_merge_sha(monkeypatch) -> None:
     result = SubprocessGitGh().watch_workflow_run("o/r", "main", "build", commit_sha="merge123")
     assert result[2] == 42
     assert calls[0][calls[0].index("--commit") + 1] == "merge123"
+
+
+@pytest.mark.asyncio
+async def test_head_change_during_ci_is_not_accepted(tmp_path: Path) -> None:
+    with Store(tmp_path / "head.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=1, head_sha="old")
+        def watch(*args, **kwargs):
+            vcs.prs["feat/p1"]["headRefOid"] = "new"
+            return True, "passed"
+        vcs.watch_pr_checks = watch
+        result = await CiPipelineManager(vcs, store, Scheduler(store, QuotaLedger(store)), {}).watch_and_heal(
+            repo="o/r", local_repo=tmp_path, worktree_dir=tmp_path, phase_id="p1", phase_title="P1",
+            branch="feat/p1", pr_number=1, initial_engine="agy", risk=RiskAssessment(level="low"),
+        )
+        assert not result.passed
+        assert result.checked_sha is None
+
+
+@pytest.mark.parametrize("conclusion,expected", [("failure", False), ("cancelled", None)])
+def test_workflow_watch_distinguishes_failure_from_unknown(monkeypatch, conclusion, expected) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+    def run(cmd, **kwargs):
+        if cmd[1:3] == ["run", "list"]:
+            return 0, '[{"databaseId": 42}]', "", False
+        if cmd[1:3] == ["run", "view"]:
+            return 0, '{"status":"completed","conclusion":"' + conclusion + '"}', "", False
+        return 1, "", "watch failed", False
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", run)
+    assert SubprocessGitGh().watch_workflow_run("o/r", "main", "build", commit_sha="sha")[0] is expected
 
 
 def test_revert_merge_uses_first_parent(monkeypatch, tmp_path: Path) -> None:

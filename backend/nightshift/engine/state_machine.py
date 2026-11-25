@@ -297,7 +297,7 @@ class EngineStateMachine:
                     merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch)
                     if merged_pr:
                         prior = self.store.get_phase(phase.id) or {}
-                        if phase.release_after_merge and prior.get("status") in ("merging", "merged", "releasing"):
+                        if prior.get("status") in ("merging", "merged", "releasing", "verifying_build"):
                             row = self._finish_merged_delivery(project, phase, merged_pr, "none")
                             summary_rows.append(row)
                             if row["status"] == "COMPLETED":
@@ -673,14 +673,12 @@ class EngineStateMachine:
         if phase.auto_merge:
             latest_pr = self.vcs.find_open_pr(project.repo, phase.branch)
             if (
-                ci_res.checked_sha
-                and latest_pr
-                and latest_pr.get("headRefOid")
-                and str(latest_pr["headRefOid"]) != ci_res.checked_sha
+                not ci_res.checked_sha or not latest_pr or not latest_pr.get("headRefOid")
+                or str(latest_pr["headRefOid"]) != ci_res.checked_sha
             ):
                 mismatch_reason = (
                     f"Hard guard: PR #{pr_number} head SHA changed after CI passed "
-                    f"(checked {ci_res.checked_sha[:7]}, now {str(latest_pr['headRefOid'])[:7]})."
+                    f"(checked {str(ci_res.checked_sha)[:7]}, now {str((latest_pr or {}).get('headRefOid'))[:7]})."
                 )
                 self.store.record_guard_result(phase.id, "exact_head_sha", passed=False, detail=mismatch_reason)
                 self.store.park_phase(phase.id, reason=mismatch_reason, next_step="Re-run CI on the latest head commit")
@@ -705,12 +703,11 @@ class EngineStateMachine:
             self.store.update_phase(phase.id, status="merged")
             detail = f"Merged PR #{pr_number}"
 
-            if phase.release_after_merge:
-                merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
-                result = self._finish_merged_delivery(project, phase, merged_pr, ci_res.last_engine)
-                if result["status"] != "COMPLETED":
-                    return result
-                detail = result["detail"]
+            merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
+            result = self._finish_merged_delivery(project, phase, merged_pr, ci_res.last_engine)
+            if result["status"] != "COMPLETED":
+                return result
+            detail = result["detail"]
 
         # Cleanup worktree
         self.vcs.remove_worktree(project.local_path, wt_dir)
@@ -728,23 +725,30 @@ class EngineStateMachine:
         self, project: ProjectConfig, phase: PhaseDefinition, merged_pr: dict[str, Any], runner: str
     ) -> dict[str, Any]:
         """Resume post-merge delivery without repeating implementation or merge."""
-        self.store.update_phase(phase.id, status="releasing", pr_number=merged_pr.get("number"))
+        self.store.update_phase(phase.id, status="verifying_build", pr_number=merged_pr.get("number"))
         merge_sha = (merged_pr.get("mergeCommit") or {}).get("oid")
         try:
             if not merge_sha:
                 raise RuntimeError("Could not determine the merged commit SHA")
+            ok, msg, run_id = self.vcs.watch_workflow_run(project.repo, branch="main", workflow=project.release_workflow, timeout_seconds=3600, commit_sha=merge_sha)
+            if ok is False:
+                self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg)
+                raise RuntimeError(f"Main build failed: {msg}")
+            if ok is not True or run_id is None:
+                raise RuntimeError(f"Could not verify main build: {msg}")
+            if not phase.release_after_merge:
+                self.store.update_phase(phase.id, status="completed")
+                return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')}; main build passed"}
+            self.store.update_phase(phase.id, status="releasing")
             tag, files = self.release_mgr.publish_verified_release(
                 repo=project.repo, merge_sha=merge_sha, output_dir=project.output_dir,
                 title_note=phase.title, workflow_name=project.release_workflow,
-                artifact_glob=project.artifact_glob, tag_prefix=project.tag_prefix,
+                artifact_glob=project.artifact_glob, tag_prefix=project.tag_prefix, run_id=run_id,
             )
             self.store.update_phase(phase.id, status="completed")
             self.events.emit(Event(kind="release.published", plain_text=f"Published verified release {tag} with SHA-256 checksums.", phase_id=phase.id))
             return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')} ? Released {tag} ({len(files)} files)"}
         except Exception as rel_err:
             logger.error("Post-merge release failed: %s", rel_err)
-            if merge_sha:
-                self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, str(rel_err))
-            else:
-                self.store.park_phase(phase.id, reason=str(rel_err), next_step="Find the merged commit and inspect the release")
+            self.store.park_phase(phase.id, reason=str(rel_err), next_step="Inspect the main build or release and resume")
             return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": f"Post-merge failure: {rel_err}"}

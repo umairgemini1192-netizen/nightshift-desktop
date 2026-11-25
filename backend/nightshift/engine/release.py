@@ -37,15 +37,17 @@ class ReleaseManager:
         artifact_glob: str = "*.apk",
         tag_prefix: str = "v1.0.0-preview.",
         temp_dir: Path | None = None,
+        run_id: int | None = None,
     ) -> tuple[str, list[Path]]:
         """Watch post-merge build, download artifacts, compute SHA256, create release, copy to output_dir.
 
         Returns (tag, list_of_published_files).
         """
         # 1. Watch main build workflow
-        ok, msg, run_id = self.vcs.watch_workflow_run(repo, branch="main", workflow=workflow_name, timeout_seconds=3600, commit_sha=merge_sha)
-        if not ok or run_id is None:
-            raise RuntimeError(f"Main workflow '{workflow_name}' failed or not found: {msg}")
+        if run_id is None:
+            ok, msg, run_id = self.vcs.watch_workflow_run(repo, branch="main", workflow=workflow_name, timeout_seconds=3600, commit_sha=merge_sha)
+            if not ok or run_id is None:
+                raise RuntimeError(f"Main workflow '{workflow_name}' failed or not found: {msg}")
 
         # 2. Download artifacts
         work_tmp = temp_dir or (output_dir / "temp_download")

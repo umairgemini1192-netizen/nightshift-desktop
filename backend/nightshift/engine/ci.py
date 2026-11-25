@@ -103,7 +103,9 @@ class CiPipelineManager:
             if on_status_change:
                 on_status_change(f"WATCHING_CI ({round_num + 1}/{max_retries + 1})")
 
-            # Check CI status on PR
+            # Bind the check and review to a stable PR head.
+            snapshot = self.vcs.find_open_pr(repo, branch)
+            checked_sha = str(snapshot.get("headRefOid") or "") if snapshot else ""
             passed, ci_msg = self.vcs.watch_pr_checks(repo, pr_number, worktree_dir)
 
             # 1. Flaky test detector: if failed, re-run checks once before burning a fix round
@@ -156,7 +158,8 @@ class CiPipelineManager:
                         continue
 
                 pr_snap = self.vcs.find_open_pr(repo, branch)
-                checked_sha = str(pr_snap["headRefOid"]) if pr_snap and pr_snap.get("headRefOid") else None
+                if not checked_sha or not pr_snap or str(pr_snap.get("headRefOid") or "") != checked_sha:
+                    return CiWatchResult(passed=False, detail="PR head changed or could not be verified during CI and review.", last_engine=active_engine)
                 return CiWatchResult(
                     passed=True,
                     flaky=flaky_detected,

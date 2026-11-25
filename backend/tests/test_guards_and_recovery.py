@@ -173,6 +173,7 @@ async def test_merge_main_conflict_resolution_in_ci_fix_loop(tmp_path: Path) -> 
     with Store(db) as store:
         store.migrate()
         vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=701)
         vcs.ci_results[701] = [False, False, True]
         vcs.merge_conflict = True
         quota = QuotaLedger(store)
@@ -506,6 +507,35 @@ def test_release_manager_sha256sums_and_output_copy(tmp_path: Path) -> None:
     expected_sha = compute_sha256(zip_out)
     assert f"{expected_sha}  NightShift-v1.zip" in sums_out.read_text(encoding="utf-8")
     assert len(vcs.releases) == 1
+
+
+@pytest.mark.parametrize("build_result,release,expected,reverts", [
+    ((True, "passed", 12), False, "COMPLETED", 0),
+    ((False, "failed", 12), False, "PARKED", 1),
+    ((None, "timeout", 12), False, "PARKED", 0),
+    ((True, "passed", 12), True, "PARKED", 0),
+])
+def test_post_merge_verification_and_release_failures(tmp_path: Path, build_result, release, expected, reverts) -> None:
+    with Store(tmp_path / "delivery.db") as store:
+        store.migrate()
+        store.create_project("project", "Project", "o/r", str(tmp_path))
+        store.create_plan("plan", "project", "Plan")
+        store.upsert_phase("p1", "plan", "P1", "feat/p1")
+        vcs = FakeGitGh()
+        calls = []
+        def watch(*args, **kwargs):
+            calls.append(kwargs.get("commit_sha"))
+            return build_result
+        vcs.watch_workflow_run = watch
+        vcs.artifacts_to_create = []
+        quota = QuotaLedger(store)
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs)
+        project = ProjectConfig(id="project", name="Project", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        phase = PhaseDefinition(id="p1", title="P1", branch="feat/p1", release_after_merge=release)
+        result = engine._finish_merged_delivery(project, phase, {"number": 1, "mergeCommit": {"oid": "merge_sha"}}, "agy")
+        assert result["status"] == expected
+        assert calls == ["merge_sha"]
+        assert len(vcs.reverts) == reverts
 
 
 @pytest.mark.asyncio

@@ -84,7 +84,7 @@ class GitGhClient(Protocol):
         workflow: str,
         timeout_seconds: int = 3600,
         commit_sha: str = "",
-    ) -> tuple[bool, str, int | None]: ...
+    ) -> tuple[bool | None, str, int | None]: ...
 
     def download_run_artifact(
         self,
@@ -345,27 +345,36 @@ class SubprocessGitGh:
         workflow: str,
         timeout_seconds: int = 3600,
         commit_sha: str = "",
-    ) -> tuple[bool, str, int | None]:
+    ) -> tuple[bool | None, str, int | None]:
         if not commit_sha:
-            return False, "Merged commit SHA is required", None
+            return None, "Merged commit SHA is required", None
         rc, out, err, _ = run_subprocess_with_timeout(
             ["gh", "run", "list", "--repo", repo, "--branch", branch, "--workflow", workflow, "--commit", commit_sha, "--limit", "1", "--json", "databaseId,status,conclusion"],
             timeout_seconds=60,
         )
         if rc != 0 or not out:
-            return False, f"Could not locate workflow run: {err}", None
+            return None, f"Could not locate workflow run: {err}", None
         try:
             runs = json.loads(out)
             if not runs:
-                return False, "No workflow runs found", None
+                return None, "No workflow runs found", None
             run_id = int(runs[0]["databaseId"])
             rc_w, out_w, err_w, _ = run_subprocess_with_timeout(
                 ["gh", "run", "watch", str(run_id), "--repo", repo, "--exit-status"],
                 timeout_seconds=timeout_seconds,
             )
-            return (rc_w == 0, out_w or err_w, run_id)
+            if rc_w == 0:
+                return True, out_w or err_w, run_id
+            rc_v, out_v, _, _ = run_subprocess_with_timeout(
+                ["gh", "run", "view", str(run_id), "--repo", repo, "--json", "status,conclusion"], timeout_seconds=60,
+            )
+            if rc_v == 0:
+                result = json.loads(out_v)
+                if result.get("status") == "completed" and result.get("conclusion") == "failure":
+                    return False, out_w or err_w, run_id
+            return None, out_w or err_w, run_id
         except Exception as e:
-            return False, str(e), None
+            return None, str(e), None
 
     def download_run_artifact(
         self,
