@@ -36,7 +36,8 @@ Owner profile: not a programmer. The UI must explain itself at a glance. No admi
 | Tests | pytest (engine), Vitest + Testing Library (UI), Playwright (screenshots + a11y via axe) | All run on GitHub Actions `windows-latest` |
 | Packaging | PyInstaller `--onedir` -> `NightShift.exe` + zipped folder | Per-user, no installer needed |
 
-No network calls except: GitHub (`gh`, `git`) and the AI CLIs the owner already uses. No telemetry.
+No network calls except: GitHub (`gh`, `git`), the AI CLIs the owner already uses, and the optional
+phone status bridge (section 5i: off by default, only the owner's own Apps Script URL). No telemetry.
 
 ## 3. Repository layout
 
@@ -403,6 +404,51 @@ review, and only within the owner's Gold budget.
 per job size. If an economy engine's success rate for a size falls below 60% over the last 10 jobs,
 the Router starts that size one tier higher and says so on the deck. The deck shows
 "gold saved tonight (estimate)": jobs finished by Economy that would otherwise have used Standard/Gold.
+
+## 5i. Phone status bridge (owner rule, 2026-11-25)
+
+Purpose: the owner checks an unattended run from the phone (open one Google Doc, or ask Gemini
+"Update") without RDP, Google Cloud credentials or admin rights. It is a module (section 4),
+`phone_status`, off by default.
+
+**Path:** engine -> HTTPS POST -> the owner's own Google Apps Script web app (deployed under the
+owner's account, "Execute as: me") -> redraws the Google Doc `NIGHTSHIFT_LIVE_STATUS`. No other host.
+
+**What is sent: the deck, never raw data.** The payload is the section 5e deck only: project name,
+state (`working` / `attention` / `good` / `stopped`), one-line headline, now (phase, step, working AI,
+ETA estimate), needs you (max 3), done this run, next (max 3), and a phase strip (short title + state
+per phase). No log lines, file paths, diffs, prompts or command output. Every string passes the 5d
+secret redaction before sending; the web app also whitelists and length-caps every field.
+
+**Rules:**
+1. **Secret required.** The web app is reachable anonymously, so the URL alone is not enough: every
+   POST carries a shared secret in the JSON body (not the URL; Apps Script cannot read headers). The
+   web app compares it in constant time and rejects anything else. URL and secret live in `settings`,
+   the secret encrypted with Windows DPAPI; neither is ever logged or shown after entry.
+2. **Never blocks a phase.** One background sender, 20 s timeout, every error swallowed and recorded
+   as one line on the Settings card ("last phone update: ok 10:45" / "failed: timeout").
+3. **Debounce + urgent.** At most one post per 60 s; run start/stop, a phase merging, completing or
+   parking goes out at once.
+4. **Heartbeat.** Every 10 min while running. The Doc shows "last heard" per project; older than
+   25 min means the PC is off, asleep or offline (the Doc says so in plain words).
+5. **Ordered writes.** Each post carries `seq` (epoch ms); the web app serialises writes with
+   `LockService` and drops a post older than the stored one.
+6. **Apps Script quirks.** A POST to `/exec` answers with a 302 after `doPost` has run; the client
+   follows it and does not treat it as a failure.
+7. **One card per project.** DriveLift and Night-Shift Desktop each keep their own card in the same
+   Doc (running projects first, cards older than 7 days dropped), so two builders never overwrite
+   each other.
+
+**Doc look:** one dark card per project in the design-system colours (`design/tokens.json` dark theme):
+large status word (WORKING cyan, NEEDS YOU red, ALL GOOD green, STOPPED/SILENT amber), the headline,
+a coloured strip with one block per phase (green done, cyan working, red stopped, slate waiting),
+then NOW / NEEDS YOU / DONE THIS RUN / NEXT and "last heard". Readable in one glance on a phone.
+
+**Settings card:** toggle, URL, secret (masked), "Send test update" button, last result. The Apps
+Script source ships in `tools/phone-bridge/Code.gs` with a one-page setup guide.
+
+Reference implementation (legacy, running since 2026-11-25): `Gemini-Supervisor/status_bridge.py`
+(client) and `Gemini-Supervisor/gas-bridge/Code.gs` (web app v6).
 
 ## 6. Data model (SQLite)
 
