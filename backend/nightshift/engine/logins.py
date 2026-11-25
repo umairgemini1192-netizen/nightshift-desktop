@@ -49,7 +49,7 @@ class LoginHealthChecker:
         self._store = store
         self._quota_ledger = quota_ledger
         self._runner = command_runner or (lambda cmd, to: run_subprocess_with_timeout(cmd, timeout_seconds=to))
-        self._cache: dict[str, tuple[datetime, LoginCheckResult]] = {}
+        self._cache: dict[tuple[str, str], tuple[datetime, LoginCheckResult]] = {}
 
     def clear_cache(self) -> None:
         self._cache.clear()
@@ -63,9 +63,10 @@ class LoginHealthChecker:
     ) -> LoginCheckResult:
         """Check login health of a specific tool, respecting cache and cooldowns."""
         now = datetime.now(timezone.utc)
+        cache_key = (tool, repo if tool == "git" else "")
         ttl_minutes = self.RUN_RECHECK_TTL_MINUTES if in_run else self.CACHE_TTL_MINUTES
-        if not force and tool in self._cache:
-            cached_time, cached_res = self._cache[tool]
+        if not force and cache_key in self._cache:
+            cached_time, cached_res = self._cache[cache_key]
             if now - cached_time < timedelta(minutes=ttl_minutes):
                 return cached_res
 
@@ -81,7 +82,7 @@ class LoginHealthChecker:
                 back_at=back_at.isoformat() if back_at else None,
                 checked_at=now.isoformat(),
             )
-            self._cache[tool] = (now, res)
+            self._cache[cache_key] = (now, res)
             if self._store:
                 self._store.record_login_check(tool, res.state, res.detail, res.back_at)
             return res
@@ -97,7 +98,7 @@ class LoginHealthChecker:
         else:
             res = checker_fn(repo=repo)
 
-        self._cache[tool] = (now, res)
+        self._cache[cache_key] = (now, res)
         if self._store:
             self._store.record_login_check(tool, res.state, res.detail, res.back_at)
         return res

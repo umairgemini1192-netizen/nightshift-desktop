@@ -1,10 +1,57 @@
 import json
+import threading
 
 from nightshift.bridge import BridgeAPI, attach_event_pump
 from nightshift.engine.logins import LoginCheckResult
 from nightshift.events import Event, EventBus
 from nightshift.modules.registry import ModuleRegistry
 from nightshift.store import Store
+
+
+def test_start_executes_selected_project_plan_and_rejects_duplicate(tmp_path) -> None:
+    store = Store(tmp_path / "run.db")
+    store.migrate()
+    for project_id in ("first", "selected"):
+        store.create_project(project_id, project_id, f"owner/{project_id}", str(tmp_path))
+        store.create_plan(f"{project_id}-plan", project_id, "Plan")
+        store.upsert_phase(f"{project_id}-phase", f"{project_id}-plan", "Phase", "feat/phase")
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    class Engine:
+        is_running = False
+
+        async def execute_plan(self, project, phases, *, plan_id):
+            calls.append((project.id, [p.id for p in phases], plan_id))
+            entered.set()
+            release.wait(5)
+
+    bridge = BridgeAPI(store, EventBus(), ModuleRegistry(), Engine())
+    bridge._logins.check_all = lambda **kwargs: {}
+    bridge.call("app.selectProject", {"projectId": "selected"})
+    assert bridge.call("engine.start")["ok"]
+    assert entered.wait(5)
+    assert calls == [("selected", ["selected-phase"], "selected-plan")]
+    assert not bridge.call("engine.start")["ok"]
+    release.set()
+    bridge._run_thread.join(5)
+    store.close()
+
+
+def test_snapshot_checks_selected_repository_and_empty_project(tmp_path, monkeypatch) -> None:
+    store = Store(tmp_path / "snapshot.db")
+    store.migrate()
+    bridge = BridgeAPI(store, EventBus(), ModuleRegistry())
+    calls = []
+    monkeypatch.setattr(bridge._logins, "check_all", lambda **kwargs: calls.append(kwargs) or {
+        "git": LoginCheckResult(tool="git", state="Logged out", detail="Sign in")
+    })
+    assert bridge.call("app.snapshot")["data"]["logins"] == {}
+    store.create_project("p", "Project", "owner/repo", str(tmp_path))
+    snapshot = bridge.call("app.selectProject", {"projectId": "p"})["data"]
+    assert snapshot["logins"]["git"]["state"] == "Logged out"
+    assert calls == [{"repo": "owner/repo", "force": False}]
+    store.close()
 
 
 def test_event_pump_serializes_and_unsubscribes() -> None:
@@ -106,18 +153,19 @@ def test_bridge_engine_status_and_stop_controls(tmp_path) -> None:
     assert not start_resp["ok"]
 
     engine.is_running = False
-    start_resp2 = bridge.call("engine.start")
-    assert start_resp2["ok"]
-    assert start_resp2["data"]["started"] is True
+    assert not bridge.call("engine.start")["ok"]
 
     store.close()
 
 
-def test_bridge_plan_and_runs_and_engines_list(tmp_path) -> None:
+def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     store = Store(tmp_path / "test_data.db")
     store.migrate()
     events = EventBus(store=store)
     bridge = BridgeAPI(store, events, ModuleRegistry())
+    monkeypatch.setattr(bridge._logins, "check_all", lambda **kwargs: {
+        "gh": LoginCheckResult(tool="gh", state="Ready", detail="Verified")
+    })
 
     store.create_project("p1", "Test Project", "owner/repo", "/path")
     store.create_plan("plan1", "p1", "Overnight Plan")
@@ -145,6 +193,7 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path) -> None:
     assert snap_resp["ok"]
     assert snap_resp["data"]["activeProjectId"] == "p1"
     assert len(snap_resp["data"]["projects"]) == 1
+    assert snap_resp["data"]["logins"]["gh"]["state"] == "Ready"
 
     # settings get / set
     assert bridge.call("settings.get", {"key": "theme"})["data"] is None

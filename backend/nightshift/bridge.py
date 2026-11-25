@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import asyncio
+import threading
 from dataclasses import asdict
 from typing import Any, Callable
 
 from nightshift import __version__
 from nightshift.engine.deck import generate_deck_data
 from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.planner import PhaseDefinition, validate_plan_dag
+from nightshift.engine.state_machine import ProjectConfig
 from nightshift.events import Event, EventBus
 from nightshift.modules.registry import ModuleRegistry
 from nightshift.quota.ledger import QuotaLedger
@@ -50,6 +54,9 @@ class BridgeAPI:
         self._engine = engine
         self._logins = LoginHealthChecker(store=store, quota_ledger=QuotaLedger(store))
         self._stop_armed = False
+        self._active_project_id: str | None = None
+        self._run_lock = threading.Lock()
+        self._run_thread: threading.Thread | None = None
 
     def call(self, method: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         """Dispatch a ``<module>.<action>`` or ``app.<action>`` RPC call."""
@@ -116,13 +123,37 @@ class BridgeAPI:
             }
 
         if method == "engine.start":
-            if self._engine and getattr(self._engine, "is_running", False):
-                return {"ok": False, "error": "Engine is already running."}
-            self._events.emit(Event(
-                kind="run.started",
-                plain_text="Night-Shift overnight run started.",
-                level="info",
-            ))
+            with self._run_lock:
+                if (self._run_thread and self._run_thread.is_alive()) or (self._engine and getattr(self._engine, "is_running", False)):
+                    return {"ok": False, "error": "Engine is already running."}
+                if not self._engine:
+                    return {"ok": False, "error": "The engine is unavailable."}
+                projects = self._store.list_projects()
+                project_id = str(payload.get("projectId") or self._active_project_id or (projects[0]["id"] if projects else ""))
+                project = self._store.get_project(project_id)
+                plan_id = str(payload.get("planId") or "")
+                plans = self._store.list_plans(project_id) if project else []
+                plan = self._store.get_plan(plan_id) if plan_id else (plans[0] if plans else None)
+                if not project or not plan or plan["project_id"] != project_id:
+                    return {"ok": False, "error": "Select a project with a plan before starting."}
+                try:
+                    phases = [PhaseDefinition.from_dict(p) for p in self._store.list_phases(plan["id"])]
+                    if not phases:
+                        return {"ok": False, "error": "Add a phase to the plan before starting."}
+                    validate_plan_dag(phases)
+                    config = ProjectConfig.from_dict(project)
+                except (ValueError, TypeError, KeyError) as exc:
+                    return {"ok": False, "error": f"The plan could not be started: {exc}"}
+
+                def run() -> None:
+                    try:
+                        asyncio.run(self._engine.execute_plan(config, phases, plan_id=plan["id"]))
+                    except Exception:
+                        logger.exception("Plan execution failed")
+                        self._events.emit(Event(kind="run.failed", plain_text="The run could not continue.", level="error"))
+
+                self._run_thread = threading.Thread(target=run, daemon=True, name="NightShiftPlan")
+                self._run_thread.start()
             return {"ok": True, "data": {"started": True}}
 
         if method == "engine.stopAfterPhase":
@@ -194,7 +225,10 @@ class BridgeAPI:
             projects = self._store.list_projects()
             active_project_id = str(payload.get("projectId") or "")
             if not active_project_id and projects:
-                active_project_id = projects[0]["id"]
+                active_project_id = self._active_project_id or projects[0]["id"]
+            self._active_project_id = active_project_id or None
+            active_project = next((p for p in projects if p["id"] == active_project_id), None)
+            checks = self._logins.check_all(repo=active_project["repo"], force=False) if active_project else {}
 
             deck = generate_deck_data(self._store, project_id=active_project_id or "nightshift-desktop")
             is_running = bool(self._engine and getattr(self._engine, "is_running", False))
@@ -236,6 +270,7 @@ class BridgeAPI:
                     "moduleBadges": badges,
                     "deck": deck,
                     "stopArmed": stop_armed,
+                    "logins": {name: asdict(result) for name, result in checks.items()},
                 },
             }
 
