@@ -226,8 +226,12 @@ after every fix path is exhausted, and even then keeps working on everything tha
      quota: three full reviews in one hour on DriveLift PR #99).
   2. **Free fallback.** Codex silent for 15 min or reporting a usage/quota limit -> the Economy engines
      (5h, in order) review the diff in the same P1/P2 format; the result is posted on the PR as
-     `[FREE-REVIEW]`. The diff is packed by priority (app code, then resources, then tests; unchanged
-     context trimmed; every file gets a share) so large PRs are still covered.
+     `[FREE-REVIEW]`. The diff is packed by priority (app code, then resources, then tests; full hunks,
+     never trimmed context, which made free models report false syntax-error P1s; every file gets a
+     share). **Measured 2026-11-25:** Nemotron 550B and ERNIE 5.5 both returned "no findings" on a
+     DriveLift PR #99 commit where Codex found a real P1, and GLM/Ling hit free-tier rate limits. A
+     free-only review is therefore labelled **LIGHT review** on the deck, phone Doc and digest, never
+     "reviewed". Its P1s still block the merge.
   3. **P1 gate.** P1 = user-visible bug, crash, data loss, security/privacy issue, broken accessibility
      (touch target under 48 dp, unlabeled control) or behaviour against the phase goal. Any open P1 ->
      one fix round (Economy first, 5h ladder) -> CI -> one re-review. Still P1 -> **parked** with the
