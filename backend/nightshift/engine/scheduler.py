@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.router import Router
 from nightshift.engine.vcs import GitGhClient
 from nightshift.quota.ledger import QuotaLedger
 from nightshift.store import Store
@@ -126,6 +127,7 @@ class Scheduler:
         max_run_invocations: int = 60,
         max_run_hours: float = 12.0,
         aggressive_switchback: bool = False,
+        router: Router | None = None,
     ) -> None:
         self.store = store
         self.quota_ledger = quota_ledger
@@ -135,6 +137,7 @@ class Scheduler:
         self.max_run_invocations = max_run_invocations
         self.max_run_hours = max_run_hours
         self.aggressive_switchback = aggressive_switchback
+        self.router = router if router is not None else Router(store, quota_ledger, login_checker)
 
         self.same_error_detector = SameErrorDetector()
         self.circuit_breaker = CircuitBreaker()
@@ -160,14 +163,21 @@ class Scheduler:
         if self.quota_ledger.is_cooling_down(engine_name, model):
             return False
 
-        # Enforce owner-set budget caps per engine (BLUEPRINT 5d)
-        for eng in self.store.list_engines():
-            if eng.get("runner") == engine_name and (not model or eng.get("model") == model):
+        # Enforce owner-set budget caps per engine (BLUEPRINT 5d) across all matching catalogue rows
+        matching_rows = [
+            eng
+            for eng in self.store.list_engines()
+            if eng.get("id") == engine_name
+            or (eng.get("runner") == engine_name and (not model or eng.get("model") in (model, "")))
+        ]
+        if matching_rows:
+            if all(not eng.get("enabled", 1) for eng in matching_rows):
+                return False
+            for eng in matching_rows:
                 if not eng.get("enabled", 1):
-                    return False
+                    continue
                 if not self.quota_ledger.check_budget_cap(engine_name, eng.get("budget_json", "{}")):
                     return False
-                break
 
         if self.login_checker is not None:
             status = self.login_checker.check_tool(engine_name, in_run=True)
@@ -216,30 +226,63 @@ class Scheduler:
         current_engine: str | None = None,
         exclude_engines: set[str] | None = None,
     ) -> EngineChoice | None:
-        """Select the next engine according to BLUEPRINT 5c.
+        """Select the next engine according to BLUEPRINT 5a, 5c, and 5h.
 
         Hierarchy:
-          1. Preferred engine (switch-back if cooldown ended)
-          2. Global priority list
-          3. Router score
+          1. Explicit phase assignment (owner override > plan implementer) with fast switch-back
+          2. When unassigned ("Auto"): Smart quota-aware Router (5a/5h Economy-first)
+          3. Global fallback priority list (skipping unavailable/cooling engines)
         """
         excluded = set(exclude_engines or set())
+        assignment = self.store.get_phase_assignment(phase_id)
+        has_explicit_assignment = bool(
+            assignment
+            and (
+                (assignment.get("override_engine") and assignment.get("override_engine") != "auto")
+                or (assignment.get("planned_engine") and assignment.get("planned_engine") != "auto")
+            )
+        )
         preferred_engine, pref_model, pref_effort = self.get_preferred_engine(phase_id)
 
-        # Fast switch-back check (BLUEPRINT 5c):
-        # If current engine was a fallback and preferred engine is now available, switch back immediately!
+        # 1. Fast switch-back & explicit assignment check (BLUEPRINT 5c)
         if preferred_engine not in excluded and self.is_engine_available(preferred_engine, pref_model):
             is_sb = bool(current_engine and current_engine != preferred_engine)
             reason = "Preferred engine available" + (" (fast switch-back)" if is_sb else "")
-            return EngineChoice(
-                engine=preferred_engine,
-                model=pref_model,
-                effort=pref_effort,
-                reason=reason,
-                is_switchback=is_sb,
-            )
+            if has_explicit_assignment:
+                self.store.record_router_decision(chosen=preferred_engine, reason=reason)
+                return EngineChoice(
+                    engine=preferred_engine,
+                    model=pref_model,
+                    effort=pref_effort,
+                    reason=reason,
+                    is_switchback=is_sb,
+                )
 
-        # Fall back through priority list (Economy -> Standard -> Gold, Claude always last)
+        # 2. Smart Quota-Aware Router selection when unassigned ("Auto") and not mid-phase takeover (BLUEPRINT 5a, 5c item 7, 5h)
+        # During a takeover/rotation (current_engine is set), the global priority list decides who takes over (BLUEPRINT 5c item 3).
+        if not has_explicit_assignment and current_engine is None and self.router is not None:
+            phase_def = self.store.get_phase(phase_id)
+            size = phase_def.get("size", "medium") if phase_def else "medium"
+            effective_kind = step_kind
+            if step_kind == "implement" and phase_def and phase_def.get("ladder") in ("ui", "backend", "docs", "review", "fix_ci"):
+                effective_kind = str(phase_def["ladder"])
+            dec = self.router.pick(
+                step_kind=effective_kind,
+                phase_id=phase_id,
+                size=size,
+                current_engine=current_engine,
+                exclude_engines=excluded,
+            )
+            if dec and not dec.exhausted and self.is_engine_available(dec.runner, dec.model):
+                return EngineChoice(
+                    engine=dec.runner,
+                    model=dec.model,
+                    effort=dec.effort,
+                    reason=dec.reason,
+                    is_switchback=dec.is_switchback,
+                )
+
+        # 3. Fall back through global priority list (BLUEPRINT 5c item 3)
         priority_list = self.get_priority_list()
         for item in priority_list:
             eng = item["engine"]
@@ -249,6 +292,7 @@ class Scheduler:
                 continue
             if self.is_engine_available(eng, mod):
                 reason = f"Priority list choice: {preferred_engine} unavailable or cooling down"
+                self.store.record_router_decision(chosen=eng, reason=reason)
                 return EngineChoice(
                     engine=eng,
                     model=mod,

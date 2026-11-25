@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from nightshift.quota.ledger import QuotaLedger
+from nightshift.quota.usage import record_cli_usage
 from nightshift.runners.base import RunnerResult, run_subprocess_with_timeout
 
 
@@ -71,6 +72,8 @@ class TemplateRunner:
             is_quota = self._quota_ledger.is_quota_or_transient_error(rc, out, err, custom_patterns=self._quota_patterns)
             if is_quota:
                 reset_at = self._quota_ledger.record_quota_error(self.name, model or "default", f"{out}\n{err}")
+            else:
+                record_cli_usage(self._quota_ledger, self.name, model or "default", out)
 
         return RunnerResult(
             rc=rc,

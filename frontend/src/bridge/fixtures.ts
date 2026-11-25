@@ -11,6 +11,10 @@ export const SCENARIO_NAMES: readonly ScenarioName[] = [
   "handoff",
   "ci-healing",
   "finished",
+  "council-drafting",
+  "council-critique",
+  "council-final-ready",
+  "council-substitution",
 ] as const;
 
 const DEFAULT_READY_LOGINS: Record<string, LoginCheckItem> = {
@@ -62,6 +66,12 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
         claude: { invocations: 0, tokens: 0, budgetPct: 0 },
       },
       handoff_count: 0,
+      gold_saved_tonight: {
+        jobs_done: 3,
+        cost_saved_usd: 0.9,
+        tokens_saved: 45000,
+        estimate_label: "$0.90 gold saved tonight (estimate)",
+      },
       guards: [
         { name: "Branch protection", status: "pass", detail: "Required checks active on main" },
         { name: "Diff guards", status: "pass", detail: "Zero test deletions or weakened checks" },
@@ -118,6 +128,12 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
         claude: { invocations: 0, tokens: 0, budgetPct: 0 },
       },
       handoff_count: 0,
+      gold_saved_tonight: {
+        jobs_done: 3,
+        cost_saved_usd: 0.9,
+        tokens_saved: 45000,
+        estimate_label: "$0.90 gold saved tonight (estimate)",
+      },
       guards: [
         { name: "Branch protection", status: "pass", detail: "Required checks active on main" },
         { name: "Diff guards", status: "pass", detail: "Zero test deletions or weakened checks" },
@@ -519,8 +535,82 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
         claude: { invocations: 1, tokens: 18000, budgetPct: 20 },
       },
       handoff_count: 1,
+      gold_saved_tonight: {
+        jobs_done: 5,
+        cost_saved_usd: 1.5,
+        tokens_saved: 75000,
+        estimate_label: "$1.50 gold saved tonight (estimate)",
+      },
       updated_at: new Date().toISOString(),
     },
+  },
+  "council-drafting": {
+    scenario: "council-drafting",
+    runState: "idle",
+    headline: "AI Planning Council is actively drafting your implementation plan.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: "Gemini CLI",
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Drafting", tone: "info" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+  },
+  "council-critique": {
+    scenario: "council-critique",
+    runState: "idle",
+    headline: "Codex CLI is critiquing the draft and refining dependency boundaries.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: "Codex CLI",
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Critique", tone: "warning" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+  },
+  "council-final-ready": {
+    scenario: "council-final-ready",
+    runState: "idle",
+    headline: "Planning Council complete. Review plan diff and trade-offs before approving.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: null,
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Ready", tone: "success" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+  },
+  "council-substitution": {
+    scenario: "council-substitution",
+    runState: "idle",
+    headline: "Gemini is cooling down; Codex substituted for Draft role automatically.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: null,
+    etaEstimate: null,
+    moduleBadges: {
+      "plan-studio": { label: "Substituted", tone: "warning" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
   },
 };
 
