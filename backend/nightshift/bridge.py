@@ -146,7 +146,7 @@ class BridgeAPI:
                 if not project or not plan or plan["project_id"] != project_id:
                     return {"ok": False, "error": "Select a project with a plan before starting."}
                 try:
-                    phases = [PhaseDefinition.from_dict(p) for p in self._store.list_phases(plan["id"])]
+                    phases = [PhaseDefinition.from_dict(p) for p in payload.get("phases", self._store.list_phases(plan["id"]))]
                     if not phases:
                         return {"ok": False, "error": "Add a phase to the plan before starting."}
                     validate_plan_dag(phases)
@@ -220,6 +220,9 @@ class BridgeAPI:
                     size=str(p.get("size", "medium")),
                     position=int(p.get("position", idx)),
                     status=str(p.get("status", "pending")),
+                    ladder=str(p.get("ladder", "default")), timeout_minutes=int(p.get("timeout_minutes", 180)),
+                    auto_merge=bool(p.get("auto_merge", True)), release_after_merge=bool(p.get("release_after_merge", False)),
+                    force_rerun=bool(p.get("force_rerun", False)),
                 )
             return {"ok": True, "data": {"saved": True, "planId": plan_id}}
 
@@ -264,7 +267,8 @@ class BridgeAPI:
                         prompt=ph.prompt,
                         depends_on_json=json.dumps(ph.depends_on),
                         size=ph.size,
-                        position=idx,
+                        position=idx, ladder=ph.ladder, timeout_minutes=ph.timeout_minutes,
+                        auto_merge=ph.auto_merge, release_after_merge=ph.release_after_merge, force_rerun=ph.force_rerun,
                     )
                 if imported.get("ladders"):
                     self._store.set_setting("engines.ladders", json.dumps(imported["ladders"]))
@@ -299,6 +303,7 @@ class BridgeAPI:
         if method == "plan.setImplementer":
             phase_ids = payload.get("phaseIds") or []
             engine = str(payload.get("engine") or "")
+            engine = {"Antigravity": "agy", "Gemini CLI": "gemini", "Codex CLI": "codex", "Claude Code": "claude"}.get(engine, engine)
             model = str(payload.get("model") or "")
             effort = str(payload.get("effort") or "medium")
             reset = bool(payload.get("reset", False))

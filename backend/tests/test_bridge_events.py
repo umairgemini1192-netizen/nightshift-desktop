@@ -211,22 +211,26 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     save_resp = bridge.call("plan.save", {
         "plan": {"id": "plan2", "project_id": "p1", "title": "Saved Plan"},
         "phases": [
-            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "depends_on": []},
+            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "depends_on": [], "ladder": "ui", "timeout_minutes": 42, "auto_merge": False, "release_after_merge": True, "force_rerun": True},
             {"id": "p2-2", "title": "P2-2", "branch": "feat/p2-2", "depends_on": ["p2-1"]},
         ],
     })
     assert save_resp["ok"]
     assert save_resp["data"]["planId"] == "plan2"
 
+    saved = store.get_phase("p2-1")
+    assert (saved["ladder"], saved["timeout_minutes"], saved["auto_merge"], saved["release_after_merge"], saved["force_rerun"]) == ("ui", 42, 0, 1, 1)
+
     # plan.setImplementer
     impl_resp = bridge.call("plan.setImplementer", {
         "phaseIds": ["p2-1"],
-        "engine": "gemini",
+        "engine": "Gemini CLI",
         "model": "gemini-2.5-pro",
         "effort": "high",
     })
     assert impl_resp["ok"]
     assert impl_resp["data"]["updated"] == 1
+    assert store.get_phase_assignment("p2-1")["override_engine"] == "gemini"
 
     # plan.exportQueue
     exp_resp = bridge.call("plan.exportQueue", {"planId": "plan2"})

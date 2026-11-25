@@ -488,14 +488,19 @@ class Store:
         depends_on_json: str = "[]",
         size: str = "medium",
         position: int = 0,
+        ladder: str = "default",
+        timeout_minutes: int = 180,
+        auto_merge: bool = True,
+        release_after_merge: bool = False,
+        force_rerun: bool = False,
     ) -> dict[str, Any]:
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO phases (
                     id, plan_id, title, prompt, depends_on_json, size, position,
-                    status, attempt, pr_number, branch
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, attempt, pr_number, branch, ladder, timeout_minutes, auto_merge, release_after_merge, force_rerun
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     prompt = excluded.prompt,
@@ -505,7 +510,10 @@ class Store:
                     status = excluded.status,
                     attempt = excluded.attempt,
                     pr_number = excluded.pr_number,
-                    branch = excluded.branch
+                    branch = excluded.branch,
+                    ladder = excluded.ladder, timeout_minutes = excluded.timeout_minutes,
+                    auto_merge = excluded.auto_merge, release_after_merge = excluded.release_after_merge,
+                    force_rerun = excluded.force_rerun
                 """,
                 (
                     phase_id,
@@ -518,7 +526,7 @@ class Store:
                     status,
                     attempt,
                     pr_number,
-                    branch,
+                    branch, ladder, timeout_minutes, int(auto_merge), int(release_after_merge), int(force_rerun),
                 ),
             )
         row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()

@@ -41,6 +41,7 @@ export default function PlanBuilderPage() {
   const bridge = useAppStore((s) => s.bridge);
   const pushToast = useAppStore((s) => s.pushToast);
 
+  const [plan, setPlan] = useState<{ id: string; title: string; project_id?: string; goal?: string } | null>(null);
   const [phases, setPhases] = useState<PlanPhase[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [selectedPhases, setSelectedPhases] = useState<Set<string>>(new Set());
@@ -63,12 +64,17 @@ export default function PlanBuilderPage() {
   const loadPlan = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await bridge.call<{ plan?: { id: string; title: string }; phases?: PlanPhase[] }>("plan.get");
-      const loaded = res?.phases ?? [];
+      const res = await bridge.call<{ plan?: { id: string; title: string; project_id?: string; goal?: string }; phases?: PlanPhase[] }>("plan.get");
+      setPlan(res?.plan ?? null);
+      const loaded = (res?.phases ?? []).map((phase) => ({
+        ...phase,
+        depends_on: phase.depends_on ?? JSON.parse((phase as PlanPhase & { depends_on_json?: string }).depends_on_json ?? "[]"),
+        auto_merge: Boolean(phase.auto_merge),
+        release_after_merge: Boolean(phase.release_after_merge),
+        force_rerun: Boolean(phase.force_rerun),
+      }));
       setPhases(loaded);
-      if (loaded.length > 0 && !selectedId) {
-        setSelectedId(loaded[0].id);
-      }
+      setSelectedId((current) => current ?? loaded[0]?.id ?? null);
     } catch (err) {
       pushToast({
         title: "Could not load plan",
@@ -78,7 +84,7 @@ export default function PlanBuilderPage() {
     } finally {
       setLoading(false);
     }
-  }, [bridge, pushToast, selectedId]);
+  }, [bridge, pushToast]);
 
   useEffect(() => {
     void loadPlan();
@@ -147,7 +153,10 @@ export default function PlanBuilderPage() {
         });
         return;
       }
-      await bridge.call("engine.start");
+      const runPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      await bridge.call("plan.save", { plan: runPlan, phases });
+      setPlan(runPlan);
+      await bridge.call("engine.start", { planId: runPlan.id, projectId: runPlan.project_id, phases });
       pushToast({
         title: "Overnight run started",
         description: "Continuous failover orchestrator is active.",
@@ -165,7 +174,7 @@ export default function PlanBuilderPage() {
   const handleSavePlan = async () => {
     try {
       await bridge.call("plan.save", {
-        plan: { id: "active_plan", title: "Continuous Delivery Plan" },
+        plan: plan ?? { id: "active_plan", title: "Continuous Delivery Plan" },
         phases,
       });
       pushToast({
@@ -184,20 +193,21 @@ export default function PlanBuilderPage() {
 
   const handleImportQueue = async () => {
     try {
-      const res = await bridge.call<{ ok: boolean; data?: { phases: PlanPhase[] } }>(
+      const res = await bridge.call<{ plan: { id: string; title: string; project_id?: string; goal?: string }; phases: PlanPhase[] }>(
         "plan.importQueue",
         { queue: importJson },
       );
-      if (res?.ok && res.data?.phases) {
-        setPhases(res.data.phases);
-        if (res.data.phases.length > 0) {
-          setSelectedId(res.data.phases[0].id);
+      if (res?.phases) {
+        setPlan(res.plan);
+        setPhases(res.phases.map((phase) => ({ ...phase, auto_merge: Boolean(phase.auto_merge), release_after_merge: Boolean(phase.release_after_merge), force_rerun: Boolean(phase.force_rerun) })));
+        if (res.phases.length > 0) {
+          setSelectedId(res.phases[0].id);
         }
         setShowImportModal(false);
         setImportJson("");
         pushToast({
           title: "Queue imported",
-          description: `Imported ${res.data.phases.length} phase(s) from legacy queue.json.`,
+          description: `Imported ${res.phases.length} phase(s) from legacy queue.json.`,
           tone: "success",
         });
       }
@@ -213,7 +223,7 @@ export default function PlanBuilderPage() {
   const handleExportQueue = async () => {
     try {
       const res = await bridge.call<Record<string, unknown>>("plan.exportQueue", {
-        planId: "active_plan",
+        planId: plan?.id ?? "active_plan",
       });
       setExportJson(JSON.stringify(res, null, 2));
       setShowExportModal(true);
