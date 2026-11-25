@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from nightshift.bridge import BridgeAPI
+from nightshift.bridge import BridgeAPI, attach_event_pump
 from nightshift.events import EventBus
 from nightshift.modules.registry import ModuleRegistry
 from nightshift.store import Store
@@ -44,13 +44,13 @@ def main() -> None:
     """Launch the pywebview desktop window (EdgeChromium / WebView2 on Windows)."""
     import webview  # type: ignore[import-not-found]
 
-    store, _events, _registry, bridge = create_app_components()
+    store, events, _registry, bridge = create_app_components()
     dist_index = Path(__file__).resolve().parents[2] / "frontend" / "dist" / "index.html"
     url = dist_index.as_uri() if dist_index.exists() else "http://localhost:5173"
 
     logger.info("Starting Night-Shift Desktop window pointing at %s", url)
     try:
-        webview.create_window(
+        window = webview.create_window(
             title="Night-Shift",
             url=url,
             js_api=bridge,
@@ -59,9 +59,13 @@ def main() -> None:
             width=1440,
             height=900,
             min_size=(1024, 700),
+            background_color="#080d1a",
         )
+        unsubscribe = attach_event_pump(events, window.evaluate_js)
         webview.start(debug=False)
     finally:
+        if "unsubscribe" in locals():
+            unsubscribe()
         store.close()
 
 

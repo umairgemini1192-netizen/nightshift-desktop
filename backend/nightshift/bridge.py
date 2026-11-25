@@ -2,12 +2,30 @@
 
 from __future__ import annotations
 
-from typing import Any
+import json
+import logging
+from dataclasses import asdict
+from typing import Any, Callable
 
 from nightshift import __version__
-from nightshift.events import EventBus
+from nightshift.events import Event, EventBus
 from nightshift.modules.registry import ModuleRegistry
 from nightshift.store import Store
+
+logger = logging.getLogger(__name__)
+
+
+def attach_event_pump(events: EventBus, evaluate_js: Callable[[str], Any]) -> Callable[[], None]:
+    """Forward persisted events to the frontend as data, never as executable code."""
+    def forward(event: Event) -> None:
+        payload = json.dumps(asdict(event), ensure_ascii=True).replace("<", "\\u003c")
+        try:
+            evaluate_js(f"window.dispatchEvent(new CustomEvent('nightshift:event', {{detail: {payload}}}));")
+        except Exception:
+            # A window that is loading or closing must not interrupt engine work.
+            logger.exception("Could not deliver an event to the window")
+
+    return events.subscribe("*", forward)
 
 
 class BridgeAPI:
