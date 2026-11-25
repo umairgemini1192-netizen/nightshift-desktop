@@ -71,7 +71,11 @@ class PhaseDefinition:
 def validate_plan_dag(phases: list[PhaseDefinition]) -> list[PhaseDefinition]:
     """Validate that phases form an acyclic directed graph and return topological order."""
     phase_by_id = {p.id: p for p in phases}
+    if len(phase_by_id) != len(phases):
+        raise ValueError("Each phase needs a unique ID.")
     for p in phases:
+        if not p.branch.strip():
+            raise ValueError(f"Phase '{p.id}' needs a branch.")
         for dep in p.depends_on:
             if dep not in phase_by_id:
                 raise ValueError(f"Phase '{p.id}' depends on non-existent phase '{dep}'")

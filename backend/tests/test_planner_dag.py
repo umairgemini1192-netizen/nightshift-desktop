@@ -44,6 +44,17 @@ def test_plan_dag_missing_dependency() -> None:
         validate_plan_dag([p1])
 
 
+def test_plan_rejects_missing_branch_and_duplicate_ids() -> None:
+    with pytest.raises(ValueError, match="needs a branch"):
+        validate_plan_dag([PhaseDefinition(id="p1", title="P1", branch="  ")])
+
+    with pytest.raises(ValueError, match="unique ID"):
+        validate_plan_dag([
+            PhaseDefinition(id="p1", title="First", branch="feat/first"),
+            PhaseDefinition(id="p1", title="Second", branch="feat/second"),
+        ])
+
+
 def test_runnable_phases_and_stacked_branches() -> None:
     p1 = PhaseDefinition(id="p1", title="P1", branch="feat/p1")
     p2 = PhaseDefinition(id="p2", title="P2", branch="feat/p2", depends_on=["p1"])
