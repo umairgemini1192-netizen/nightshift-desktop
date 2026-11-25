@@ -198,7 +198,11 @@ async def test_crash_recovery_resumes_cleanly(tmp_path: Path) -> None:
         store.upsert_phase("p1", "plan_r", "Phase 1", "feat/p1", status="merged")
         store.upsert_phase("p2", "plan_r", "Phase 2", "feat/p2", status="watching_ci", pr_number=402)
 
-        vcs.merged_prs["feat/p1"] = {"number": 401, "url": "https://github.com/..."}
+        vcs.merged_prs["feat/p1"] = {
+            "number": 401,
+            "url": "https://github.com/...",
+            "mergeCommit": {"oid": "p1_merge_sha"},
+        }
         vcs.add_pr("feat/p2", number=402)
 
         mock_login_runner = lambda cmd, to: (0, "Logged in to github.com\nOK", "", False)
@@ -220,13 +224,19 @@ async def test_crash_recovery_resumes_cleanly(tmp_path: Path) -> None:
             PhaseDefinition(id="p2", title="Phase 2", branch="feat/p2", depends_on=["p1"]),
         ]
 
-        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt_root"):
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt_root"), patch.object(
+            vcs, "watch_workflow_run", wraps=vcs.watch_workflow_run
+        ) as watch_build:
             results = await engine.execute_plan(project, phases, plan_id="plan_r")
 
         assert len(results) == 2
-        assert results[0]["status"] == "SKIPPED"
+        assert results[0]["status"] == "COMPLETED"
+        assert "main build passed" in results[0]["detail"]
         assert results[1]["status"] == "COMPLETED"
         assert "Merged PR #402" in results[1]["detail"]
+        assert [call.kwargs["commit_sha"] for call in watch_build.call_args_list] == [
+            "p1_merge_sha", "sha_merge_123"
+        ]
 
         # Runner was NOT called for implementation because it resumed at CI watch!
         assert len(runner.calls) == 0
