@@ -219,11 +219,25 @@ after every fix path is exhausted, and even then keeps working on everything tha
   `critical_paths` (glob list) plus built-in critical signals: auth/login, encryption/keys,
   permissions (e.g. AndroidManifest permissions), payments, data deletion/migrations, file-system
   writes outside app data, network/security config, build and CI config, dependency additions.
-- **Low risk** (no critical signal): merge as soon as all required CI checks are green on the head SHA
-  and the diff guards pass. No AI review, no waiting.
-- **Critical**: one independent AI review (single call, medium effort, different engine) limited to the
-  critical files; APPROVE -> merge; CHANGES -> self-heal loop above.
-- The digest and the deck list every critical change and its review result in one line each.
+- **Every phase: one review of the final head, P1 blocks the merge** (owner rule, 2026-11-25).
+  After CI is green and the implementer has finished, exactly one review of the exact head SHA:
+  1. **Codex first, once.** If Codex already reviewed this head, use it. Otherwise post `@codex review`
+     once and wait up to 15 min. Codex automatic review on every push stays **off** (it burns the free
+     quota: three full reviews in one hour on DriveLift PR #99).
+  2. **Free fallback.** Codex silent for 15 min or reporting a usage/quota limit -> the Economy engines
+     (5h, in order) review the diff in the same P1/P2 format; the result is posted on the PR as
+     `[FREE-REVIEW]`. The diff is packed by priority (app code, then resources, then tests; unchanged
+     context trimmed; every file gets a share) so large PRs are still covered.
+  3. **P1 gate.** P1 = user-visible bug, crash, data loss, security/privacy issue, broken accessibility
+     (touch target under 48 dp, unlabeled control) or behaviour against the phase goal. Any open P1 ->
+     one fix round (Economy first, 5h ladder) -> CI -> one re-review. Still P1 -> **parked** with the
+     finding as the reason on the deck's "Needs your attention" and the phone Doc (5i). P2 never blocks;
+     it is listed on the PR and in the digest.
+  4. **No reviewer at all** (Codex and every free engine failed) -> merge on green CI but mark the phase
+     **UNREVIEWED** on the deck, the phone Doc and the morning digest.
+- **Critical** changes (signals above) additionally require the review to come from a Standard-tier or
+  better engine when one has quota; a free-only review of a critical change is flagged on the deck.
+- The digest and the deck list every merged phase with its reviewer and P1/P2 counts in one line each.
 
 **Hard guards (always on, never skipped)**
 - Nothing pushes to `main` directly; no force-push; no history rewrite. GitHub branch protection on
