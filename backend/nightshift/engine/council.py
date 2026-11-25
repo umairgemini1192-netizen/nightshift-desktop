@@ -201,6 +201,8 @@ class PlanningCouncil:
             size=SIZE_LARGE,
             exclude_engines=excluded.union({preferred_id}),
         )
+        if decision.exhausted:
+            raise RuntimeError("No AI engines are available for the planning council. Try again when an engine is available.")
         reason = f"{preferred_id} unavailable; substituted with {decision.chosen_id}"
         return decision.chosen_id, decision.runner, decision.model, True, reason
 

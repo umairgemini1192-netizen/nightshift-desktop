@@ -251,3 +251,23 @@ def test_repo_snapshot_generation(tmp_path: Path) -> None:
     assert "Autonomous nightly coding." in snapshot
     assert "src/" in snapshot
     assert "main.py" in snapshot
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["draft", "critique", "final"])
+async def test_council_stops_when_router_is_exhausted(
+    role: str, council_store: Store, council_router: Router, tmp_path: Path
+) -> None:
+    """An exhausted router must never launch its nominal fallback runner."""
+    def fail_factory(runner_name: str, engine_id: str) -> FakeRunner:
+        pytest.fail("No runner should be created when all engines are unavailable")
+
+    council = PlanningCouncil(council_store, council_router, runner_factory=fail_factory)
+    with patch.object(council_router, "is_engine_installed", return_value=False):
+        with pytest.raises(RuntimeError, match="No AI engines are available"):
+            if role == "draft":
+                await council.run_draft("Build goal", tmp_path)
+            elif role == "critique":
+                await council.run_critique("Build goal", {}, tmp_path)
+            else:
+                await council.run_final("Build goal", [], [], [], tmp_path)
