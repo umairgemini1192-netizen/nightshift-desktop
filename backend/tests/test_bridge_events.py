@@ -62,3 +62,94 @@ def test_login_fix_uses_allowlisted_argument_list(tmp_path, monkeypatch) -> None
     assert not bridge.call("logins.openFix", {"tool": "gh; dangerous"})["ok"]
     assert len(calls) == 1
     store.close()
+
+
+def test_bridge_engine_status_and_stop_controls(tmp_path) -> None:
+    store = Store(tmp_path / "test_engine.db")
+    store.migrate()
+    events = EventBus(store=store)
+
+    class DummyEngine:
+        def __init__(self) -> None:
+            self.is_running = True
+            self.stop_requested = False
+
+        def request_stop(self) -> None:
+            self.stop_requested = True
+
+        def cancel_stop(self) -> None:
+            self.stop_requested = False
+
+    engine = DummyEngine()
+    bridge = BridgeAPI(store, events, ModuleRegistry(), engine=engine)
+
+    status = bridge.call("engine.status")
+    assert status["ok"]
+    assert status["data"]["running"] is True
+    assert status["data"]["runState"] == "running"
+    assert status["data"]["stopArmed"] is False
+
+    # Stop after phase
+    stop_resp = bridge.call("engine.stopAfterPhase")
+    assert stop_resp["ok"]
+    assert stop_resp["data"]["armed"] is True
+    assert engine.stop_requested is True
+
+    # Undo stop
+    undo_resp = bridge.call("engine.undoStop")
+    assert undo_resp["ok"]
+    assert undo_resp["data"]["armed"] is False
+    assert engine.stop_requested is False
+
+    # Cannot start while running
+    start_resp = bridge.call("engine.start")
+    assert not start_resp["ok"]
+
+    engine.is_running = False
+    start_resp2 = bridge.call("engine.start")
+    assert start_resp2["ok"]
+    assert start_resp2["data"]["started"] is True
+
+    store.close()
+
+
+def test_bridge_plan_and_runs_and_engines_list(tmp_path) -> None:
+    store = Store(tmp_path / "test_data.db")
+    store.migrate()
+    events = EventBus(store=store)
+    bridge = BridgeAPI(store, events, ModuleRegistry())
+
+    store.create_project("p1", "Test Project", "owner/repo", "/path")
+    store.create_plan("plan1", "p1", "Overnight Plan")
+    store.upsert_phase("ph1", "plan1", "Phase 1", "feat/ph1")
+
+    # plan.get
+    plan_resp = bridge.call("plan.get", {"planId": "plan1"})
+    assert plan_resp["ok"]
+    assert plan_resp["data"]["plan"]["title"] == "Overnight Plan"
+    assert len(plan_resp["data"]["phases"]) == 1
+
+    # runs.list
+    runs_resp = bridge.call("runs.list")
+    assert runs_resp["ok"]
+    assert len(runs_resp["data"]) == 1
+    assert runs_resp["data"][0]["phasesCount"] == 1
+
+    # engines.list
+    eng_resp = bridge.call("engines.list")
+    assert eng_resp["ok"]
+    assert len(eng_resp["data"]) >= 4
+
+    # app.snapshot
+    snap_resp = bridge.call("app.snapshot")
+    assert snap_resp["ok"]
+    assert snap_resp["data"]["activeProjectId"] == "p1"
+    assert len(snap_resp["data"]["projects"]) == 1
+
+    # settings get / set
+    assert bridge.call("settings.get", {"key": "theme"})["data"] is None
+    set_resp = bridge.call("settings.set", {"key": "theme", "value": "dark"})
+    assert set_resp["ok"]
+    assert bridge.call("settings.get", {"key": "theme"})["data"] == "dark"
+
+    store.close()

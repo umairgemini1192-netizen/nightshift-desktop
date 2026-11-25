@@ -5,7 +5,8 @@ import type { Bridge } from "./types";
 
 export * from "./types";
 export * from "./fixtures";
-export { MockBridge } from "./mockBridge";
+export * from "./eventMapper";
+export { MockBridge, REALISTIC_STREAMS, type StreamEvent } from "./mockBridge";
 export { PyWebviewBridge } from "./pywebviewBridge";
 
 export function createBridge(search: string = window.location.search): Bridge {

@@ -1,12 +1,32 @@
-import type { AppSnapshot, ScenarioName } from "./types";
+import type { AppSnapshot, LoginCheckItem, ScenarioName } from "./types";
 
-export const SCENARIO_NAMES: readonly ScenarioName[] = ["idle", "running", "failure", "empty"] as const;
+export const SCENARIO_NAMES: readonly ScenarioName[] = [
+  "idle",
+  "running",
+  "failure",
+  "empty",
+  "gemini-logged-out",
+  "claude-limit",
+  "gh-logged-out",
+  "handoff",
+  "ci-healing",
+  "finished",
+] as const;
+
+const DEFAULT_READY_LOGINS: Record<string, LoginCheckItem> = {
+  git: { tool: "git", state: "Ready", detail: "git ls-remote verified" },
+  gh: { tool: "gh", state: "Ready", detail: "gh auth status verified" },
+  agy: { tool: "agy", state: "Ready", detail: "Antigravity CLI ready" },
+  gemini: { tool: "gemini", state: "Ready", detail: "Gemini CLI ready" },
+  codex: { tool: "codex", state: "Ready", detail: "Codex CLI ready" },
+  claude: { tool: "claude", state: "Ready", detail: "Claude Code ready" },
+};
 
 export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
   idle: {
     scenario: "idle",
     runState: "idle",
-    headline: "Ready for tonight. Select a plan to start an unattended run.",
+    headline: "Night-Shift Desktop is ready for tonight. Select a plan to start.",
     activeProjectId: "nightshift-desktop",
     projects: [
       { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
@@ -16,14 +36,45 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
     activeEngineLabel: null,
     etaEstimate: null,
     moduleBadges: {
-      "plan-builder": { label: "6 phases", tone: "neutral" },
+      "mission-control": { label: "Idle", tone: "neutral" },
+      "plan-builder": { label: "5 phases", tone: "neutral" },
       "engines-quota": { label: "4 ready", tone: "success" },
     },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "idle",
+      headline: "Night-Shift Desktop is ready for tonight. Select a plan to start.",
+      needs_you: [],
+      done_tonight: [],
+      now: { phase: null, step: null, engine: null, why: null, eta: null },
+      next: [
+        { phase_id: "p1", title: "Phase 1: Environment & auth verification", status: "pending" },
+        { phase_id: "p2", title: "Phase 2: Database schema migrations", status: "pending" },
+        { phase_id: "p3", title: "Phase 3: Core shell and design tokens", status: "pending" },
+      ],
+      usage_tonight: {
+        agy: { invocations: 0, tokens: 0, budgetPct: 0 },
+        gemini: { invocations: 0, tokens: 0, budgetPct: 0 },
+        codex: { invocations: 0, tokens: 0, budgetPct: 0 },
+        claude: { invocations: 0, tokens: 0, budgetPct: 0 },
+      },
+      handoff_count: 0,
+      guards: [
+        { name: "Branch protection", status: "pass", detail: "Required checks active on main" },
+        { name: "Diff guards", status: "pass", detail: "Zero test deletions or weakened checks" },
+        { name: "Secrets check", status: "pass", detail: "High-entropy secrets scan ready" },
+      ],
+      updated_at: new Date().toISOString(),
+    },
   },
+
   running: {
     scenario: "running",
     runState: "running",
-    headline: "All good - 2 of 6 phases merged, 1 running, finishing ~04:15 (estimate).",
+    headline: "All good - 2 of 5 phases merged, 1 running, finishing ~04:15 (estimate from past runs).",
     activeProjectId: "nightshift-desktop",
     projects: [
       { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
@@ -31,31 +82,113 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
     ],
     activePhaseTitle: "Phase 3: Core shell and design tokens",
     activeEngineLabel: "Antigravity (medium effort)",
-    etaEstimate: "~1 h 25 m left (estimate)",
+    etaEstimate: "~1 h 25 m left (estimate from past runs)",
     moduleBadges: {
       "mission-control": { label: "Running", tone: "info" },
-      "plan-builder": { label: "3 / 6", tone: "info" },
-      "engines-quota": { label: "1 cooling", tone: "warning" },
+      "plan-builder": { label: "2 / 5", tone: "info" },
+      "engines-quota": { label: "4 ready", tone: "success" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "working",
+      headline: "All good - 2 of 5 phases merged, 1 running, finishing ~04:15 (estimate from past runs).",
+      needs_you: [],
+      done_tonight: [
+        { phase_id: "p1", title: "Phase 1: Environment & auth verification", status: "merged", runners: ["agy"], pr_number: 10 },
+        { phase_id: "p2", title: "Phase 2: Database schema migrations", status: "merged", runners: ["gemini"], pr_number: 11 },
+      ],
+      now: {
+        phase: "Phase 3: Core shell and design tokens",
+        step: "Antigravity is writing implementation code",
+        engine: "Antigravity (medium effort)",
+        why: "Assigned by plan as primary implementer for UI components",
+        eta: "~1 h 25 m left (estimate from past runs)",
+      },
+      next: [
+        { phase_id: "p4", title: "Phase 4: Mission control live status deck", status: "pending" },
+        { phase_id: "p5", title: "Phase 5: Release packaging and verification", status: "pending" },
+      ],
+      usage_tonight: {
+        agy: { invocations: 4, tokens: 32000, budgetPct: 35 },
+        gemini: { invocations: 3, tokens: 28000, budgetPct: 20 },
+        codex: { invocations: 1, tokens: 12000, budgetPct: 15 },
+        claude: { invocations: 0, tokens: 0, budgetPct: 0 },
+      },
+      handoff_count: 0,
+      guards: [
+        { name: "Branch protection", status: "pass", detail: "Required checks active on main" },
+        { name: "Diff guards", status: "pass", detail: "Zero test deletions or weakened checks" },
+        { name: "Tests verified", status: "pass", detail: "Automated deliverable check verified" },
+      ],
+      updated_at: new Date().toISOString(),
     },
   },
+
   failure: {
     scenario: "failure",
     runState: "failed",
-    headline: "Needs you - 1 phase parked after checks failed twice. Independent phases continue.",
+    headline: "Needs you - 1 phase parked: login change failed review twice. Stacked phases continue.",
     activeProjectId: "nightshift-desktop",
     projects: [
       { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
       { id: "drivelift-android", name: "DriveLift Android", repo: "owner/drivelift-android" },
     ],
-    activePhaseTitle: "Phase 2: Login health checks",
-    activeEngineLabel: "Codex (continuing from Gemini checkpoint)",
+    activePhaseTitle: "Phase 3: Stacked UI fixes",
+    activeEngineLabel: "Codex (continuing on stacked branch)",
     etaEstimate: "Paused on parked phase",
     moduleBadges: {
       "mission-control": { label: "1 parked", tone: "danger" },
       "runs-history": { label: "Attention", tone: "warning" },
-      "engines-quota": { label: "1 logged out", tone: "danger" },
+      "engines-quota": { label: "4 ready", tone: "success" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "attention",
+      headline: "Needs you - 1 phase parked: login change failed review twice. Stacked phases continue.",
+      needs_you: [
+        {
+          phase_id: "p2",
+          headline: "Phase 2 is parked",
+          detail: "Login change failed review twice on P1 security gate.",
+          action: "Inspect logs and resume",
+        },
+      ],
+      done_tonight: [
+        { phase_id: "p1", title: "Phase 1: Environment & auth verification", status: "merged", runners: ["agy"], pr_number: 10 },
+        { phase_id: "p2", title: "Phase 2: Login health checks", status: "parked", runners: ["gemini", "codex"], pr_number: 12 },
+      ],
+      now: {
+        phase: "Phase 3: Stacked UI fixes",
+        step: "Codex implementing on stacked branch",
+        engine: "Codex (medium effort)",
+        why: "Independent stacked child continuing from Phase 2 branch",
+        eta: "Paused on parked phase",
+      },
+      next: [
+        { phase_id: "p4", title: "Phase 4: Mission control live status deck", status: "pending" },
+      ],
+      usage_tonight: {
+        agy: { invocations: 3, tokens: 24000, budgetPct: 25 },
+        gemini: { invocations: 4, tokens: 41000, budgetPct: 40 },
+        codex: { invocations: 3, tokens: 35000, budgetPct: 30 },
+        claude: { invocations: 0, tokens: 0, budgetPct: 0 },
+      },
+      handoff_count: 1,
+      guards: [
+        { name: "Diff guards", status: "warn", detail: "Phase 2 open P1 review finding pending" },
+        { name: "Branch protection", status: "pass", detail: "main branch protection verified" },
+      ],
+      problems: "Phase 2 parked after two P1 review findings. Stacked child branches remain resumable.",
+      updated_at: new Date().toISOString(),
     },
   },
+
   empty: {
     scenario: "empty",
     runState: "idle",
@@ -65,14 +198,336 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
     activePhaseTitle: null,
     activeEngineLabel: null,
     etaEstimate: null,
-    moduleBadges: {},
+    moduleBadges: {
+      "mission-control": { label: "Empty", tone: "neutral" },
+    },
+    stopArmed: false,
+    logins: {},
+    deck: undefined,
+  },
+
+  "gemini-logged-out": {
+    scenario: "gemini-logged-out",
+    runState: "idle",
+    headline: "Readiness note: Gemini is logged out. The night will continue with Antigravity, GPT, and Claude.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: null,
+    etaEstimate: null,
+    moduleBadges: {
+      "mission-control": { label: "1 logged out", tone: "warning" },
+      "engines-quota": { label: "1 logged out", tone: "warning" },
+    },
+    stopArmed: false,
+    logins: {
+      ...structuredClone(DEFAULT_READY_LOGINS),
+      gemini: {
+        tool: "gemini",
+        state: "Logged out",
+        detail: "Run 'gemini' in terminal to log in",
+      },
+    },
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "attention",
+      headline: "Readiness note: Gemini is logged out. The night will continue with Antigravity, GPT, and Claude.",
+      needs_you: [
+        {
+          headline: "Gemini CLI logged out",
+          detail: "Gemini is not logged in. Priority list will bypass Gemini tonight.",
+          action: "Fix now",
+        },
+      ],
+      done_tonight: [],
+      now: { phase: null, step: null, engine: null, why: null, eta: null },
+      next: [
+        { phase_id: "p1", title: "Phase 1: Environment & auth verification", status: "pending" },
+      ],
+      usage_tonight: {
+        agy: { invocations: 0, tokens: 0, budgetPct: 0 },
+        gemini: { invocations: 0, tokens: 0, budgetPct: 0 },
+        codex: { invocations: 0, tokens: 0, budgetPct: 0 },
+        claude: { invocations: 0, tokens: 0, budgetPct: 0 },
+      },
+      handoff_count: 0,
+      updated_at: new Date().toISOString(),
+    },
+  },
+
+  "claude-limit": {
+    scenario: "claude-limit",
+    runState: "running",
+    headline: "All good - Claude reached quota limit, cooling down until 03:10. Fallback engines active.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: "Phase 2: Database schema migrations",
+    activeEngineLabel: "Antigravity (medium effort)",
+    etaEstimate: "~50 m left (estimate from past runs)",
+    moduleBadges: {
+      "mission-control": { label: "Running", tone: "info" },
+      "engines-quota": { label: "1 cooling", tone: "warning" },
+    },
+    stopArmed: false,
+    logins: {
+      ...structuredClone(DEFAULT_READY_LOGINS),
+      claude: {
+        tool: "claude",
+        state: "Limit reached",
+        detail: "Weekly limit threshold reached",
+        backAt: "03:10",
+      },
+    },
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "working",
+      headline: "All good - Claude reached quota limit, cooling down until 03:10. Fallback engines active.",
+      needs_you: [],
+      done_tonight: [
+        { phase_id: "p1", title: "Phase 1: Environment setup", status: "merged", runners: ["agy"], pr_number: 10 },
+      ],
+      now: {
+        phase: "Phase 2: Database schema migrations",
+        step: "Antigravity implementing migration scripts",
+        engine: "Antigravity (medium effort)",
+        why: "Claude cooling down until 03:10; Antigravity took over from priority list",
+        eta: "~50 m left (estimate from past runs)",
+      },
+      next: [
+        { phase_id: "p3", title: "Phase 3: Core shell and design tokens", status: "pending" },
+      ],
+      usage_tonight: {
+        agy: { invocations: 3, tokens: 22000, budgetPct: 25 },
+        gemini: { invocations: 0, tokens: 0, budgetPct: 0 },
+        codex: { invocations: 0, tokens: 0, budgetPct: 0 },
+        claude: { invocations: 2, tokens: 48000, budgetPct: 95 },
+      },
+      handoff_count: 1,
+      problems: "Claude cooling down until 03:10. Fast switch-back armed.",
+      updated_at: new Date().toISOString(),
+    },
+  },
+
+  "gh-logged-out": {
+    scenario: "gh-logged-out",
+    runState: "failed",
+    headline: "Needs you - GitHub CLI is logged out. Pausing run until auth returns.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: "Phase 1: Environment & auth verification",
+    activeEngineLabel: "Paused for GitHub auth",
+    etaEstimate: "Paused on GitHub CLI auth",
+    moduleBadges: {
+      "mission-control": { label: "gh logged out", tone: "danger" },
+      "engines-quota": { label: "gh logged out", tone: "danger" },
+    },
+    stopArmed: false,
+    logins: {
+      ...structuredClone(DEFAULT_READY_LOGINS),
+      gh: {
+        tool: "gh",
+        state: "Logged out",
+        detail: "Run 'gh auth login' to authenticate GitHub CLI",
+      },
+    },
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "attention",
+      headline: "Needs you - GitHub CLI is logged out. Pausing run until auth returns.",
+      needs_you: [
+        {
+          headline: "GitHub CLI logged out",
+          detail: "Cannot push branches or watch CI while GitHub CLI is logged out.",
+          action: "Fix now",
+        },
+      ],
+      done_tonight: [],
+      now: {
+        phase: "Phase 1: Environment & auth verification",
+        step: "Paused waiting for GitHub CLI authentication",
+        engine: "Paused",
+        why: "GitHub auth token expired during pre-flight check",
+        eta: "Paused",
+      },
+      next: [],
+      usage_tonight: {
+        agy: { invocations: 0, tokens: 0, budgetPct: 0 },
+        gemini: { invocations: 0, tokens: 0, budgetPct: 0 },
+        codex: { invocations: 0, tokens: 0, budgetPct: 0 },
+        claude: { invocations: 0, tokens: 0, budgetPct: 0 },
+      },
+      handoff_count: 0,
+      problems: "GitHub CLI authentication required before any PR can be created.",
+      updated_at: new Date().toISOString(),
+    },
+  },
+
+  handoff: {
+    scenario: "handoff",
+    runState: "running",
+    headline: "Working on Phase 2 - Claude exhausted mid-phase. Antigravity continuing from Claude checkpoint.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: "Phase 2: Database schema migrations",
+    activeEngineLabel: "Antigravity (continuing from Claude checkpoint)",
+    etaEstimate: "~45 m left (estimate from past runs)",
+    moduleBadges: {
+      "mission-control": { label: "Handoff", tone: "info" },
+      "plan-builder": { label: "1 / 4", tone: "info" },
+      "engines-quota": { label: "1 cooling", tone: "warning" },
+    },
+    stopArmed: false,
+    logins: {
+      ...structuredClone(DEFAULT_READY_LOGINS),
+      claude: {
+        tool: "claude",
+        state: "Limit reached",
+        detail: "Cooling down until 04:00",
+        backAt: "04:00",
+      },
+    },
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "working",
+      headline: "Working on Phase 2 - Claude exhausted mid-phase. Antigravity continuing from Claude checkpoint.",
+      needs_you: [],
+      done_tonight: [
+        { phase_id: "p1", title: "Phase 1: Environment & auth verification", status: "merged", runners: ["agy"], pr_number: 10 },
+      ],
+      now: {
+        phase: "Phase 2: Database schema migrations",
+        step: "Antigravity continuing from Claude checkpoint",
+        engine: "Antigravity (medium effort)",
+        why: "Claude Code hit limit at 01:42; checkpoint created and pushed. Fast switch-back armed.",
+        eta: "~45 m left (estimate from past runs)",
+      },
+      next: [
+        { phase_id: "p3", title: "Phase 3: Core shell and design tokens", status: "pending" },
+      ],
+      usage_tonight: {
+        agy: { invocations: 2, tokens: 16000, budgetPct: 18 },
+        gemini: { invocations: 0, tokens: 0, budgetPct: 0 },
+        codex: { invocations: 0, tokens: 0, budgetPct: 0 },
+        claude: { invocations: 3, tokens: 55000, budgetPct: 90 },
+      },
+      handoff_count: 1,
+      problems: "Claude Code exhausted mid-phase. Antigravity continuing from checkpoint; switch-back ready at 04:00.",
+      updated_at: new Date().toISOString(),
+    },
+  },
+
+  "ci-healing": {
+    scenario: "ci-healing",
+    runState: "running",
+    headline: "Self-healing CI failure - Round 1 of 4. Fresh eyes rotated to Codex.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: "Phase 3: Core shell and design tokens",
+    activeEngineLabel: "Codex (fixing failing tests)",
+    etaEstimate: "~20 m left (estimate from past runs)",
+    moduleBadges: {
+      "mission-control": { label: "CI Fixing", tone: "info" },
+      "plan-builder": { label: "2 / 5", tone: "info" },
+      "engines-quota": { label: "4 ready", tone: "success" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "working",
+      headline: "Self-healing CI failure - Round 1 of 4. Fresh eyes rotated to Codex.",
+      needs_you: [],
+      done_tonight: [
+        { phase_id: "p1", title: "Phase 1: Setup", status: "merged", runners: ["agy"], pr_number: 10 },
+        { phase_id: "p2", title: "Phase 2: Database", status: "merged", runners: ["gemini"], pr_number: 11 },
+      ],
+      now: {
+        phase: "Phase 3: Core shell and design tokens",
+        step: "Codex fixing failing tests from CI log",
+        engine: "Codex (medium effort)",
+        why: "CI failed on unit tests; fresh eyes rotation chose Codex for fix round 1 of 4",
+        eta: "~20 m left (estimate from past runs)",
+      },
+      next: [
+        { phase_id: "p4", title: "Phase 4: Mission control live status deck", status: "pending" },
+      ],
+      usage_tonight: {
+        agy: { invocations: 4, tokens: 32000, budgetPct: 35 },
+        gemini: { invocations: 2, tokens: 19000, budgetPct: 15 },
+        codex: { invocations: 2, tokens: 21000, budgetPct: 20 },
+        claude: { invocations: 0, tokens: 0, budgetPct: 0 },
+      },
+      handoff_count: 0,
+      problems: "Self-healing CI failure: 1 failing test in test_bridge_events.py. Fix commit underway.",
+      updated_at: new Date().toISOString(),
+    },
+  },
+
+  finished: {
+    scenario: "finished",
+    runState: "done",
+    headline: "All 5 phases merged cleanly tonight. Release preview.44 ready.",
+    activeProjectId: "nightshift-desktop",
+    projects: [
+      { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
+    ],
+    activePhaseTitle: null,
+    activeEngineLabel: null,
+    etaEstimate: "Run finished",
+    moduleBadges: {
+      "mission-control": { label: "Done", tone: "success" },
+      "plan-builder": { label: "5 / 5", tone: "success" },
+      "runs-history": { label: "Complete", tone: "success" },
+      "engines-quota": { label: "4 ready", tone: "success" },
+    },
+    stopArmed: false,
+    logins: structuredClone(DEFAULT_READY_LOGINS),
+    deck: {
+      project_id: "nightshift-desktop",
+      project_name: "Night-Shift Desktop",
+      state: "good",
+      headline: "All 5 phases merged cleanly tonight. Release preview.44 ready.",
+      needs_you: [],
+      done_tonight: [
+        { phase_id: "p1", title: "Phase 1: Environment & auth verification", status: "merged", runners: ["agy"], pr_number: 10 },
+        { phase_id: "p2", title: "Phase 2: Database schema migrations", status: "merged", runners: ["gemini"], pr_number: 11 },
+        { phase_id: "p3", title: "Phase 3: Core shell and design tokens", status: "merged", runners: ["agy"], pr_number: 12 },
+        { phase_id: "p4", title: "Phase 4: Mission control live status deck", status: "merged", runners: ["codex"], pr_number: 13 },
+        { phase_id: "p5", title: "Phase 5: Release packaging and verification", status: "merged", runners: ["claude"], pr_number: 14 },
+      ],
+      now: { phase: null, step: null, engine: null, why: null, eta: null },
+      next: [],
+      usage_tonight: {
+        agy: { invocations: 6, tokens: 48000, budgetPct: 45 },
+        gemini: { invocations: 4, tokens: 34000, budgetPct: 30 },
+        codex: { invocations: 3, tokens: 29000, budgetPct: 25 },
+        claude: { invocations: 1, tokens: 18000, budgetPct: 20 },
+      },
+      handoff_count: 1,
+      updated_at: new Date().toISOString(),
+    },
   },
 };
 
 export function parseScenarioParam(search: string): ScenarioName {
   const params = new URLSearchParams(search);
-  const value = params.get("scenario");
-  if (value === "idle" || value === "running" || value === "failure" || value === "empty") {
+  const value = params.get("scenario") as ScenarioName | null;
+  if (value && value in SCENARIO_FIXTURES) {
     return value;
   }
   return "idle";

@@ -171,6 +171,15 @@ class EngineStateMachine:
         self._stop_requested = True
         logger.info("Stop requested at phase boundary.")
 
+    def cancel_stop(self) -> None:
+        """Cancel an armed stop-after-current-phase request (BLUEPRINT 5e)."""
+        self._stop_requested = False
+        logger.info("Stop request cancelled.")
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
     @property
     def is_running(self) -> bool:
         return self._is_running
