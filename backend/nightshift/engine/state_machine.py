@@ -259,8 +259,14 @@ class EngineStateMachine:
                     critical_paths_json=json.dumps(project.critical_paths),
                 )
 
+            self.scheduler.max_implement_attempts = int(self.store.get_setting("guard.maxAttempts", str(self.scheduler.max_implement_attempts)))
+            self.scheduler.max_ci_fix_rounds = int(self.store.get_setting("guard.maxCiRetries", str(self.scheduler.max_ci_fix_rounds)))
+            self.scheduler.max_run_invocations = int(self.store.get_setting("guard.maxRunInvocations", str(self.scheduler.max_run_invocations)))
+            self.scheduler.total_invocations_count = 0
+
             # Persist plan in store
-            self.store.create_plan(plan_id, project.id, f"Run for {project.name}")
+            if not self.store.get_plan(plan_id):
+                self.store.create_plan(plan_id, project.id, f"Run for {project.name}")
             for p in ordered_phases:
                 previous = self.store.get_phase(p.id) or {}
                 self.store.upsert_phase(
@@ -270,7 +276,8 @@ class EngineStateMachine:
                     p.branch,
                     prompt=p.prompt,
                     depends_on_json=json.dumps(p.depends_on),
-                    size=p.size,
+                    size=p.size, ladder=p.ladder, timeout_minutes=p.timeout_minutes,
+                    auto_merge=p.auto_merge, release_after_merge=p.release_after_merge, force_rerun=p.force_rerun,
                     position=p.position,
                     status=previous.get("status", "pending"),
                     attempt=previous.get("attempt", 0),
@@ -536,7 +543,7 @@ class EngineStateMachine:
                 # Capture remote SHA BEFORE runner execution for accurate NO-OP detection
                 sha_before = self.vcs.remote_branch_sha(project.local_path, phase.branch)
                 inv_timeout = self.scheduler.invocation_timeout_seconds(
-                    phase.id, active_runner_name, phase.timeout_minutes * 60
+                    phase.id, active_runner_name, min(phase.timeout_minutes, int(self.store.get_setting("guard.runnerTimeoutMinutes", "90") or "90")) * 60
                 )
                 res = await runner_obj.run(
                     instruction,

@@ -201,4 +201,176 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert set_resp["ok"]
     assert bridge.call("settings.get", {"key": "theme"})["data"] == "dark"
 
+    # plan.validate
+    val_resp = bridge.call("plan.validate", {"phases": [{"id": "bad", "branch": "", "title": "Bad"}]})
+    assert val_resp["ok"]
+    assert val_resp["data"]["valid"] is False
+    assert any("needs a branch" in p for p in val_resp["data"]["problems"])
+
+    # plan.save
+    save_resp = bridge.call("plan.save", {
+        "plan": {"id": "plan2", "project_id": "p1", "title": "Saved Plan"},
+        "phases": [
+            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "depends_on": [], "ladder": "ui", "timeout_minutes": 42, "auto_merge": False, "release_after_merge": True, "force_rerun": True},
+            {"id": "p2-2", "title": "P2-2", "branch": "feat/p2-2", "depends_on": ["p2-1"]},
+        ],
+    })
+    assert save_resp["ok"]
+    assert save_resp["data"]["planId"] == "plan2"
+
+    saved = store.get_phase("p2-1")
+    assert (saved["ladder"], saved["timeout_minutes"], saved["auto_merge"], saved["release_after_merge"], saved["force_rerun"]) == ("ui", 42, 0, 1, 1)
+
+    # plan.setImplementer
+    impl_resp = bridge.call("plan.setImplementer", {
+        "phaseIds": ["p2-1"],
+        "engine": "Gemini CLI",
+        "model": "gemini-2.5-pro",
+        "effort": "high",
+    })
+    assert impl_resp["ok"]
+    assert impl_resp["data"]["updated"] == 1
+    assert store.get_phase_assignment("p2-1")["override_engine"] == "gemini"
+
+    # plan.exportQueue
+    exp_resp = bridge.call("plan.exportQueue", {"planId": "plan2"})
+    assert exp_resp["ok"]
+    assert exp_resp["data"]["repo"] == "owner/repo"
+
+    # plan.importQueue
+    import_payload = {
+        "repo": "owner/imported",
+        "local_repo": "/local/imported",
+        "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1"}],
+    }
+    imp_resp = bridge.call("plan.importQueue", {"queue": import_payload})
+    assert imp_resp["ok"]
+    assert imp_resp["data"]["project"]["id"] == "imported"
+
+    # runs.get
+    run_detail = bridge.call("runs.get", {"runId": "plan1"})
+    assert run_detail["ok"]
+    assert "Morning Digest" in run_detail["data"]["digest"]
+    assert len(run_detail["data"]["phases"]) >= 1
+
+    # runs.openArtifactFolder
+    folder_resp = bridge.call("runs.openArtifactFolder", {"projectId": "p1"})
+    assert folder_resp["ok"]
+    assert folder_resp["data"]["opened"] is True
+
+    # engines.getLadders and setLadders (Claude pinned last)
+    ladders_resp = bridge.call("engines.getLadders")
+    assert ladders_resp["ok"]
+    assert "Claude is pinned last" in ladders_resp["data"]["pinnedNote"]
+
+    set_ladders = bridge.call("engines.setLadders", {
+        "ladders": {"backend": ["claude", "agy", "gemini"]}  # User put claude first
+    })
+    assert set_ladders["ok"]
+    # Verify claude was automatically pinned last!
+    assert set_ladders["data"]["ladders"]["backend"][-1] == "claude"
+
+    # engines.getLedger
+    ledger_resp = bridge.call("engines.getLedger")
+    assert ledger_resp["ok"]
+    assert ledger_resp["data"]["isEstimate"] is True
+    assert len(ledger_resp["data"]["chartData"]) == 4
+
+    # engines.update
+    eng_up = bridge.call("engines.update", {"id": "agy", "effort": "high"})
+    assert eng_up["ok"]
+
+    # settings: projects CRUD
+    proj_list = bridge.call("settings.getProjects")
+    assert proj_list["ok"]
+    assert len(proj_list["data"]) >= 1
+
+    new_proj = bridge.call("settings.saveProject", {
+        "id": "new_app",
+        "name": "New App",
+        "repo": "owner/new-app",
+        "local_path": "/path/new-app",
+        "build_rules": "gradlew assembleDebug",
+    })
+    assert new_proj["ok"]
+    assert new_proj["data"]["id"] == "new_app"
+
+    del_proj = bridge.call("settings.deleteProject", {"id": "new_app"})
+    assert del_proj["ok"]
+
+    # settings: priority list, guard limits, data folder, keep awake
+    prio_resp = bridge.call("settings.getPriorityList")
+    assert prio_resp["ok"]
+    assert len(prio_resp["data"]) == 4
+
+    prio_set = bridge.call("settings.setPriorityList", {
+        "items": [{"position": 1, "engine": "gemini", "model": "auto", "effort": "medium"}]
+    })
+    assert prio_set["ok"]
+
+    guards_get = bridge.call("settings.getGuardLimits")
+    assert guards_get["ok"]
+    assert guards_get["data"]["maxAttempts"] == 3
+
+    guards_set = bridge.call("settings.setGuardLimits", {"maxAttempts": 5})
+    assert guards_set["ok"]
+    assert bridge.call("settings.getGuardLimits")["data"]["maxAttempts"] == 5
+
+    data_folder = bridge.call("settings.openDataFolder")
+    assert data_folder["ok"]
+    assert data_folder["data"]["opened"] is True
+
+    keep_awake = bridge.call("settings.setKeepAwake", {"enabled": True})
+    assert keep_awake["ok"]
+    assert keep_awake["data"]["keepAwake"] is True
+
+    store.close()
+
+def test_bridge_preserves_phase_execution_and_rejects_cross_plan_ids(tmp_path):
+    store = Store(tmp_path / "data.db")
+    store.migrate()
+    bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+    store.create_project("p", "Project", "owner/repo", "/path")
+    store.create_plan("one", "p", "One")
+    store.upsert_phase("shared", "one", "Original", "feat/shared", status="merged", attempt=3, pr_number=42)
+    saved = bridge.call("plan.save", {"plan": {"id": "one", "project_id": "p"}, "phases": [{"id": "shared", "title": "Edited"}]})
+    assert saved["ok"]
+    phase = store.get_phase("shared")
+    assert (phase["title"], phase["status"], phase["attempt"], phase["pr_number"]) == ("Edited", "merged", 3, 42)
+    rejected = bridge.call("plan.save", {"plan": {"id": "two", "project_id": "p"}, "phases": [{"id": "shared", "title": "Wrong"}]})
+    assert not rejected["ok"]
+    assert store.get_phase("shared")["title"] == "Edited"
+    assert store.get_plan("two") is None
+    imported = bridge.call("plan.importQueue", {"queue": {"repo": "owner/imported", "phases": [{"id": "shared", "title": "Wrong", "branch": "feat/shared"}]}})
+    assert not imported["ok"]
+    assert store.get_phase("shared")["title"] == "Edited"
+
+
+def test_bridge_run_detail_and_persisted_engine_contract(tmp_path):
+    store = Store(tmp_path / "data.db")
+    store.migrate()
+    bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+    store.create_project("p", "Project", "owner/repo", "/path")
+    store.create_plan("one", "p", "One")
+    store.upsert_phase("phase", "one", "Phase", "feat/phase", status="merged")
+    summary = bridge.call("runs.list")["data"][0]
+    assert bridge.call("runs.get", {"runId": "one"})["data"]["run"] == summary
+    store.upsert_engine("custom", "custom-cli", "model", skills_json='{"backend": 4}', cost_tier="economy", enabled=0)
+    engine = bridge.call("engines.list")["data"][0]
+    assert (engine["name"], engine["costTier"], engine["state"], engine["quotaUsedPct"], engine["skills"]) == ("custom-cli", "economy", "unavailable", 0, {"backend": 4})
+
+
+def test_engine_effort_update_preserves_configuration(tmp_path):
+    store = Store(tmp_path / "data.db")
+    store.migrate()
+    bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+    before = store.upsert_engine(
+        "custom", "custom-cli", "custom-model", effort="low",
+        skills_json='{"backend": 5}', cost_tier="gold", budget_json='{"limit": 42}',
+        enabled=0, pinned=1, command_template='["custom", "{instruction}"]',
+        usage_parser="custom-parser", quota_patterns_json='["limit"]',
+    )
+    assert bridge.call("engines.update", {"id": "custom", "effort": "high"})["ok"]
+    after = store.get_engine("custom")
+    assert after == {**before, "effort": "high"}
     store.close()
