@@ -160,7 +160,9 @@ class Scheduler:
 
     def is_engine_available(self, engine_name: str, model: str = "") -> bool:
         """Check if an engine is installed, logged in, within budget, and not cooling down."""
-        if self.quota_ledger.is_cooling_down(engine_name, model):
+        selected = self.store.get_engine(engine_name)
+        runner_name = selected["runner"] if selected else engine_name
+        if self.quota_ledger.is_cooling_down(runner_name, model):
             return False
 
         # Enforce owner-set budget caps per engine (BLUEPRINT 5d) across all matching catalogue rows
@@ -168,7 +170,8 @@ class Scheduler:
             eng
             for eng in self.store.list_engines()
             if eng.get("id") == engine_name
-            or (eng.get("runner") == engine_name and (not model or eng.get("model") in (model, "")))
+            or (eng.get("runner") == runner_name and not eng.get("model"))
+            or (not selected and eng.get("runner") == engine_name and (not model or eng.get("model") == model))
         ]
         if matching_rows:
             if all(not eng.get("enabled", 1) for eng in matching_rows):
@@ -176,11 +179,11 @@ class Scheduler:
             for eng in matching_rows:
                 if not eng.get("enabled", 1):
                     continue
-                if not self.quota_ledger.check_budget_cap(engine_name, eng.get("budget_json", "{}")):
+                if not self.quota_ledger.check_budget_cap(runner_name, eng.get("budget_json", "{}")):
                     return False
 
         if self.login_checker is not None:
-            status = self.login_checker.check_tool(engine_name, in_run=True)
+            status = self.login_checker.check_tool("claude" if runner_name == "claude-compatible" else runner_name, in_run=True)
             if status.state in ("Logged out", "Not installed") or status.state.startswith("Limit reached"):
                 return False
 
@@ -273,9 +276,9 @@ class Scheduler:
                 current_engine=current_engine,
                 exclude_engines=excluded,
             )
-            if dec and not dec.exhausted and self.is_engine_available(dec.runner, dec.model):
+            if dec and not dec.exhausted and self.is_engine_available(dec.chosen_id, dec.model):
                 return EngineChoice(
-                    engine=dec.runner,
+                    engine=dec.chosen_id,
                     model=dec.model,
                     effort=dec.effort,
                     reason=dec.reason,

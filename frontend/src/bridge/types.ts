@@ -177,6 +177,7 @@ export interface EngineItem {
   coolingUntil?: string | null;
   quotaUsedPct: number;
   skills: Record<string, number>;
+  budget?: Record<string, number>;
 }
 
 export interface RouterDecision {

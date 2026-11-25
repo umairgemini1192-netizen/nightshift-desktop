@@ -518,10 +518,14 @@ class BridgeAPI:
             goal = str(payload.get("goal") or "")
             projects = self._store.list_projects()
             project_id = str(payload.get("projectId") or self._active_project_id or (projects[0]["id"] if projects else "default"))
-            if not self._store.get_project(project_id):
-                self._store.create_project(project_id, project_id, "owner/repo", ".")
             title = str(payload.get("title") or (f"Council Plan: {goal[:40]}" if goal else "Council Plan"))
             phases_data = payload.get("phases") or []
+            for phase in phases_data:
+                existing = self._store.get_phase(str(phase["id"]))
+                if existing and existing["plan_id"] != plan_id:
+                    return {"ok": False, "error": f"Phase ID {phase['id']} belongs to another plan."}
+            if not self._store.get_project(project_id):
+                self._store.create_project(project_id, project_id, "owner/repo", ".")
             self._store.create_plan(plan_id, project_id, title, goal=goal)
             for idx, p in enumerate(phases_data):
                 pid = str(p["id"])

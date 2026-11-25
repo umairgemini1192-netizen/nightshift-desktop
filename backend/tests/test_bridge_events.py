@@ -429,3 +429,15 @@ def test_bridge_council_and_custom_engine_dpapi_and_test(tmp_path, monkeypatch):
     assert len(plan_data["phases"]) == 1
     assert plan_data["phases"][0]["implementer"] == "codex"
     store.close()
+
+def test_council_approval_rejects_phase_from_other_plan(tmp_path):
+    with Store(tmp_path / "collision.db") as store:
+        store.migrate()
+        store.create_project("p", "Project", "owner/repo", ".")
+        store.create_plan("original", "p", "Original")
+        store.upsert_phase("shared", "original", "Original phase", "feat/original")
+        bridge = BridgeAPI(store, EventBus(), ModuleRegistry())
+        result = bridge.call("council.approve", {"planId": "new", "projectId": "p", "phases": [{"id": "shared"}]})
+        assert not result["ok"]
+        assert store.get_phase("shared")["plan_id"] == "original"
+        assert not any(p["id"] == "new" for p in store.list_plans())

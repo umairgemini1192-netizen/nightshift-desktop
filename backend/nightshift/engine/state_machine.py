@@ -520,28 +520,28 @@ class EngineStateMachine:
                 active_runner_name = choice.engine
                 runner_obj = self.runners.get(active_runner_name)
                 if not runner_obj:
-                    if self.runners:
-                        runner_obj = list(self.runners.values())[0]
-                    else:
-                        eng_row = next(
-                            (e for e in self.store.list_engines() if e["id"] == active_runner_name or e["runner"] == active_runner_name),
-                            None,
+                    eng_row = next(
+                        (e for e in self.store.list_engines() if e["id"] == active_runner_name),
+                        None,
+                    ) or next(
+                        (e for e in self.store.list_engines() if e["runner"] == active_runner_name),
+                        None,
+                    )
+                    if eng_row:
+                        env = self.scheduler.router.build_isolated_environment(eng_row["id"])
+                        try:
+                            patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
+                        except Exception:
+                            patterns = []
+                        runner_obj = TemplateRunner(
+                            eng_row["runner"],
+                            eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
+                            quota_ledger=self.quota,
+                            quota_patterns=patterns,
+                            env=env,
                         )
-                        if eng_row:
-                            env = self.scheduler.router.build_isolated_environment(eng_row["id"])
-                            try:
-                                patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
-                            except Exception:
-                                patterns = []
-                            runner_obj = TemplateRunner(
-                                eng_row["runner"],
-                                eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
-                                quota_ledger=self.quota,
-                                quota_patterns=patterns,
-                                env=env,
-                            )
-                        else:
-                            raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
+                    else:
+                        raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
 
                 # Record step in SQLite before execution
                 step_id = self.store.record_step(phase.id, "implement", active_runner_name)

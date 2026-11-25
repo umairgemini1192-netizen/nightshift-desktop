@@ -110,6 +110,7 @@ export default function EnginesQuotaPage() {
       ]);
 
       setEngines(engRes ?? []);
+      setBudgets(Object.fromEntries((engRes ?? []).map((eng) => [eng.id, eng.budget?.weekly_percent ?? 100])));
       if (ladderRes?.ladders) {
         setLadders(ladderRes.ladders);
       }
@@ -176,8 +177,11 @@ export default function EnginesQuotaPage() {
     try {
       await bridge.call("engines.update", {
         id: engineId,
-        budget: { weekly_percent: value },
+        budget: { ...engines.find((eng) => eng.id === engineId)?.budget, weekly_percent: value },
       });
+      setEngines((prev) => prev.map((eng) => eng.id === engineId
+        ? { ...eng, budget: { ...eng.budget, weekly_percent: value } }
+        : eng));
       pushToast({
         title: "Budget limit saved",
         description: `Set ${engineId} weekly quota cap to ${value}%.`,
