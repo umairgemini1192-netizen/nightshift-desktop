@@ -81,7 +81,8 @@ async def test_diff_guard_self_heal_sends_findings_back_to_implementer(tmp_path:
                 vcs.diffs["feat/p1"] = "--- a/tests/t.py\n+++ b/tests/t.py\n+def test_x(): assert True\n"
                 vcs.changed_files["feat/p1"] = ["tests/t.py"]
 
-        runners = {"agy": FakeRunner(name="agy", on_call=on_call)}
+        reviewer = FakeRunner.success("codex")
+        runners = {"agy": FakeRunner(name="agy", on_call=on_call), "codex": reviewer}
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
         engine = EngineStateMachine(store, events, quota, vcs=vcs, runners=runners, login_checker=logins)
 
@@ -95,6 +96,7 @@ async def test_diff_guard_self_heal_sends_findings_back_to_implementer(tmp_path:
 
         assert rows[0]["status"] == "COMPLETED"
         assert attempt_count == 2
+        assert len(reviewer.calls) == 1
         guards = store.list_guard_results("p1")
         assert any(g["guard"] == "no_skipped_tests" and g["passed"] == 0 for g in guards)
 

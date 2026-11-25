@@ -205,12 +205,13 @@ async def test_crash_recovery_resumes_cleanly(tmp_path: Path) -> None:
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=mock_login_runner)
 
         runner = FakeRunner.success("agy")
+        reviewer = FakeRunner.success("codex")
         engine = EngineStateMachine(
             store=store,
             event_bus=events,
             quota_ledger=quota,
             vcs=vcs,
-            runners={"agy": runner},
+            runners={"agy": runner, "codex": reviewer},
             login_checker=logins,
         )
 
@@ -229,6 +230,7 @@ async def test_crash_recovery_resumes_cleanly(tmp_path: Path) -> None:
 
         # Runner was NOT called for implementation because it resumed at CI watch!
         assert len(runner.calls) == 0
+        assert len(reviewer.calls) == 1
 
 
 def test_single_instance_lock(tmp_path: Path) -> None:
