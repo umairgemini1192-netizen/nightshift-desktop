@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from nightshift.engine.verify import redact_secrets
 from nightshift.store import Store
 
 
@@ -47,6 +46,8 @@ class EventBus:
 
     def emit(self, event: Event) -> int | None:
         """Persist the event (if a store is attached) and notify subscribers."""
+        from nightshift.engine.verify import redact_secrets
+
         safe_text = redact_secrets(event.plain_text)
         safe_event = Event(
             kind=event.kind,

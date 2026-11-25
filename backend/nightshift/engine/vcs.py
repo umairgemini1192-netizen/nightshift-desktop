@@ -306,7 +306,7 @@ class SubprocessGitGh:
     ) -> tuple[bool, str]:
         run_subprocess_with_timeout(["git", "fetch", "origin", branch], cwd=local_repo, timeout_seconds=60)
         rc_r, out_r, err_r, _ = run_subprocess_with_timeout(
-            ["git", "revert", commit_sha, "--no-edit"],
+            ["git", "revert", "-m", "1", commit_sha, "--no-edit"],
             cwd=local_repo,
             timeout_seconds=60,
         )

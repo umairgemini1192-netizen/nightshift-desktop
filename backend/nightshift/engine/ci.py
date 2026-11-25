@@ -117,44 +117,43 @@ class CiPipelineManager:
             if passed:
                 # CI is green! Now run Risk-based review loop (BLUEPRINT 5d)
                 review_findings: list[ReviewFinding] = []
-                if risk.level == "critical":
-                    rev_engine_name, reviewer = self.select_reviewer(active_engine)
-                    if reviewer and rev_engine_name:
-                        if on_status_change:
-                            on_status_change(f"REVIEWING ({rev_engine_name})")
-                        diff_text = self.vcs.get_diff(worktree_dir)
-                        review_prompt = (
-                            f"Perform an independent code review of this PR branch `{branch}`.\n"
-                            f"Check for bugs, crash hazards, accessibility issues (<48dp), and security flaws.\n"
-                            f"Mark any blocking issues with [P1] and non-blocking nits with [P2].\n"
-                            f"Diff:\n```\n{diff_text[-3000:]}\n```"
+                rev_engine_name, reviewer = self.select_reviewer(active_engine)
+                if reviewer and rev_engine_name:
+                    if on_status_change:
+                        on_status_change(f"REVIEWING ({rev_engine_name})")
+                    diff_text = self.vcs.get_diff(worktree_dir)
+                    review_prompt = (
+                        f"Perform an independent code review of this PR branch `{branch}`.\n"
+                        f"Check for bugs, crash hazards, accessibility issues (<48dp), and security flaws.\n"
+                        f"Mark any blocking issues with [P1] and non-blocking nits with [P2].\n"
+                        f"Diff:\n```\n{diff_text[-3000:]}\n```"
+                    )
+                    rev_res = await reviewer.run(review_prompt, worktree_dir, effort="low", timeout_seconds=900)
+                    review_findings = parse_review_findings(f"{rev_res.stdout}\n{rev_res.stderr}")
+                    p1_findings = [f for f in review_findings if f.priority == "P1"]
+
+                    # P1 gate: any open P1 blocks merge -> trigger one fix round
+                    if p1_findings and round_num >= max_retries:
+                        return CiWatchResult(
+                            passed=False, rounds_used=round_num,
+                            detail="Unresolved P1 review findings: " + "; ".join(f.message for f in p1_findings),
+                            last_engine=active_engine, review_findings=review_findings,
                         )
-                        rev_res = await reviewer.run(review_prompt, worktree_dir, effort="low", timeout_seconds=900)
-                        review_findings = parse_review_findings(f"{rev_res.stdout}\n{rev_res.stderr}")
-                        p1_findings = [f for f in review_findings if f.priority == "P1"]
+                    if p1_findings and round_num < max_retries:
+                        if on_status_change:
+                            on_status_change("FIXING_REVIEW_P1")
+                        findings_text = "\n".join(f"- {f.message}" for f in p1_findings)
+                        fix_review_prompt = (
+                            f"{guardrail_header}\n\nIndependent reviewer ({rev_engine_name}) found blocking [P1] issues:\n"
+                            f"{findings_text}\n\nFix all P1 issues, commit, and push to `{branch}`."
+                        )
+                        prompt_path = worktree_dir / ".nightshift_prompt.md"
+                        prompt_path.write_text(fix_review_prompt, encoding="utf-8")
 
-                        # P1 gate: any open P1 blocks merge -> trigger one fix round
-                        if p1_findings and round_num >= max_retries:
-                            return CiWatchResult(
-                                passed=False, rounds_used=round_num,
-                                detail="Unresolved P1 review findings: " + "; ".join(f.message for f in p1_findings),
-                                last_engine=active_engine, review_findings=review_findings,
-                            )
-                        if p1_findings and round_num < max_retries:
-                            if on_status_change:
-                                on_status_change("FIXING_REVIEW_P1")
-                            findings_text = "\n".join(f"- {f.message}" for f in p1_findings)
-                            fix_review_prompt = (
-                                f"{guardrail_header}\n\nIndependent reviewer ({rev_engine_name}) found blocking [P1] issues:\n"
-                                f"{findings_text}\n\nFix all P1 issues, commit, and push to `{branch}`."
-                            )
-                            prompt_path = worktree_dir / ".nightshift_prompt.md"
-                            prompt_path.write_text(fix_review_prompt, encoding="utf-8")
-
-                            runner_obj = self.runners.get(active_engine) or list(self.runners.values())[0]
-                            await runner_obj.run(fix_review_prompt, worktree_dir, effort="medium", timeout_seconds=1800)
-                            # Re-verify CI after review fix
-                            continue
+                        runner_obj = self.runners.get(active_engine) or list(self.runners.values())[0]
+                        await runner_obj.run(fix_review_prompt, worktree_dir, effort="medium", timeout_seconds=1800)
+                        # Re-verify CI after review fix
+                        continue
 
                 pr_snap = self.vcs.find_open_pr(repo, branch)
                 checked_sha = str(pr_snap["headRefOid"]) if pr_snap and pr_snap.get("headRefOid") else None

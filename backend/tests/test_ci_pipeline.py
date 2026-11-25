@@ -134,7 +134,8 @@ async def test_ci_auto_fix_and_engine_rotation(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_risk_based_review_p1_blocks_p2_passes(tmp_path: Path) -> None:
+@pytest.mark.parametrize("risk_level", ["low", "critical"])
+async def test_risk_based_review_p1_blocks_p2_passes(tmp_path: Path, risk_level: str) -> None:
     db = tmp_path / "ci_review.db"
     with Store(db) as store:
         store.migrate()
@@ -167,7 +168,7 @@ async def test_risk_based_review_p1_blocks_p2_passes(tmp_path: Path) -> None:
             branch="feat/p1",
             pr_number=104,
             initial_engine="agy",
-            risk=RiskAssessment(level="critical", reasons=["Modifies permissions"]),
+            risk=RiskAssessment(level=risk_level, reasons=[]),
         )
         assert res.passed is True
         # Verified that P1 triggered a fix round and re-review
@@ -234,3 +235,16 @@ def test_workflow_watcher_filters_by_merge_sha(monkeypatch) -> None:
     result = SubprocessGitGh().watch_workflow_run("o/r", "main", "build", commit_sha="merge123")
     assert result[2] == 42
     assert calls[0][calls[0].index("--commit") + 1] == "merge123"
+
+
+def test_revert_merge_uses_first_parent(monkeypatch, tmp_path: Path) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    calls = []
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        return 0, "ok", "", False
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", run)
+    assert SubprocessGitGh().revert_commit_and_push(tmp_path, "merge123")[0]
+    assert calls[1] == ["git", "revert", "-m", "1", "merge123", "--no-edit"]

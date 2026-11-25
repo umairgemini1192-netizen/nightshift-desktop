@@ -138,3 +138,14 @@ def test_upgrade_existing_project_columns(tmp_path: Path) -> None:
         assert row["output_dir"] == "saved"
         assert row["release_workflow"] == "Android build"
         assert store.migrate() == []
+
+
+def test_events_imports_in_fresh_interpreter() -> None:
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from nightshift.events import EventBus"],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
