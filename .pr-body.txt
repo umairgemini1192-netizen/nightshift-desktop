@@ -1,0 +1,16 @@
+﻿## Changes
+- Migrate existing project databases to the new release settings.
+- Block unresolved P1 findings and enforce diff guards on resumed and fixed PR heads.
+- Select the post-merge workflow using the merge commit SHA.
+- Separate implementation and review runners in recovery tests and verify the required review runs.
+
+## Testing
+- Engine suite: 78 passed on Windows (one pytest cache warning).
+- UI rules and token checks passed.
+- Frontend lint, typecheck, and tests were not run locally.
+
+## Screenshots
+- None; no UI changes.
+
+## Left undone
+- GitHub Actions must verify all jobs.
