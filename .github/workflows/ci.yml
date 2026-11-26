@@ -72,16 +72,18 @@ jobs:
     name: Windows package
     runs-on: windows-latest
     needs: [gates, backend, frontend]
-    if: hashFiles('backend/packaging/nightshift.spec') != ''
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         with:
           python-version: "3.12"
       - uses: actions/setup-node@v4
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         with:
           node-version: "22"
       - name: Build NightShift.exe
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         shell: pwsh
         run: |
           Push-Location frontend; npm ci; npm run tokens; npm run build; Pop-Location
@@ -89,6 +91,7 @@ jobs:
           python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
           Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip
       - uses: actions/upload-artifact@v4
+        if: hashFiles('backend/packaging/nightshift.spec') != ''
         with:
           name: nightshift-windows
           path: NightShift-windows.zip
