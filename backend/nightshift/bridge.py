@@ -48,6 +48,19 @@ def attach_event_pump(events: EventBus, evaluate_js: Callable[[str], Any]) -> Ca
     return events.subscribe("*", forward)
 
 
+ENGINE_NAME_TO_ID: dict[str, str] = {
+    "Antigravity": "agy",
+    "Gemini CLI": "gemini",
+    "Codex CLI": "codex",
+    "Claude Code": "claude",
+    "Qwen Code": "qwen",
+    "DeepSeek": "deepseek",
+    "Kimi K2": "kimi",
+    "GLM": "glm",
+    "MiniMax": "minimax",
+}
+
+
 class BridgeAPI:
     """RPC facade exposed as ``window.pywebview.api`` to the frontend."""
 
@@ -74,6 +87,20 @@ class BridgeAPI:
         self._run_lock = threading.Lock()
         self._run_thread: threading.Thread | None = None
         self._registry.attach(store=self._store, events=self._events, creds=self._creds, engine=self._engine)
+
+    def _enrich_phase_with_assignment(self, ph: dict[str, Any]) -> dict[str, Any]:
+        assignment = self._store.get_phase_assignment(str(ph["id"]))
+        item = dict(ph)
+        if assignment:
+            if assignment.get("planned_engine"):
+                item["implementer"] = assignment["planned_engine"]
+            if assignment.get("override_engine"):
+                item["overrideImplementer"] = assignment["override_engine"]
+            if assignment.get("model"):
+                item["overrideModel"] = assignment["model"]
+            if assignment.get("effort"):
+                item["overrideEffort"] = assignment["effort"]
+        return item
 
     def _get_router(self) -> Router:
         if self._router is None:
@@ -256,37 +283,39 @@ class BridgeAPI:
         if method == "plan.get":
             plan_id = str(payload.get("planId") or "")
             if not plan_id:
-                plans = self._store.list_plans()
+                target_project_id = str(payload.get("projectId") or self._active_project_id or "")
+                project_plans = self._store.list_plans(target_project_id) if target_project_id else []
+                plans = project_plans or self._store.list_plans()
                 plan_id = plans[0]["id"] if plans else ""
             plan = self._store.get_plan(plan_id) if plan_id else None
             phases = self._store.list_phases(plan_id) if plan_id else self._store.list_phases()
-            enriched_phases = []
-            for ph in phases:
-                assignment = self._store.get_phase_assignment(ph["id"])
-                item = dict(ph)
-                if assignment:
-                    if assignment.get("planned_engine"):
-                        item["implementer"] = assignment["planned_engine"]
-                    if assignment.get("override_engine"):
-                        item["overrideImplementer"] = assignment["override_engine"]
-                    if assignment.get("model"):
-                        item["overrideModel"] = assignment["model"]
-                    if assignment.get("effort"):
-                        item["overrideEffort"] = assignment["effort"]
-                enriched_phases.append(item)
+            enriched_phases = [self._enrich_phase_with_assignment(ph) for ph in phases]
             return {"ok": True, "data": {"plan": plan, "phases": enriched_phases}}
 
         if method == "plan.save":
             plan_data = payload.get("plan") or {}
             plan_id = str(plan_data.get("id") or "default_plan")
-            project_id = str(plan_data.get("project_id") or self._active_project_id or "default")
-            title = str(plan_data.get("title") or "Plan")
-            goal = str(plan_data.get("goal") or "")
+            existing_plan = self._store.get_plan(plan_id)
+            projects = self._store.list_projects()
+            project_id = str(
+                plan_data.get("project_id")
+                or (existing_plan["project_id"] if existing_plan else "")
+                or self._active_project_id
+                or (projects[0]["id"] if projects else "default")
+            )
+            title = str(plan_data.get("title") or (existing_plan["title"] if existing_plan else "Plan"))
+            goal = str(
+                plan_data.get("goal")
+                if "goal" in plan_data and plan_data.get("goal") is not None
+                else (existing_plan["goal"] if existing_plan else "")
+            )
             phases_data = payload.get("phases") or []
             for phase in phases_data:
                 existing = self._store.get_phase(str(phase["id"]))
                 if existing and existing["plan_id"] != plan_id:
                     return {"ok": False, "error": f"Phase ID {phase['id']} belongs to another plan."}
+            if not self._store.get_project(project_id):
+                self._store.create_project(project_id, project_id, "owner/repo", ".", artifact_glob="*.apk")
             self._store.create_plan(plan_id, project_id, title, goal)
             for idx, p in enumerate(phases_data):
                 raw_deps = p.get("depends_on") or []
@@ -310,11 +339,17 @@ class BridgeAPI:
                 )
                 if p.get("implementer") is not None:
                     assignment = self._store.get_phase_assignment(str(p["id"])) or {}
-                    planned = str(p.get("implementer")).strip()
-                    planned = {"Antigravity": "agy", "Gemini CLI": "gemini", "Codex CLI": "codex", "Claude Code": "claude", "Qwen Code": "qwen", "DeepSeek": "deepseek", "Kimi K2": "kimi", "GLM": "glm", "MiniMax": "minimax"}.get(planned, planned)
-                    planned_engine = None if planned == "auto" else (planned or assignment.get("planned_engine"))
-                    self._store.upsert_phase_assignment(str(p["id"]), planned_engine=planned_engine, override_engine=assignment.get("override_engine"), model=assignment.get("model"), effort=assignment.get("effort") or "medium")
-            return {"ok": True, "data": {"saved": True, "planId": plan_id}}
+                    raw_planned = str(p.get("implementer")).strip()
+                    planned = ENGINE_NAME_TO_ID.get(raw_planned, raw_planned)
+                    planned_engine = None if planned.lower() == "auto" else (planned or assignment.get("planned_engine"))
+                    self._store.upsert_phase_assignment(
+                        str(p["id"]),
+                        planned_engine=planned_engine,
+                        override_engine=assignment.get("override_engine"),
+                        model=assignment.get("model"),
+                        effort=assignment.get("effort") or "medium",
+                    )
+            return {"ok": True, "data": {"saved": True, "planId": plan_id, "projectId": project_id}}
 
         if method == "plan.validate":
             raw_phases = payload.get("phases")
@@ -375,6 +410,8 @@ class BridgeAPI:
                     )
                 plan = imported["plan"]
                 self._store.create_plan(plan["id"], proj["id"], plan["title"], plan.get("goal", ""))
+                self._active_project_id = proj["id"]
+                raw_phases = raw_cfg.get("phases") if isinstance(raw_cfg.get("phases"), list) else []
                 for idx, ph in enumerate(imported["phases"]):
                     existing = self._store.get_phase(ph.id) or {}
                     self._store.upsert_phase(
@@ -391,6 +428,19 @@ class BridgeAPI:
                         position=idx, ladder=ph.ladder, timeout_minutes=ph.timeout_minutes,
                         auto_merge=ph.auto_merge, release_after_merge=ph.release_after_merge, force_rerun=ph.force_rerun,
                     )
+                    raw_ph = raw_phases[idx] if idx < len(raw_phases) and isinstance(raw_phases[idx], dict) else {}
+                    if raw_ph.get("implementer") is not None:
+                        assignment = self._store.get_phase_assignment(ph.id) or {}
+                        raw_planned = str(raw_ph.get("implementer")).strip()
+                        planned = ENGINE_NAME_TO_ID.get(raw_planned, raw_planned)
+                        planned_engine = None if planned.lower() == "auto" else (planned or assignment.get("planned_engine"))
+                        self._store.upsert_phase_assignment(
+                            ph.id,
+                            planned_engine=planned_engine,
+                            override_engine=assignment.get("override_engine"),
+                            model=assignment.get("model"),
+                            effort=assignment.get("effort") or "medium",
+                        )
                 if imported.get("ladders"):
                     self._store.set_setting("engines.ladders", json.dumps(imported["ladders"]))
                 return {
@@ -398,7 +448,7 @@ class BridgeAPI:
                     "data": {
                         "project": proj,
                         "plan": plan,
-                        "phases": [ph.to_dict() for ph in imported["phases"]],
+                        "phases": [self._enrich_phase_with_assignment(ph.to_dict()) for ph in imported["phases"]],
                         "ladders": imported["ladders"],
                     },
                 }
@@ -424,17 +474,7 @@ class BridgeAPI:
         if method == "plan.setImplementer":
             phase_ids = payload.get("phaseIds") or []
             engine = str(payload.get("engine") or "")
-            engine = {
-                "Antigravity": "agy",
-                "Gemini CLI": "gemini",
-                "Codex CLI": "codex",
-                "Claude Code": "claude",
-                "Qwen Code": "qwen",
-                "DeepSeek": "deepseek",
-                "Kimi K2": "kimi",
-                "GLM": "glm",
-                "MiniMax": "minimax",
-            }.get(engine, engine)
+            engine = ENGINE_NAME_TO_ID.get(engine, engine)
             model = str(payload.get("model") or "")
             effort = str(payload.get("effort") or "medium")
             reset = bool(payload.get("reset", False))

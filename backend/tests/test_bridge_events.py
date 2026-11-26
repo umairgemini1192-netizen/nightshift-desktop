@@ -251,19 +251,26 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
         "repo": "owner/imported",
         "local_repo": "/local/imported",
         "artifact_glob": "*.zip",
-        "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1"}],
+        "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1", "implementer": "Gemini CLI"}],
     }
     imp_resp = bridge.call("plan.importQueue", {"queue": import_payload})
     assert imp_resp["ok"]
     assert imp_resp["data"]["project"]["id"] == "owner/imported"
+    assert imp_resp["data"]["phases"][0]["implementer"] == "gemini"
     assert store.get_project("owner/imported")["artifact_glob"] == "*.zip"
+    assert bridge.call("plan.get")["data"]["plan"]["id"] == "plan_owner/imported"
+    assert bridge.call("plan.setImplementer", {"phaseIds": ["imp1"], "engine": "Claude Code", "model": "sonnet", "effort": "medium"})["ok"]
     reimp_resp = bridge.call("plan.importQueue", {"queue": {**import_payload, "artifact_glob": "dist/*.exe"}})
     assert reimp_resp["ok"]
     assert store.get_project("owner/imported")["artifact_glob"] == "dist/*.exe"
-    minimal_reimp = bridge.call("plan.importQueue", {"queue": {"repo": "owner/imported", "phases": import_payload["phases"]}})
+    assert reimp_resp["data"]["phases"][0]["implementer"] == "gemini"
+    assert reimp_resp["data"]["phases"][0]["overrideImplementer"] == "claude"
+    minimal_reimp = bridge.call("plan.importQueue", {"queue": {"repo": "owner/imported", "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1"}]}})
     assert minimal_reimp["ok"]
     assert store.get_project("owner/imported")["artifact_glob"] == "dist/*.exe"
     assert store.get_project("owner/imported")["local_path"] == "/local/imported"
+    assert minimal_reimp["data"]["phases"][0]["implementer"] == "gemini"
+    assert minimal_reimp["data"]["phases"][0]["overrideImplementer"] == "claude"
 
     # runs.get
     run_detail = bridge.call("runs.get", {"runId": "plan1"})
@@ -459,3 +466,35 @@ def test_council_approval_rejects_phase_from_other_plan(tmp_path):
         assert not result["ok"]
         assert store.get_phase("shared")["plan_id"] == "original"
         assert not any(p["id"] == "new" for p in store.list_plans())
+
+
+def test_plan_save_without_project_creates_fallback_and_handles_auto_implementer(tmp_path):
+    with Store(tmp_path / "empty_save.db") as store:
+        store.migrate()
+        bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+        saved = bridge.call(
+            "plan.save",
+            {
+                "plan": {"id": "active_plan", "title": "Fresh Plan", "goal": "Ship cleanly"},
+                "phases": [
+                    {"id": "p1", "title": "Phase 1", "branch": "feat/p1", "implementer": "Gemini CLI"},
+                ],
+            },
+        )
+        assert saved["ok"]
+        assert saved["data"]["projectId"] == "default"
+        assert store.get_project("default")["artifact_glob"] == "*.apk"
+        assert store.get_phase_assignment("p1")["planned_engine"] == "gemini"
+
+        auto_saved = bridge.call(
+            "plan.save",
+            {
+                "plan": {"id": "active_plan", "title": "Fresh Plan"},
+                "phases": [
+                    {"id": "p1", "title": "Phase 1", "branch": "feat/p1", "implementer": "Auto"},
+                ],
+            },
+        )
+        assert auto_saved["ok"]
+        assert store.get_plan("active_plan")["goal"] == "Ship cleanly"
+        assert store.get_phase_assignment("p1")["planned_engine"] is None

@@ -55,6 +55,8 @@ describe("Phase 5 Core Modules UI", () => {
     await user.click(screen.getByRole("button", { name: /Import queue\.json/i }));
     await user.click(screen.getByRole("button", { name: /Import plan/i }));
     expect(await screen.findByText(/Imported Phase 1/i)).toBeInTheDocument();
+    expect(useAppStore.getState().snapshot.activeProjectId).toBe("owner/imported-repo");
+    expect(useAppStore.getState().snapshot.projects.some((p) => p.id === "owner/imported-repo")).toBe(true);
     call.mockRestore();
   });
 

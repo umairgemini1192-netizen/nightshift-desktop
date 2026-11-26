@@ -42,6 +42,7 @@ const EFFORT_OPTIONS = [
 export default function PlanBuilderPage() {
   const bridge = useAppStore((s) => s.bridge);
   const pushToast = useAppStore((s) => s.pushToast);
+  const refreshSnapshot = useAppStore((s) => s.refreshSnapshot);
 
   const [plan, setPlan] = useState<{ id: string; title: string; project_id?: string; goal?: string } | null>(null);
   const [phases, setPhases] = useState<PlanPhase[]>([]);
@@ -177,9 +178,15 @@ export default function PlanBuilderPage() {
 
   const handleSavePlan = async () => {
     try {
-      await bridge.call("plan.save", {
-        plan: plan ?? { id: "active_plan", title: "Continuous Delivery Plan" },
+      const targetPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      const saved = await bridge.call<{ planId?: string; projectId?: string }>("plan.save", {
+        plan: targetPlan,
         phases,
+      });
+      setPlan((current) => current ?? {
+        ...targetPlan,
+        id: saved?.planId ?? targetPlan.id,
+        project_id: saved?.projectId ?? targetPlan.project_id,
       });
       pushToast({
         title: "Plan saved",
@@ -217,6 +224,7 @@ export default function PlanBuilderPage() {
         if (res.phases.length > 0) {
           setSelectedId(res.phases[0].id);
         }
+        await refreshSnapshot();
         setShowImportModal(false);
         setImportJson("");
         pushToast({
@@ -251,7 +259,10 @@ export default function PlanBuilderPage() {
   };
 
   const handleAddPhase = () => {
-    const nextIdx = phases.length + 1;
+    let nextIdx = phases.length + 1;
+    while (phases.some((p) => p.id === `p${nextIdx}`)) {
+      nextIdx += 1;
+    }
     const newId = `p${nextIdx}`;
     const newPhase: PlanPhase = {
       id: newId,

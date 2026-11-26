@@ -360,14 +360,29 @@ export class MockBridge implements Bridge {
       case "plan.setImplementer":
         return { ok: true, saved: true } as T;
 
-      case "plan.importQueue":
+      case "plan.importQueue": {
+        const importedProject = {
+          id: "owner/imported-repo",
+          name: "owner/imported-repo",
+          repo: "owner/imported-repo",
+        };
+        const existingProjects = this.snapshot.projects.some((p) => p.id === importedProject.id)
+          ? this.snapshot.projects
+          : [...this.snapshot.projects, importedProject];
+        this.snapshot = {
+          ...this.snapshot,
+          activeProjectId: importedProject.id,
+          projects: existingProjects,
+        };
+        this.emit("app.snapshot", structuredClone(this.snapshot));
         return {
-          project: { id: "owner/imported-repo", repo: "owner/imported-repo", artifact_glob: "*.apk" },
-          plan: { id: "plan_imported", title: "Imported Queue Plan", project_id: "owner/imported-repo" },
+          project: { ...importedProject, artifact_glob: "*.apk" },
+          plan: { id: "plan_imported", title: "Imported Queue Plan", project_id: importedProject.id },
           phases: [
             { id: "p1", title: "Imported Phase 1", branch: "feat/p1", depends_on: [], ladder: "backend" },
           ],
         } as T;
+      }
 
       case "plan.exportQueue":
         return {
