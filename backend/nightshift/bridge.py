@@ -308,11 +308,12 @@ class BridgeAPI:
                     auto_merge=bool(p.get("auto_merge", True)), release_after_merge=bool(p.get("release_after_merge", False)),
                     force_rerun=bool(p.get("force_rerun", False)),
                 )
-                if "implementer" in p:
+                if p.get("implementer") is not None:
                     assignment = self._store.get_phase_assignment(str(p["id"])) or {}
-                    planned = p.get("implementer")
+                    planned = str(p.get("implementer")).strip()
                     planned = {"Antigravity": "agy", "Gemini CLI": "gemini", "Codex CLI": "codex", "Claude Code": "claude", "Qwen Code": "qwen", "DeepSeek": "deepseek", "Kimi K2": "kimi", "GLM": "glm", "MiniMax": "minimax"}.get(planned, planned)
-                    self._store.upsert_phase_assignment(str(p["id"]), planned_engine=planned if planned != "auto" else None, override_engine=assignment.get("override_engine"), model=assignment.get("model"), effort=assignment.get("effort") or "medium")
+                    planned_engine = None if planned == "auto" else (planned or assignment.get("planned_engine"))
+                    self._store.upsert_phase_assignment(str(p["id"]), planned_engine=planned_engine, override_engine=assignment.get("override_engine"), model=assignment.get("model"), effort=assignment.get("effort") or "medium")
             return {"ok": True, "data": {"saved": True, "planId": plan_id}}
 
         if method == "plan.validate":
@@ -346,6 +347,14 @@ class BridgeAPI:
                         proj["name"],
                         proj["repo"],
                         proj["local_path"],
+                        build_rules=proj.get("build_rules", ""),
+                        artifact_glob=proj.get("artifact_glob", "*.apk"),
+                        output_dir=proj.get("output_dir", ""),
+                    )
+                else:
+                    self._store.update_project(
+                        proj["id"],
+                        local_path=proj["local_path"],
                         build_rules=proj.get("build_rules", ""),
                         artifact_glob=proj.get("artifact_glob", "*.apk"),
                         output_dir=proj.get("output_dir", ""),

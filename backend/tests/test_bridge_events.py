@@ -235,6 +235,11 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert bridge.call("plan.setImplementer", {"phaseIds": ["p2-1"], "reset": True})["ok"]
     assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
     assert store.get_phase_assignment("p2-1")["override_engine"] is None
+    assert bridge.call("plan.save", {
+        "plan": {"id": "plan2", "project_id": "p1", "title": "Saved Plan"},
+        "phases": [{"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "implementer": None}],
+    })["ok"]
+    assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
 
     # plan.exportQueue
     exp_resp = bridge.call("plan.exportQueue", {"planId": "plan2"})
@@ -252,6 +257,9 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert imp_resp["ok"]
     assert imp_resp["data"]["project"]["id"] == "owner/imported"
     assert store.get_project("owner/imported")["artifact_glob"] == "*.zip"
+    reimp_resp = bridge.call("plan.importQueue", {"queue": {**import_payload, "artifact_glob": "dist/*.exe"}})
+    assert reimp_resp["ok"]
+    assert store.get_project("owner/imported")["artifact_glob"] == "dist/*.exe"
 
     # runs.get
     run_detail = bridge.call("runs.get", {"runId": "plan1"})
