@@ -2,6 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { describe, expect, it, vi } from "vitest";
+import { SETTINGS_MODULES } from "../src/app/registry";
 import { useAppStore } from "../src/app/store";
 import PlanBuilderPage from "../src/modules/plan-builder/Page";
 import RunsHistoryPage from "../src/modules/runs-history/Page";
@@ -107,6 +108,46 @@ describe("Phase 5 Core Modules UI", () => {
     expect(await screen.findByText("Night-Shift Desktop")).toBeInTheDocument();
     expect(screen.getByText("Engine Fallback Priority")).toBeInTheDocument();
     expect(screen.getByText("Guard & Circuit Breaker Limits")).toBeInTheDocument();
+    expect(await screen.findByText("Phone Status Bridge")).toBeInTheDocument();
     expect(screen.getByText(/Keep Windows awake while running/i)).toBeInTheDocument();
+  });
+
+  it("discovers phone_status dynamically, validates URL, masks secret, and sends test update", async () => {
+    expect(SETTINGS_MODULES.map((m) => m.id)).toContain("phone_status");
+
+    const user = userEvent.setup();
+    const bridge = useAppStore.getState().bridge;
+    const call = vi.spyOn(bridge, "call");
+
+    render(
+      <MemoryRouter>
+        <SettingsPage />
+      </MemoryRouter>,
+    );
+
+    expect(await screen.findByText("Phone Status Bridge")).toBeInTheDocument();
+    expect(screen.getByText("not sent yet")).toBeInTheDocument();
+
+    const urlInput = screen.getByLabelText(/Apps Script web app URL/i);
+    const secretInput = screen.getByLabelText(/Shared secret/i);
+
+    await user.type(urlInput, "ftp://invalid.example/exec");
+    expect(screen.getByText(/Use the https:\/\/ Web app URL/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Send test update/i })).toBeDisabled();
+
+    await user.clear(urlInput);
+    await user.type(urlInput, "https://script.google.com/macros/s/test/exec");
+    await user.type(secretInput, "my-secret-passphrase");
+
+    await user.click(screen.getByRole("button", { name: /Send test update/i }));
+
+    await waitFor(() => {
+      expect(call.mock.calls.some(([m]) => m === "phone_status.saveSettings")).toBe(true);
+      expect(call.mock.calls.some(([m]) => m === "phone_status.sendTest")).toBe(true);
+      expect(screen.getByText("ok 05:25")).toBeInTheDocument();
+    });
+    expect((secretInput as HTMLInputElement).value).toBe("");
+    expect(screen.getByRole("button", { name: /Clear secret/i })).toBeInTheDocument();
+    call.mockRestore();
   });
 });

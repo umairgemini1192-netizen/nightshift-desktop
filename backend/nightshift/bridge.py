@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 from nightshift import __version__
 from nightshift.engine.council import CouncilRoleResult, CouncilSessionResult, PlanningCouncil
-from nightshift.engine.credentials import get_credential_store
+from nightshift.engine.credentials import CredentialStore, get_credential_store
 from nightshift.engine.deck import generate_deck_data
 from nightshift.engine.logins import LoginHealthChecker
 from nightshift.engine.planner import (
@@ -59,6 +59,7 @@ class BridgeAPI:
         events: EventBus,
         registry: ModuleRegistry,
         engine: Any | None = None,
+        creds: CredentialStore | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -66,12 +67,13 @@ class BridgeAPI:
         self._engine = engine
         self._quota = QuotaLedger(store)
         self._logins = LoginHealthChecker(store=store, quota_ledger=self._quota)
-        self._creds = get_credential_store()
+        self._creds = creds if creds is not None else get_credential_store()
         self._router: Router | None = None
         self._stop_armed = False
         self._active_project_id: str | None = None
         self._run_lock = threading.Lock()
         self._run_thread: threading.Thread | None = None
+        self._registry.attach(store=self._store, events=self._events, creds=self._creds, engine=self._engine)
 
     def _get_router(self) -> Router:
         if self._router is None:

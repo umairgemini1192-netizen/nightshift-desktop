@@ -235,6 +235,20 @@ export interface CouncilSessionData {
   tradeoffSummary: string;
 }
 
+export interface PhoneStatusSettings {
+  enabled: boolean;
+  url: string;
+  hasSecret: boolean;
+  lastResult: string;
+  lastResultAt: string;
+}
+
+export interface PhoneStatusTestResult {
+  ok: boolean;
+  lastResult: string;
+  lastResultAt: string;
+}
+
 export interface Bridge {
   call<T = unknown>(method: string, args?: Record<string, unknown>): Promise<T>;
   subscribe(event: string, cb: BridgeEventCallback): () => void;

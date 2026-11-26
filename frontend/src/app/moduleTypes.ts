@@ -14,10 +14,19 @@ export interface ModuleManifest {
   title: string;
   icon: string;
   order: number;
-  route: string;
+  route?: string;
   section: ModuleSection;
-  page: () => Promise<{ default: ComponentType }>;
+  page?: () => Promise<{ default: ComponentType }>;
   statusBadge?: (snapshot: AppSnapshot) => ModuleBadgeState | null;
   settings?: () => Promise<{ default: ComponentType }>;
   commands?: ModuleCommand[];
+}
+
+export interface RoutedModuleManifest extends ModuleManifest {
+  route: string;
+  page: () => Promise<{ default: ComponentType }>;
+}
+
+export interface SettingsModuleManifest extends ModuleManifest {
+  settings: () => Promise<{ default: ComponentType }>;
 }

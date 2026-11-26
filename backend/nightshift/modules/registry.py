@@ -41,3 +41,25 @@ class ModuleRegistry:
 
     def resolve(self, method: str) -> Callable[[dict[str, Any]], Any] | None:
         return self._handlers.get(method)
+
+    def attach(
+        self,
+        *,
+        store: Any = None,
+        events: Any = None,
+        creds: Any = None,
+        engine: Any = None,
+    ) -> None:
+        """Attach core services to all registered modules and subscribe them to events."""
+        for module in self._modules.values():
+            module.configure(store=store, events=events, creds=creds, engine=engine)
+            if events is not None and type(module).on_event is not ModuleBase.on_event:
+                events.subscribe("*", module.on_event)
+
+    def stop_all(self) -> None:
+        """Stop all registered modules cleanly."""
+        for module in self._modules.values():
+            try:
+                module.stop()
+            except Exception:
+                pass

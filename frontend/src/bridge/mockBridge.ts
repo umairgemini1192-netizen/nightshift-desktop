@@ -53,11 +53,43 @@ export class MockBridge implements Bridge {
   private snapshot: AppSnapshot;
   private listeners = new Map<string, Set<BridgeEventCallback>>();
   private stopArmed = false;
+  private phoneStatus: {
+    enabled: boolean;
+    url: string;
+    hasSecret: boolean;
+    lastResult: string;
+    lastResultAt: string;
+  };
 
   constructor(scenario: ScenarioName = "idle") {
     this.scenario = scenario;
     this.snapshot = structuredClone(SCENARIO_FIXTURES[scenario] ?? SCENARIO_FIXTURES.idle);
     this.stopArmed = Boolean(this.snapshot.stopArmed);
+    if (scenario === "running") {
+      this.phoneStatus = {
+        enabled: true,
+        url: "https://script.google.com/macros/s/demo-bridge/exec",
+        hasSecret: true,
+        lastResult: "ok 05:24",
+        lastResultAt: "2026-11-26T05:24:00Z",
+      };
+    } else if (scenario === "failure") {
+      this.phoneStatus = {
+        enabled: true,
+        url: "https://script.google.com/macros/s/demo-bridge/exec",
+        hasSecret: true,
+        lastResult: "failed: timeout",
+        lastResultAt: "2026-11-26T05:24:00Z",
+      };
+    } else {
+      this.phoneStatus = {
+        enabled: false,
+        url: "",
+        hasSecret: false,
+        lastResult: "not sent yet",
+        lastResultAt: "",
+      };
+    }
   }
 
   async call<T = unknown>(method: string, args?: Record<string, unknown>): Promise<T> {
@@ -636,6 +668,43 @@ export class MockBridge implements Bridge {
 
       case "settings.set":
         return { ok: true, key: args?.key, value: args?.value } as T;
+
+      case "phone_status.getSettings":
+        return structuredClone(this.phoneStatus) as T;
+
+      case "phone_status.saveSettings": {
+        if (typeof args?.enabled === "boolean") {
+          this.phoneStatus.enabled = args.enabled;
+        }
+        if (typeof args?.url === "string") {
+          this.phoneStatus.url = args.url.trim();
+        }
+        if (args?.clearSecret) {
+          this.phoneStatus.hasSecret = false;
+        } else if (typeof args?.secret === "string" && args.secret.trim()) {
+          this.phoneStatus.hasSecret = true;
+        }
+        return structuredClone(this.phoneStatus) as T;
+      }
+
+      case "phone_status.sendTest": {
+        if (!this.phoneStatus.url || !this.phoneStatus.hasSecret) {
+          this.phoneStatus.lastResult = "failed: missing URL or secret";
+          this.phoneStatus.lastResultAt = "2026-11-26T05:25:00Z";
+          return {
+            ok: false,
+            lastResult: this.phoneStatus.lastResult,
+            lastResultAt: this.phoneStatus.lastResultAt,
+          } as T;
+        }
+        this.phoneStatus.lastResult = "ok 05:25";
+        this.phoneStatus.lastResultAt = "2026-11-26T05:25:00Z";
+        return {
+          ok: true,
+          lastResult: this.phoneStatus.lastResult,
+          lastResultAt: this.phoneStatus.lastResultAt,
+        } as T;
+      }
 
       case "window.minimize":
       case "window.toggleMaximize":
