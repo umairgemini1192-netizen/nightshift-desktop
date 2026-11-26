@@ -110,7 +110,14 @@ export default function EnginesQuotaPage() {
       ]);
 
       setEngines(engRes ?? []);
-      setBudgets(Object.fromEntries((engRes ?? []).map((eng) => [eng.id, eng.budget?.weekly_percent ?? 100])));
+      setBudgets(
+        Object.fromEntries(
+          (engRes ?? []).map((eng) => [
+            eng.id,
+            eng.budget?.weekly_percent ?? (eng.id === "claude" ? 20 : 100),
+          ]),
+        ),
+      );
       if (ladderRes?.ladders) {
         setLadders(ladderRes.ladders);
       }

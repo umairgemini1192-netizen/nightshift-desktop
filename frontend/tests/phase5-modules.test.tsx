@@ -61,6 +61,14 @@ describe("Phase 5 Core Modules UI", () => {
     await waitFor(() => expect(call.mock.calls.some(([method]) => method === "plan.exportQueue")).toBe(true));
     const exportArgs = call.mock.calls.find(([method]) => method === "plan.exportQueue")?.[1] as { planId?: string };
     expect(exportArgs.planId).toBe("plan_owner/imported-repo");
+    await user.click(screen.getByRole("button", { name: "Done" }));
+
+    // Importing cleared stale selections, and deleting a selected phase clears it from bulk selection
+    expect(screen.queryByText(/phase\(s\) selected/i)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("checkbox", { name: "Select p1" }));
+    expect(screen.getByText("1 phase(s) selected")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.queryByText(/phase\(s\) selected/i)).not.toBeInTheDocument();
     call.mockRestore();
   });
 
@@ -101,16 +109,19 @@ describe("Phase 5 Core Modules UI", () => {
     expect(screen.getAllByText("Codex CLI").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("Claude Code").length).toBeGreaterThanOrEqual(1);
 
-    // Verify Claude pinned last explanation note
+    // Verify Claude pinned last explanation note and default 20% weekly budget cap
     expect(
       screen.getByText(/Claude is pinned last due to token cost/i),
     ).toBeInTheDocument();
+    expect(screen.getByLabelText("Weekly budget cap for Claude Code")).toHaveValue("20");
 
     // Verify ledger chart with (estimates) label
     expect(screen.getByText(/Quota & Token Ledger \(estimates\)/i)).toBeInTheDocument();
   });
 
   it("renders Settings page with projects CRUD, fallback priority, and system toggles", async () => {
+    const bridge = useAppStore.getState().bridge;
+    const call = vi.spyOn(bridge, "call");
     render(
       <MemoryRouter>
         <SettingsPage />
@@ -123,6 +134,9 @@ describe("Phase 5 Core Modules UI", () => {
     expect(screen.getByText("Guard & Circuit Breaker Limits")).toBeInTheDocument();
     expect(await screen.findByText("Phone Status Bridge")).toBeInTheDocument();
     expect(screen.getByText(/Keep Windows awake while running/i)).toBeInTheDocument();
+    expect(call.mock.calls.some(([method]) => method === "settings.getDataFolder")).toBe(true);
+    expect(call.mock.calls.some(([method]) => method === "settings.openDataFolder")).toBe(false);
+    call.mockRestore();
   });
 
   it("discovers phone_status dynamically, validates URL, masks secret, and sends test update", async () => {

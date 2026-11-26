@@ -163,6 +163,8 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     store.migrate()
     events = EventBus(store=store)
     bridge = BridgeAPI(store, events, ModuleRegistry())
+    opened_paths: list[str] = []
+    monkeypatch.setattr("nightshift.bridge.os.startfile", opened_paths.append, raising=False)
     monkeypatch.setattr(bridge._logins, "check_all", lambda **kwargs: {
         "gh": LoginCheckResult(tool="gh", state="Ready", detail="Verified")
     })
@@ -240,6 +242,7 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
         "phases": [{"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "implementer": None}],
     })["ok"]
     assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
+    assert store.get_phase("p2-2") is None
 
     # plan.exportQueue
     exp_resp = bridge.call("plan.exportQueue", {"planId": "plan2"})
@@ -341,9 +344,15 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert guards_set["ok"]
     assert bridge.call("settings.getGuardLimits")["data"]["maxAttempts"] == 5
 
+    data_folder_info = bridge.call("settings.getDataFolder")
+    assert data_folder_info["ok"]
+    assert data_folder_info["data"]["path"] == str(store.db_path.parent)
+    assert len(opened_paths) == 1
+
     data_folder = bridge.call("settings.openDataFolder")
     assert data_folder["ok"]
     assert data_folder["data"]["opened"] is True
+    assert len(opened_paths) == 2
 
     keep_awake = bridge.call("settings.setKeepAwake", {"enabled": True})
     assert keep_awake["ok"]
@@ -539,6 +548,35 @@ def test_export_queue_unsaved_plan_and_deleted_active_project_fallback(tmp_path)
         assert active_export["data"]["repo"] == "owner/imported-export"
         assert active_export["data"]["artifact_glob"] == "release/*.aab"
         assert active_export["data"]["phases"][0]["implementer"] == "codex"
+
+        # Re-importing with a trimmed phase list prunes removed phases from the plan
+        reimp_two = bridge.call(
+            "plan.importQueue",
+            {
+                "queue": {
+                    "repo": "owner/imported-export",
+                    "phases": [
+                        {"id": "exp1", "title": "Export Phase", "branch": "feat/exp1"},
+                        {"id": "exp2", "title": "Temporary Phase", "branch": "feat/exp2"},
+                    ],
+                }
+            },
+        )
+        assert reimp_two["ok"]
+        assert store.get_phase("exp2") is not None
+        reimp_trimmed = bridge.call(
+            "plan.importQueue",
+            {
+                "queue": {
+                    "repo": "owner/imported-export",
+                    "phases": [
+                        {"id": "exp1", "title": "Export Phase", "branch": "feat/exp1"},
+                    ],
+                }
+            },
+        )
+        assert reimp_trimmed["ok"]
+        assert store.get_phase("exp2") is None
 
         # Deleting the active imported project falls back cleanly to the remaining project in app.snapshot
         assert bridge.call("settings.deleteProject", {"id": "owner/imported-export"})["ok"]

@@ -195,10 +195,13 @@ export default function PlanBuilderPage() {
         plan: targetPlan,
         phases,
       });
-      setPlan((current) => current ?? {
-        ...targetPlan,
-        id: saved?.planId ?? targetPlan.id,
-        project_id: saved?.projectId ?? targetPlan.project_id,
+      setPlan((current) => {
+        const base = current ?? targetPlan;
+        return {
+          ...base,
+          id: saved?.planId ?? base.id,
+          project_id: saved?.projectId ?? base.project_id,
+        };
       });
       pushToast({
         title: "Plan saved",
@@ -233,9 +236,8 @@ export default function PlanBuilderPage() {
             force_rerun: Boolean(phase.force_rerun),
           })),
         );
-        if (res.phases.length > 0) {
-          setSelectedId(res.phases[0].id);
-        }
+        setSelectedPhases(new Set());
+        setSelectedId(res.phases[0]?.id ?? null);
         await refreshSnapshot();
         setShowImportModal(false);
         setImportJson("");
@@ -294,6 +296,12 @@ export default function PlanBuilderPage() {
 
   const handleDeletePhase = (id: string) => {
     setPhases((prev) => prev.filter((p) => p.id !== id));
+    setSelectedPhases((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     if (selectedId === id) {
       const remaining = phases.filter((p) => p.id !== id);
       setSelectedId(remaining[0]?.id ?? null);
@@ -325,10 +333,13 @@ export default function PlanBuilderPage() {
         plan: targetPlan,
         phases,
       });
-      setPlan((current) => current ?? {
-        ...targetPlan,
-        id: saved?.planId ?? targetPlan.id,
-        project_id: saved?.projectId ?? targetPlan.project_id,
+      setPlan((current) => {
+        const base = current ?? targetPlan;
+        return {
+          ...base,
+          id: saved?.planId ?? base.id,
+          project_id: saved?.projectId ?? base.project_id,
+        };
       });
       await bridge.call("plan.setImplementer", reset
         ? { phaseIds: ids, reset: true }

@@ -670,6 +670,9 @@ export class MockBridge implements Bridge {
       case "settings.setGuardLimits":
         return { ok: true } as T;
 
+      case "settings.getDataFolder":
+        return { path: "C:\\Users\\AppData\\Local\\NightShift" } as T;
+
       case "settings.openDataFolder":
         return { opened: true, path: "C:\\Users\\AppData\\Local\\NightShift" } as T;
 

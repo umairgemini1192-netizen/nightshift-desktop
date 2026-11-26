@@ -332,6 +332,10 @@ class BridgeAPI:
             if not self._store.get_project(project_id):
                 self._store.create_project(project_id, project_id, "owner/repo", ".", artifact_glob="*.apk")
             self._store.create_plan(plan_id, project_id, title, goal)
+            incoming_ids = {str(p["id"]) for p in phases_data}
+            for old_ph in self._store.list_phases(plan_id):
+                if str(old_ph["id"]) not in incoming_ids:
+                    self._store.delete_phase(str(old_ph["id"]))
             for idx, p in enumerate(phases_data):
                 raw_deps = p.get("depends_on") or []
                 deps_json = json.dumps(raw_deps) if isinstance(raw_deps, list) else str(raw_deps)
@@ -415,6 +419,10 @@ class BridgeAPI:
                 plan = imported["plan"]
                 self._store.create_plan(plan["id"], proj["id"], plan["title"], plan.get("goal", ""))
                 self._active_project_id = proj["id"]
+                imported_ids = {ph.id for ph in imported["phases"]}
+                for old_ph in self._store.list_phases(plan["id"]):
+                    if str(old_ph["id"]) not in imported_ids:
+                        self._store.delete_phase(str(old_ph["id"]))
                 raw_phases = raw_cfg.get("phases") if isinstance(raw_cfg.get("phases"), list) else []
                 for idx, ph in enumerate(imported["phases"]):
                     existing = self._store.get_phase(ph.id) or {}
@@ -607,6 +615,10 @@ class BridgeAPI:
             if not self._store.get_project(project_id):
                 self._store.create_project(project_id, project_id, "owner/repo", ".")
             self._store.create_plan(plan_id, project_id, title, goal=goal)
+            approved_ids = {str(p["id"]) for p in phases_data}
+            for old_ph in self._store.list_phases(plan_id):
+                if str(old_ph["id"]) not in approved_ids:
+                    self._store.delete_phase(str(old_ph["id"]))
             for idx, p in enumerate(phases_data):
                 pid = str(p["id"])
                 deps = p.get("depends_on") or []
@@ -1077,6 +1089,10 @@ class BridgeAPI:
             if "runnerTimeoutMinutes" in payload:
                 self._store.set_setting("guard.runnerTimeoutMinutes", str(payload["runnerTimeoutMinutes"]))
             return {"ok": True, "data": payload}
+
+        if method == "settings.getDataFolder":
+            folder = str(self._store.db_path.parent)
+            return {"ok": True, "data": {"path": folder}}
 
         if method == "settings.openDataFolder":
             folder = str(self._store.db_path.parent)
