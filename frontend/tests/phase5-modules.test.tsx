@@ -48,6 +48,10 @@ describe("Phase 5 Core Modules UI", () => {
     expect(saveIndex).toBeLessThan(overrideIndex);
     const saved = call.mock.calls[saveIndex][1] as { phases: unknown[] };
     expect(saved.phases.length).toBeGreaterThan(5);
+    await user.click(screen.getByRole("button", { name: "Reset to plan" }));
+    await waitFor(() => expect(call.mock.calls.filter(([method]) => method === "plan.setImplementer")).toHaveLength(2));
+    const secondSave = call.mock.calls.filter(([method]) => method === "plan.save")[1][1] as { phases: { implementer?: string; overrideImplementer?: string }[] };
+    expect(secondSave.phases.some((phase) => phase.implementer !== phase.overrideImplementer && phase.overrideImplementer)).toBe(true);
     call.mockRestore();
   });
 

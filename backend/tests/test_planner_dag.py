@@ -154,6 +154,8 @@ def test_queue_json_import_export_round_trip() -> None:
 
     # Import
     imported = import_queue_json(legacy_payload)
+    assert imported["project"]["id"] == "owner/drivelift-android"
+    assert import_queue_json({"repo": "another/drivelift-android"})["project"]["id"] != imported["project"]["id"]
     assert imported["project"]["repo"] == "owner/drivelift-android"
     assert imported["project"]["local_path"] == "D:/DevCache/drivelift"
     assert len(imported["phases"]) == 2

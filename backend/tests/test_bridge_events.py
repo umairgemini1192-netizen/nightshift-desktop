@@ -211,7 +211,7 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     save_resp = bridge.call("plan.save", {
         "plan": {"id": "plan2", "project_id": "p1", "title": "Saved Plan"},
         "phases": [
-            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "depends_on": [], "ladder": "ui", "timeout_minutes": 42, "auto_merge": False, "release_after_merge": True, "force_rerun": True},
+            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "implementer": "Codex CLI", "depends_on": [], "ladder": "ui", "timeout_minutes": 42, "auto_merge": False, "release_after_merge": True, "force_rerun": True},
             {"id": "p2-2", "title": "P2-2", "branch": "feat/p2-2", "depends_on": ["p2-1"]},
         ],
     })
@@ -231,6 +231,10 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert impl_resp["ok"]
     assert impl_resp["data"]["updated"] == 1
     assert store.get_phase_assignment("p2-1")["override_engine"] == "gemini"
+    assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
+    assert bridge.call("plan.setImplementer", {"phaseIds": ["p2-1"], "reset": True})["ok"]
+    assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
+    assert store.get_phase_assignment("p2-1")["override_engine"] is None
 
     # plan.exportQueue
     exp_resp = bridge.call("plan.exportQueue", {"planId": "plan2"})
@@ -241,11 +245,13 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     import_payload = {
         "repo": "owner/imported",
         "local_repo": "/local/imported",
+        "artifact_glob": "*.zip",
         "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1"}],
     }
     imp_resp = bridge.call("plan.importQueue", {"queue": import_payload})
     assert imp_resp["ok"]
-    assert imp_resp["data"]["project"]["id"] == "imported"
+    assert imp_resp["data"]["project"]["id"] == "owner/imported"
+    assert store.get_project("owner/imported")["artifact_glob"] == "*.zip"
 
     # runs.get
     run_detail = bridge.call("runs.get", {"runId": "plan1"})

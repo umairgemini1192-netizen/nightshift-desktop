@@ -174,7 +174,7 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
         cfg = dict(data_or_str)
 
     repo = str(cfg.get("repo", "")).strip()
-    project_id = repo.split("/")[-1] if "/" in repo else (repo or "imported-project")
+    project_id = repo or "imported-project"
 
     project = {
         "id": project_id,

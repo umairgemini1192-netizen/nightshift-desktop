@@ -294,8 +294,8 @@ export default function PlanBuilderPage() {
         : { phaseIds: ids, engine: bulkEngine, model: bulkModel, effort: bulkEffort });
       setPhases((prev) => prev.map((p) => ids.includes(p.id)
         ? reset
-          ? { ...p, overrideImplementer: undefined, implementer: "Antigravity" }
-          : { ...p, overrideImplementer: bulkEngine, implementer: bulkEngine }
+          ? { ...p, overrideImplementer: undefined, overrideModel: undefined, overrideEffort: undefined }
+          : { ...p, overrideImplementer: bulkEngine, overrideModel: bulkModel, overrideEffort: bulkEffort }
         : p));
       pushToast({
         title: reset ? "Reset to plan" : "Implementer overridden",

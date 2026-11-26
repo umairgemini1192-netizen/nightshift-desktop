@@ -308,6 +308,11 @@ class BridgeAPI:
                     auto_merge=bool(p.get("auto_merge", True)), release_after_merge=bool(p.get("release_after_merge", False)),
                     force_rerun=bool(p.get("force_rerun", False)),
                 )
+                if "implementer" in p:
+                    assignment = self._store.get_phase_assignment(str(p["id"])) or {}
+                    planned = p.get("implementer")
+                    planned = {"Antigravity": "agy", "Gemini CLI": "gemini", "Codex CLI": "codex", "Claude Code": "claude", "Qwen Code": "qwen", "DeepSeek": "deepseek", "Kimi K2": "kimi", "GLM": "glm", "MiniMax": "minimax"}.get(planned, planned)
+                    self._store.upsert_phase_assignment(str(p["id"]), planned_engine=planned if planned != "auto" else None, override_engine=assignment.get("override_engine"), model=assignment.get("model"), effort=assignment.get("effort") or "medium")
             return {"ok": True, "data": {"saved": True, "planId": plan_id}}
 
         if method == "plan.validate":
@@ -342,6 +347,7 @@ class BridgeAPI:
                         proj["repo"],
                         proj["local_path"],
                         build_rules=proj.get("build_rules", ""),
+                        artifact_glob=proj.get("artifact_glob", "*.apk"),
                         output_dir=proj.get("output_dir", ""),
                     )
                 plan = imported["plan"]
@@ -411,7 +417,7 @@ class BridgeAPI:
             reset = bool(payload.get("reset", False))
             for pid in phase_ids:
                 existing = self._store.get_phase_assignment(pid) or {}
-                planned = existing.get("planned_engine") or "agy"
+                planned = existing.get("planned_engine")
                 if reset:
                     self._store.upsert_phase_assignment(pid, planned_engine=planned, override_engine=None, model=None, effort="medium")
                 else:
