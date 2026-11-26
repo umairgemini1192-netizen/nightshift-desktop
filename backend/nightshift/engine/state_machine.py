@@ -237,6 +237,7 @@ class EngineStateMachine:
             raise RuntimeError(f"Another NightShift process is already running for project {project.id}")
 
         summary_rows: list[dict[str, Any]] = []
+        stopped_emitted = False
 
         try:
             # Validate plan DAG
@@ -285,17 +286,26 @@ class EngineStateMachine:
                     pr_number=previous.get("pr_number"),
                 )
 
+            self.events.emit(Event(
+                kind="run.started",
+                plain_text=f"Started run for {project.name}.",
+                level="info",
+                payload={"project_id": project.id},
+            ))
+
             completed_ids: set[str] = set()
             parked_ids: set[str] = set()
 
             for phase in ordered_phases:
                 # 1. Honour Stop-after-current-phase at boundary
                 if self._stop_requested:
+                    stopped_emitted = True
                     self.events.emit(Event(
                         kind="run.stopped",
                         plain_text="Stop after current phase requested. Halting cleanly at phase boundary.",
                         level="info",
                         phase_id=phase.id,
+                        payload={"project_id": project.id},
                     ))
                     break
 
@@ -306,6 +316,7 @@ class EngineStateMachine:
                         plain_text="Circuit breaker tripped after 3 consecutive parked phases. Pausing new phase starts.",
                         level="warn",
                         phase_id=phase.id,
+                        payload={"project_id": project.id},
                     ))
                     break
 
@@ -363,7 +374,7 @@ class EngineStateMachine:
                         await asyncio.sleep(self._network_backoff_seconds)
                         pf_ok, pf_msg = self.pre_flight_checks(project)
                     if not pf_ok:
-                        self.store.park_phase(phase.id, reason=f"Pre-flight failed: {pf_msg}", next_step="Fix pre-flight issue")
+                        self._park_phase(project.id, phase, reason=f"Pre-flight failed: {pf_msg}", next_step="Fix pre-flight issue")
                         parked_ids.add(phase.id)
                         self.scheduler.circuit_breaker.record_phase_result(parked=True)
                         summary_rows.append({"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": pf_msg})
@@ -408,8 +419,25 @@ class EngineStateMachine:
             set_keep_awake(False)
             lock.release()
             self._is_running = False
+            if not stopped_emitted:
+                self.events.emit(Event(
+                    kind="run.finished",
+                    plain_text=f"Finished run for {project.name}.",
+                    level="info",
+                    payload={"project_id": project.id},
+                ))
 
         return summary_rows
+
+    def _park_phase(self, project_id: str, phase: PhaseDefinition, *, reason: str, next_step: str) -> None:
+        self.store.park_phase(phase.id, reason=reason, next_step=next_step)
+        self.events.emit(Event(
+            kind="phase.parked",
+            plain_text=f"Parked {phase.title}: {reason}",
+            level="warn",
+            phase_id=phase.id,
+            payload={"project_id": project_id},
+        ))
 
     async def _execute_phase(
         self,
@@ -433,12 +461,13 @@ class EngineStateMachine:
             kind="phase.started",
             plain_text=f"Preparing worktree for {phase.title} on branch {phase.branch} (base: {base_branch}).",
             phase_id=phase.id,
+            payload={"project_id": project.id},
         ))
 
         try:
             self.vcs.prepare_worktree(project.local_path, wt_dir, phase.branch, base_branch=base_branch)
         except Exception as e:
-            self.store.park_phase(phase.id, reason=f"Worktree creation failed: {e}", next_step="Inspect repo / disk")
+            self._park_phase(project.id, phase, reason=f"Worktree creation failed: {e}", next_step="Inspect repo / disk")
             return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": str(e)}
 
         guardrail_header = (
@@ -478,6 +507,7 @@ class EngineStateMachine:
             prompt_path.write_text(guardrail_header + phase.prompt, encoding="utf-8")
 
             implement_attempts = 0
+            diff_guard_retries = 0
             delivered = False
             pending_choice = None
 
@@ -528,19 +558,24 @@ class EngineStateMachine:
                         None,
                     )
                     if eng_row:
-                        env = self.scheduler.router.build_isolated_environment(eng_row["id"])
-                        try:
-                            patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
-                        except Exception:
-                            patterns = []
-                        runner_obj = TemplateRunner(
-                            eng_row["runner"],
-                            eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
-                            quota_ledger=self.quota,
-                            quota_patterns=patterns,
-                            env=env,
-                        )
-                        self.runners[active_runner_name] = runner_obj
+                        runner_type = eng_row.get("runner", "")
+                        if runner_type and runner_type in self.runners:
+                            runner_obj = self.runners[runner_type]
+                            self.runners[active_runner_name] = runner_obj
+                        else:
+                            env = self.scheduler.router.build_isolated_environment(eng_row["id"])
+                            try:
+                                patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
+                            except Exception:
+                                patterns = []
+                            runner_obj = TemplateRunner(
+                                eng_row["runner"],
+                                eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
+                                quota_ledger=self.quota,
+                                quota_patterns=patterns,
+                                env=env,
+                            )
+                            self.runners[active_runner_name] = runner_obj
                     else:
                         raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
 
@@ -626,11 +661,15 @@ class EngineStateMachine:
                 failure_reason = "Diff guard failed: " + "; ".join(f.message for f in findings) if findings else deliv_reason if not ok_deliv else res.stderr[:200]
                 self.store.update_step(step_id, rc=res.rc, verified=0, detail=failure_reason)
                 if findings:
+                    diff_guard_retries += 1
                     findings_summary = "\n".join(f"- [{f.guard}] {f.message}" for f in findings)
                     prompt_path.write_text(
                         guardrail_header + phase.prompt + f"\n\nDIFF GUARD FINDINGS TO FIX:\n{findings_summary}\n",
                         encoding="utf-8",
                     )
+                    if diff_guard_retries < 2:
+                        pending_choice = choice
+                        continue
 
                 # Look for next engine to hand off to
                 next_choice = self.scheduler.select_engine(
@@ -661,12 +700,12 @@ class EngineStateMachine:
                 ))
 
             if not delivered:
-                self.store.park_phase(phase.id, reason="Exhausted implementer attempts without valid delivery", next_step="Manual inspection")
+                self._park_phase(project.id, phase, reason="Exhausted implementer attempts without valid delivery", next_step="Manual inspection")
                 return {"phase_id": phase.id, "title": phase.title, "runner": active_runner_name, "status": "PARKED", "detail": "Exhausted implementer attempts"}
 
             pr_info = self.vcs.find_open_pr(project.repo, phase.branch)
             if not pr_info:
-                self.store.park_phase(phase.id, reason="No open PR found after implementation delivery", next_step="Open PR manually")
+                self._park_phase(project.id, phase, reason="No open PR found after implementation delivery", next_step="Open PR manually")
                 return {"phase_id": phase.id, "title": phase.title, "runner": active_runner_name, "status": "PARKED", "detail": "No open PR found"}
             pr_number = int(pr_info["number"])
             pr_url = str(pr_info["url"])
@@ -680,7 +719,7 @@ class EngineStateMachine:
             for finding in findings:
                 self.store.record_guard_result(phase.id, finding.guard, passed=False, detail=finding.message)
             reason = "Diff guard failed: " + "; ".join(f.message for f in findings)
-            self.store.park_phase(phase.id, reason=reason, next_step="Fix the diff guard findings")
+            self._park_phase(project.id, phase, reason=reason, next_step="Fix the diff guard findings")
             return {"phase_id": phase.id, "title": phase.title, "runner": active_runner_name, "status": "PARKED", "detail": reason}
 
         guard_failure = park_on_diff_guard()
@@ -711,7 +750,7 @@ class EngineStateMachine:
         )
 
         if not ci_res.passed:
-            self.store.park_phase(phase.id, reason=ci_res.detail, next_step="Fix remaining CI failure")
+            self._park_phase(project.id, phase, reason=ci_res.detail, next_step="Fix remaining CI failure")
             return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": ci_res.detail}
 
         guard_failure = park_on_diff_guard()
@@ -725,7 +764,7 @@ class EngineStateMachine:
         # Step 4: Merge PR if auto_merge is enabled (verify exact head SHA match)
         if phase.auto_merge and not dependencies_merged:
             reason = "Waiting for dependencies to merge before merging this PR"
-            self.store.park_phase(phase.id, reason=reason, next_step="Merge dependencies and resume")
+            self._park_phase(project.id, phase, reason=reason, next_step="Merge dependencies and resume")
             return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": reason}
 
         if phase.auto_merge:
@@ -739,7 +778,7 @@ class EngineStateMachine:
                     f"(checked {str(ci_res.checked_sha)[:7]}, now {str((latest_pr or {}).get('headRefOid'))[:7]})."
                 )
                 self.store.record_guard_result(phase.id, "exact_head_sha", passed=False, detail=mismatch_reason)
-                self.store.park_phase(phase.id, reason=mismatch_reason, next_step="Re-run CI on the latest head commit")
+                self._park_phase(project.id, phase, reason=mismatch_reason, next_step="Re-run CI on the latest head commit")
                 return {
                     "phase_id": phase.id,
                     "title": phase.title,
@@ -752,13 +791,21 @@ class EngineStateMachine:
                 kind="phase.merging",
                 plain_text=f"Merging PR #{pr_number} cleanly into main.",
                 phase_id=phase.id,
+                payload={"project_id": project.id},
             ))
             merge_ok, merge_msg = self.vcs.merge_pr(project.repo, pr_number, project.local_path)
             if not merge_ok:
-                self.store.park_phase(phase.id, reason=f"Merge failed: {merge_msg}", next_step="Resolve merge conflict or checks")
+                self._park_phase(project.id, phase, reason=f"Merge failed: {merge_msg}", next_step="Resolve merge conflict or checks")
                 return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": f"Merge failed: {merge_msg}"}
 
             self.store.update_phase(phase.id, status="merged")
+            self.events.emit(Event(
+                kind="phase.merged",
+                plain_text=f"Merged {phase.title} via PR #{pr_number}.",
+                level="info",
+                phase_id=phase.id,
+                payload={"project_id": project.id},
+            ))
             detail = f"Merged PR #{pr_number}"
 
             merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
@@ -770,6 +817,13 @@ class EngineStateMachine:
         # Cleanup worktree
         self.vcs.remove_worktree(project.local_path, wt_dir)
         self.store.update_phase(phase.id, status="completed")
+        self.events.emit(Event(
+            kind="phase.completed",
+            plain_text=f"Completed {phase.title}.",
+            level="info",
+            phase_id=phase.id,
+            payload={"project_id": project.id},
+        ))
 
         return {
             "phase_id": phase.id,
@@ -799,6 +853,13 @@ class EngineStateMachine:
             if not phase.release_after_merge:
                 self.store.unpark_phase(phase.id)
                 self.store.update_phase(phase.id, status="completed")
+                self.events.emit(Event(
+                    kind="phase.completed",
+                    plain_text=f"Completed {phase.title}.",
+                    level="info",
+                    phase_id=phase.id,
+                    payload={"project_id": project.id},
+                ))
                 return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')}; main build passed"}
             self.store.update_phase(phase.id, status="releasing")
             tag, files = self.release_mgr.publish_verified_release(
@@ -808,9 +869,14 @@ class EngineStateMachine:
             )
             self.store.unpark_phase(phase.id)
             self.store.update_phase(phase.id, status="completed")
-            self.events.emit(Event(kind="release.published", plain_text=f"Published verified release {tag} with SHA-256 checksums.", phase_id=phase.id))
+            self.events.emit(Event(
+                kind="release.published",
+                plain_text=f"Published verified release {tag} with SHA-256 checksums.",
+                phase_id=phase.id,
+                payload={"project_id": project.id},
+            ))
             return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')} ? Released {tag} ({len(files)} files)"}
         except Exception as rel_err:
             logger.error("Post-merge release failed: %s", rel_err)
-            self.store.park_phase(phase.id, reason=str(rel_err), next_step="Inspect the main build or release and resume")
+            self._park_phase(project.id, phase, reason=str(rel_err), next_step="Inspect the main build or release and resume")
             return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": f"Post-merge failure: {rel_err}"}

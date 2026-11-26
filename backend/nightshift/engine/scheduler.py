@@ -277,8 +277,9 @@ class Scheduler:
                 exclude_engines=excluded,
             )
             if dec and not dec.exhausted and self.is_engine_available(dec.chosen_id, dec.model):
+                effective_engine = dec.runner if dec.runner in ("agy", "gemini", "codex", "claude") else dec.chosen_id
                 return EngineChoice(
-                    engine=dec.chosen_id,
+                    engine=effective_engine,
                     model=dec.model,
                     effort=dec.effort,
                     reason=dec.reason,
