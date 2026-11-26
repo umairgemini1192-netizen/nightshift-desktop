@@ -57,6 +57,10 @@ describe("Phase 5 Core Modules UI", () => {
     expect(await screen.findByText(/Imported Phase 1/i)).toBeInTheDocument();
     expect(useAppStore.getState().snapshot.activeProjectId).toBe("owner/imported-repo");
     expect(useAppStore.getState().snapshot.projects.some((p) => p.id === "owner/imported-repo")).toBe(true);
+    await user.click(screen.getByRole("button", { name: /^Export$/i }));
+    await waitFor(() => expect(call.mock.calls.some(([method]) => method === "plan.exportQueue")).toBe(true));
+    const exportArgs = call.mock.calls.find(([method]) => method === "plan.exportQueue")?.[1] as { planId?: string };
+    expect(exportArgs.planId).toBe("plan_owner/imported-repo");
     call.mockRestore();
   });
 

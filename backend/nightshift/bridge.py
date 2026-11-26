@@ -102,6 +102,21 @@ class BridgeAPI:
                 item["overrideEffort"] = assignment["effort"]
         return item
 
+    def _upsert_planned_engine(self, phase_id: str, raw_implementer: Any) -> None:
+        if raw_implementer is None:
+            return
+        assignment = self._store.get_phase_assignment(phase_id) or {}
+        raw_planned = str(raw_implementer).strip()
+        planned = ENGINE_NAME_TO_ID.get(raw_planned, raw_planned)
+        planned_engine = None if planned.lower() == "auto" else (planned or assignment.get("planned_engine"))
+        self._store.upsert_phase_assignment(
+            phase_id,
+            planned_engine=planned_engine,
+            override_engine=assignment.get("override_engine"),
+            model=assignment.get("model"),
+            effort=assignment.get("effort") or "medium",
+        )
+
     def _get_router(self) -> Router:
         if self._router is None:
             self._router = Router(
@@ -337,18 +352,7 @@ class BridgeAPI:
                     auto_merge=bool(p.get("auto_merge", True)), release_after_merge=bool(p.get("release_after_merge", False)),
                     force_rerun=bool(p.get("force_rerun", False)),
                 )
-                if p.get("implementer") is not None:
-                    assignment = self._store.get_phase_assignment(str(p["id"])) or {}
-                    raw_planned = str(p.get("implementer")).strip()
-                    planned = ENGINE_NAME_TO_ID.get(raw_planned, raw_planned)
-                    planned_engine = None if planned.lower() == "auto" else (planned or assignment.get("planned_engine"))
-                    self._store.upsert_phase_assignment(
-                        str(p["id"]),
-                        planned_engine=planned_engine,
-                        override_engine=assignment.get("override_engine"),
-                        model=assignment.get("model"),
-                        effort=assignment.get("effort") or "medium",
-                    )
+                self._upsert_planned_engine(str(p["id"]), p.get("implementer"))
             return {"ok": True, "data": {"saved": True, "planId": plan_id, "projectId": project_id}}
 
         if method == "plan.validate":
@@ -429,18 +433,7 @@ class BridgeAPI:
                         auto_merge=ph.auto_merge, release_after_merge=ph.release_after_merge, force_rerun=ph.force_rerun,
                     )
                     raw_ph = raw_phases[idx] if idx < len(raw_phases) and isinstance(raw_phases[idx], dict) else {}
-                    if raw_ph.get("implementer") is not None:
-                        assignment = self._store.get_phase_assignment(ph.id) or {}
-                        raw_planned = str(raw_ph.get("implementer")).strip()
-                        planned = ENGINE_NAME_TO_ID.get(raw_planned, raw_planned)
-                        planned_engine = None if planned.lower() == "auto" else (planned or assignment.get("planned_engine"))
-                        self._store.upsert_phase_assignment(
-                            ph.id,
-                            planned_engine=planned_engine,
-                            override_engine=assignment.get("override_engine"),
-                            model=assignment.get("model"),
-                            effort=assignment.get("effort") or "medium",
-                        )
+                    self._upsert_planned_engine(ph.id, raw_ph.get("implementer"))
                 if imported.get("ladders"):
                     self._store.set_setting("engines.ladders", json.dumps(imported["ladders"]))
                 return {
@@ -457,10 +450,26 @@ class BridgeAPI:
 
         if method == "plan.exportQueue":
             plan_id = str(payload.get("planId") or "")
-            plans = self._store.list_plans()
-            plan = self._store.get_plan(plan_id) if plan_id else (plans[0] if plans else {"id": "default", "title": "Exported Plan", "project_id": "default"})
-            project = self._store.get_project(plan.get("project_id", "")) or {"repo": "owner/repo", "local_path": "", "output_dir": ""}
-            phases = self._store.list_phases(plan.get("id"))
+            target_project_id = str(payload.get("projectId") or self._active_project_id or "")
+            project_plans = self._store.list_plans(target_project_id) if target_project_id else []
+            plans = project_plans or self._store.list_plans()
+            if plan_id:
+                plan = self._store.get_plan(plan_id) or {
+                    "id": plan_id,
+                    "title": "Exported Plan",
+                    "project_id": target_project_id or "default",
+                }
+            else:
+                plan = plans[0] if plans else {
+                    "id": "default",
+                    "title": "Exported Plan",
+                    "project_id": target_project_id or "default",
+                }
+            project = (
+                self._store.get_project(str(plan.get("project_id") or target_project_id or ""))
+                or {"repo": "owner/repo", "local_path": "", "output_dir": "", "artifact_glob": "*.apk"}
+            )
+            phases = [self._enrich_phase_with_assignment(ph) for ph in self._store.list_phases(plan.get("id"))]
             ladders_raw = self._store.get_setting("engines.ladders")
             ladders = json.loads(ladders_raw) if ladders_raw else {
                 "backend": ["agy", "gemini", "codex", "claude"],
@@ -616,9 +625,7 @@ class BridgeAPI:
                     auto_merge=bool(p.get("auto_merge", True)),
                     release_after_merge=bool(p.get("release_after_merge", False)),
                 )
-                impl = p.get("implementer")
-                if impl and impl != "auto":
-                    self._store.upsert_phase_assignment(pid, planned_engine=str(impl))
+                self._upsert_planned_engine(pid, p.get("implementer"))
             self._events.emit(
                 Event(
                     kind="council.approved",
@@ -710,7 +717,9 @@ class BridgeAPI:
         if method == "runs.openArtifactFolder":
             proj_id = str(payload.get("projectId") or self._active_project_id or "")
             proj = self._store.get_project(proj_id) if proj_id else None
-            folder = (proj.get("output_dir") or proj.get("output_folder")) if proj else str(Path.home() / "NightShiftArtifacts")
+            folder = ((proj.get("output_dir") or proj.get("output_folder")) if proj else "") or str(
+                Path.home() / "NightShiftArtifacts"
+            )
             try:
                 Path(folder).mkdir(parents=True, exist_ok=True)
                 if hasattr(os, "startfile"):
@@ -1002,6 +1011,9 @@ class BridgeAPI:
             if not pid:
                 return {"ok": False, "error": "Project ID required."}
             self._store.delete_project(pid)
+            if self._active_project_id == pid:
+                remaining = self._store.list_projects()
+                self._active_project_id = remaining[0]["id"] if remaining else None
             return {"ok": True, "data": {"deleted": pid}}
 
         if method == "settings.getPriorityList":
@@ -1087,7 +1099,12 @@ class BridgeAPI:
             projects = self._store.list_projects()
             active_project_id = str(payload.get("projectId") or "")
             if not active_project_id and projects:
-                active_project_id = self._active_project_id or projects[0]["id"]
+                valid_active = (
+                    self._active_project_id
+                    if self._active_project_id and any(p["id"] == self._active_project_id for p in projects)
+                    else None
+                )
+                active_project_id = valid_active or projects[0]["id"]
             self._active_project_id = active_project_id or None
             active_project = next((p for p in projects if p["id"] == active_project_id), None)
             checks = self._logins.check_all(repo=active_project["repo"], force=False) if active_project else {}

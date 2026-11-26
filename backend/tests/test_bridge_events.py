@@ -498,3 +498,51 @@ def test_plan_save_without_project_creates_fallback_and_handles_auto_implementer
         assert auto_saved["ok"]
         assert store.get_plan("active_plan")["goal"] == "Ship cleanly"
         assert store.get_phase_assignment("p1")["planned_engine"] is None
+
+
+def test_export_queue_unsaved_plan_and_deleted_active_project_fallback(tmp_path):
+    with Store(tmp_path / "export_and_delete.db") as store:
+        store.migrate()
+        bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+
+        # Exporting an unsaved planId before first save never crashes on NoneType
+        unsaved_export = bridge.call("plan.exportQueue", {"planId": "active_plan"})
+        assert unsaved_export["ok"]
+        assert unsaved_export["data"]["phases"] == []
+
+        store.create_project("p_old", "Old Project", "owner/old", "/old")
+        store.create_plan("plan_old", "p_old", "Old Plan")
+
+        imp_resp = bridge.call(
+            "plan.importQueue",
+            {
+                "queue": {
+                    "repo": "owner/imported-export",
+                    "local_repo": "/local/imported-export",
+                    "artifact_glob": "release/*.aab",
+                    "phases": [
+                        {
+                            "id": "exp1",
+                            "title": "Export Phase",
+                            "branch": "feat/exp1",
+                            "implementer": "Codex CLI",
+                        }
+                    ],
+                }
+            },
+        )
+        assert imp_resp["ok"]
+
+        # Exporting without planId selects the active imported project's plan and preserves implementer
+        active_export = bridge.call("plan.exportQueue")
+        assert active_export["ok"]
+        assert active_export["data"]["repo"] == "owner/imported-export"
+        assert active_export["data"]["artifact_glob"] == "release/*.aab"
+        assert active_export["data"]["phases"][0]["implementer"] == "codex"
+
+        # Deleting the active imported project falls back cleanly to the remaining project in app.snapshot
+        assert bridge.call("settings.deleteProject", {"id": "owner/imported-export"})["ok"]
+        snap = bridge.call("app.snapshot")
+        assert snap["ok"]
+        assert snap["data"]["activeProjectId"] == "p_old"
+

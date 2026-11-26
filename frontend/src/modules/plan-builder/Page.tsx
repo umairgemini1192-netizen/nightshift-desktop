@@ -158,10 +158,22 @@ export default function PlanBuilderPage() {
         });
         return;
       }
-      const runPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
-      await bridge.call("plan.save", { plan: runPlan, phases });
-      setPlan(runPlan);
-      await bridge.call("engine.start", { planId: runPlan.id, projectId: runPlan.project_id, phases });
+      const targetPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      const saved = await bridge.call<{ planId?: string; projectId?: string }>("plan.save", {
+        plan: targetPlan,
+        phases,
+      });
+      const resolvedPlan = {
+        ...targetPlan,
+        id: saved?.planId ?? targetPlan.id,
+        project_id: saved?.projectId ?? targetPlan.project_id,
+      };
+      setPlan(resolvedPlan);
+      await bridge.call("engine.start", {
+        planId: resolvedPlan.id,
+        projectId: resolvedPlan.project_id,
+        phases,
+      });
       pushToast({
         title: "Overnight run started",
         description: "Continuous failover orchestrator is active.",
@@ -245,7 +257,7 @@ export default function PlanBuilderPage() {
   const handleExportQueue = async () => {
     try {
       const res = await bridge.call<Record<string, unknown>>("plan.exportQueue", {
-        planId: plan?.id ?? "active_plan",
+        planId: plan?.id,
       });
       setExportJson(JSON.stringify(res, null, 2));
       setShowExportModal(true);
@@ -308,9 +320,16 @@ export default function PlanBuilderPage() {
   const updateBulkImplementer = async (reset: boolean) => {
     const ids = Array.from(selectedPhases);
     try {
-      const savedPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
-      await bridge.call("plan.save", { plan: savedPlan, phases });
-      setPlan(savedPlan);
+      const targetPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      const saved = await bridge.call<{ planId?: string; projectId?: string }>("plan.save", {
+        plan: targetPlan,
+        phases,
+      });
+      setPlan((current) => current ?? {
+        ...targetPlan,
+        id: saved?.planId ?? targetPlan.id,
+        project_id: saved?.projectId ?? targetPlan.project_id,
+      });
       await bridge.call("plan.setImplementer", reset
         ? { phaseIds: ids, reset: true }
         : { phaseIds: ids, engine: bulkEngine, model: bulkModel, effort: bulkEffort });

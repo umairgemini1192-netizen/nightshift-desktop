@@ -377,7 +377,7 @@ export class MockBridge implements Bridge {
         this.emit("app.snapshot", structuredClone(this.snapshot));
         return {
           project: { ...importedProject, artifact_glob: "*.apk" },
-          plan: { id: "plan_imported", title: "Imported Queue Plan", project_id: importedProject.id },
+          plan: { id: `plan_${importedProject.id}`, title: "Imported Queue Plan", project_id: importedProject.id },
           phases: [
             { id: "p1", title: "Imported Phase 1", branch: "feat/p1", depends_on: [], ladder: "backend" },
           ],
@@ -389,6 +389,7 @@ export class MockBridge implements Bridge {
           repo: "owner/nightshift-desktop",
           local_repo: "D:/DevCache/nightshift-desktop",
           desktop_apk_dir: "D:/DevCache/release",
+          artifact_glob: "*.apk",
           auto_merge: true,
           auto_release: false,
           max_ci_retries: 3,

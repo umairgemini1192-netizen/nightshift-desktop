@@ -274,7 +274,7 @@ def export_queue_json(
         else:
             deps = list(raw_deps)
 
-        serialized_phases.append({
+        phase_entry: dict[str, Any] = {
             "id": str(p_dict.get("id", f"p{idx+1}")),
             "title": str(p_dict.get("title", "")),
             "branch": str(p_dict.get("branch", "")),
@@ -286,7 +286,10 @@ def export_queue_json(
             "auto_merge": bool(p_dict.get("auto_merge", True)),
             "release_after_merge": bool(p_dict.get("release_after_merge", False)),
             "force_rerun": bool(p_dict.get("force_rerun", False)),
-        })
+        }
+        if p_dict.get("implementer"):
+            phase_entry["implementer"] = str(p_dict["implementer"])
+        serialized_phases.append(phase_entry)
 
     local_repo = str(project.get("local_path") or project.get("local_repo") or "")
     desktop_apk_dir = str(project.get("output_dir") or project.get("output_folder") or project.get("desktop_apk_dir") or "")
