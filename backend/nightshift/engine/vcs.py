@@ -160,6 +160,28 @@ class SubprocessGitGh:
             if (rc != 0 or out.strip() != branch or rc_root != 0 or Path(root.strip()).resolve() != worktree_dir.resolve()
                     or rc_common != 0 or rc_repo != 0 or Path(common.strip()).resolve() != Path(repo_common.strip()).resolve()):
                 raise RuntimeError(f"Existing worktree does not match branch {branch}: {err}")
+            remote = self.remote_branch_sha(local_repo, branch)
+            if remote and self.local_head_sha(worktree_dir) != remote:
+                def git(*args: str) -> str:
+                    rc_git, output, error, _ = run_subprocess_with_timeout(
+                        ["git", *args], cwd=worktree_dir, timeout_seconds=120,
+                    )
+                    if rc_git != 0:
+                        raise RuntimeError(f"Could not reconcile worktree: {error or output}")
+                    return output.strip()
+
+                # Preserve tracked and untracked work before integrating the remote head.
+                if git("status", "--porcelain"):
+                    git("add", "-A")
+                    git("commit", "-m", "nightshift: checkpoint before resume")
+                git("fetch", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}")
+                git("merge", "--no-edit", f"origin/{branch}")
+                if self.local_head_sha(worktree_dir) != self.remote_branch_sha(local_repo, branch):
+                    if branch.strip().lower() in ("main", "master"):
+                        raise RuntimeError("Cannot push a reconciliation to a protected branch")
+                    git("push", "origin", branch)
+                if self.local_head_sha(worktree_dir) != self.remote_branch_sha(local_repo, branch):
+                    raise RuntimeError("Remote branch changed during worktree reconciliation")
             return worktree_dir
         run_subprocess_with_timeout(["git", "worktree", "prune"], cwd=local_repo, timeout_seconds=60)
 
@@ -488,6 +510,7 @@ class FakeGitGh:
             "mergeStateStatus": "CLEAN",
         }
         self.prs[branch] = pr
+        self.branches[branch] = head_sha
         return pr
 
     def fetch_origin(self, local_repo: Path) -> tuple[int, str, str]:
@@ -503,6 +526,8 @@ class FakeGitGh:
         for branch, wt in self.worktrees.items():
             if str(wt) == str(worktree_dir):
                 return self.branches.get(branch, "sha_local_default")
+        if len(self.prs) == 1:
+            return str(next(iter(self.prs.values())).get("headRefOid") or "")
         return "sha_local_default"
 
     def prepare_worktree(

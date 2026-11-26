@@ -217,6 +217,7 @@ async def test_p1_at_retry_limit_blocks_merge(tmp_path: Path) -> None:
     with Store(tmp_path / "p1.db") as store:
         store.migrate()
         vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=1)
         sched = Scheduler(store, QuotaLedger(store))
         runners = {"agy": FakeRunner.success("agy"), "codex": FakeRunner(name="codex", responses=[RunnerResult(rc=0, stdout="[P1] Broken", stderr="")])}
         result = await CiPipelineManager(vcs, store, sched, runners).watch_and_heal(
@@ -356,3 +357,65 @@ async def test_ci_fix_uses_available_fallback(tmp_path: Path) -> None:
         assert result.last_engine == "gemini"
         assert any("CI failure" in call["prompt"] for call in gemini.calls)
         assert not any("CI failure" in call["prompt"] for call in agy.calls)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, 1])
+async def test_review_fix_obeys_budget_and_cooldown(tmp_path: Path, limit: int) -> None:
+    with Store(tmp_path / "review.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=1)
+        ledger = QuotaLedger(store)
+        ledger.record_quota_error("agy", "", "rate limit")
+        sched = Scheduler(store, ledger, max_run_invocations=limit)
+        agy = FakeRunner.success("agy")
+        gemini = FakeRunner.success("gemini")
+        codex = FakeRunner.success("codex", "[P1] Broken")
+        result = await CiPipelineManager(vcs, store, sched, {"agy": agy, "gemini": gemini, "codex": codex}).watch_and_heal(
+            repo="o/r", local_repo=tmp_path, worktree_dir=tmp_path, phase_id="p1", phase_title="P1",
+            branch="feat/p1", pr_number=1, initial_engine="agy", risk=RiskAssessment(level="low"), max_retries=1,
+        )
+        assert not agy.calls
+        assert len(gemini.calls) == limit
+        assert sched.total_invocations_count == limit
+        if not limit:
+            assert "max AI invocations" in result.detail
+        else:
+            assert ledger.check_budget_cap("gemini", {"max_runs_today": 1}) is False
+
+
+def test_resume_reconciles_remote_and_preserves_dirty_work(tmp_path: Path) -> None:
+    import subprocess
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    def git(cwd: Path, *args: str) -> str:
+        return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "test@example.invalid")
+    git(repo, "config", "user.name", "Test")
+    git(repo, "remote", "add", "origin", str(remote))
+    (repo / "base.txt").write_text("base")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "base")
+    git(repo, "push", "origin", "main")
+    git(repo, "checkout", "-b", "feat/test")
+    git(repo, "push", "origin", "feat/test")
+    git(repo, "checkout", "main")
+    worktree = tmp_path / "worktree"
+    vcs = SubprocessGitGh()
+    vcs.prepare_worktree(repo, worktree, "feat/test")
+    (worktree / "unfinished.txt").write_text("unfinished")
+    git(repo, "checkout", "--detach", "origin/feat/test")
+    (repo / "remote.txt").write_text("remote")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "remote update")
+    git(repo, "push", "origin", "HEAD:feat/test")
+    vcs.prepare_worktree(repo, worktree, "feat/test")
+    assert (worktree / "unfinished.txt").read_text() == "unfinished"
+    assert (worktree / "remote.txt").read_text() == "remote"
+    assert vcs.local_head_sha(worktree) == vcs.remote_branch_sha(repo, "feat/test")

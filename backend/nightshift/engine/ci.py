@@ -106,6 +106,8 @@ class CiPipelineManager:
             # Bind the check and review to a stable PR head.
             snapshot = self.vcs.find_open_pr(repo, branch)
             checked_sha = str(snapshot.get("headRefOid") or "") if snapshot else ""
+            if not checked_sha or self.vcs.local_head_sha(worktree_dir) != checked_sha:
+                return CiWatchResult(passed=False, detail="Local checkout does not match the PR head.", last_engine=active_engine)
             passed, ci_msg = self.vcs.watch_pr_checks(repo, pr_number, worktree_dir)
 
             # 1. Flaky test detector: if failed, re-run checks once before burning a fix round
@@ -152,8 +154,19 @@ class CiPipelineManager:
                         prompt_path = worktree_dir / ".nightshift_prompt.md"
                         prompt_path.write_text(fix_review_prompt, encoding="utf-8")
 
-                        runner_obj = self.runners.get(active_engine) or list(self.runners.values())[0]
-                        await runner_obj.run(fix_review_prompt, worktree_dir, effort="medium", timeout_seconds=1800)
+                        if not self.scheduler.has_run_budget_remaining():
+                            return CiWatchResult(passed=False, rounds_used=round_num, detail="Runaway protection: max AI invocations per run reached during review fix.", last_engine=active_engine, review_findings=review_findings)
+                        choice = self.scheduler.select_engine(phase_id=phase_id, step_kind="fix_ci", current_engine=active_engine)
+                        if not choice:
+                            return CiWatchResult(passed=False, rounds_used=round_num, detail="No engine available for review fix.", last_engine=active_engine, review_findings=review_findings)
+                        active_engine = choice.engine
+                        runner_obj = self.runners.get(active_engine) or self.runners.get(active_engine.split("-")[0])
+                        if not runner_obj:
+                            return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected review fixer {active_engine} is unavailable.", last_engine=active_engine, review_findings=review_findings)
+                        self.scheduler.record_invocation()
+                        self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
+                        timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
+                        await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
                         # Re-verify CI after review fix
                         continue
 
