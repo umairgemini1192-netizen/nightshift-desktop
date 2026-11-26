@@ -6,20 +6,20 @@ orbs:
 workflows:
   desktop-ci:
     jobs:
-      - gates
-      - backend
-      - frontend
-      - package:
+      - desktop-gates
+      - desktop-backend
+      - desktop-frontend
+      - desktop-package:
           requires:
-            - gates
-            - backend
-            - frontend
+            - desktop-gates
+            - desktop-backend
+            - desktop-frontend
           filters:
             branches:
               only: main
 
 jobs:
-  gates:
+  desktop-gates:
     docker:
       - image: cimg/python:3.12
     resource_class: small
@@ -31,7 +31,7 @@ jobs:
             python3 scripts/check_tokens.py
             python3 scripts/check_ui_rules.py
 
-  backend:
+  desktop-backend:
     docker:
       - image: cimg/python:3.12
     resource_class: small
@@ -47,7 +47,7 @@ jobs:
               echo "backend/pyproject.toml not present; skipping."
             fi
 
-  frontend:
+  desktop-frontend:
     docker:
       - image: cimg/node:22-browsers
     resource_class: medium
@@ -82,7 +82,7 @@ jobs:
           destination: ui-screenshots
           when: always
 
-  package:
+  desktop-package:
     executor:
       name: win/default
     steps:
