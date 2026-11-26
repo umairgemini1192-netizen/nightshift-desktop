@@ -257,6 +257,21 @@ def test_single_instance_lock(tmp_path: Path) -> None:
     lock2.release()
 
 
+def test_imported_project_lock_uses_safe_distinct_filename(tmp_path: Path) -> None:
+    from nightshift.engine.planner import import_queue_json
+
+    project_id = import_queue_json({'repo': 'owner/repo'})['project']['id']
+    lock = SingleInstanceLock(project_id, lock_dir=tmp_path)
+    same = SingleInstanceLock(project_id, lock_dir=tmp_path)
+    other = SingleInstanceLock('owner_repo', lock_dir=tmp_path)
+    assert lock.lock_file.parent == tmp_path
+    assert lock.lock_file == same.lock_file
+    assert lock.lock_file != other.lock_file
+    assert lock.acquire()
+    assert lock.lock_file.exists()
+    lock.release()
+
+
 @pytest.mark.asyncio
 async def test_handoff_uses_selected_fallback_on_next_attempt(tmp_path: Path) -> None:
     with Store(tmp_path / "handoff.db") as store:

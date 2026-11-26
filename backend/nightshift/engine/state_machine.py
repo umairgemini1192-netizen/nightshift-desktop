@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import hashlib
 import json
 import logging
 import os
@@ -99,7 +100,9 @@ class SingleInstanceLock:
         self.project_id = project_id
         base_dir = lock_dir or (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "NightShift" / "locks")
         base_dir.mkdir(parents=True, exist_ok=True)
-        self.lock_file = base_dir / f"{project_id}.lock"
+        # Project IDs can contain repo separators or other filesystem metacharacters.
+        lock_key = hashlib.sha256(project_id.encode("utf-8")).hexdigest()
+        self.lock_file = base_dir / f"{lock_key}.lock"
         self._acquired = False
 
     def acquire(self) -> bool:
