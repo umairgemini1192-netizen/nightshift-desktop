@@ -362,14 +362,11 @@ export class MockBridge implements Bridge {
 
       case "plan.importQueue":
         return {
-          ok: true,
-          data: {
-            project: { id: "imported", repo: "owner/imported-repo" },
-            plan: { id: "plan_imported", title: "Imported Queue Plan" },
-            phases: [
-              { id: "p1", title: "Imported Phase 1", branch: "feat/p1", depends_on: [], ladder: "backend" },
-            ],
-          },
+          project: { id: "owner/imported-repo", repo: "owner/imported-repo", artifact_glob: "*.apk" },
+          plan: { id: "plan_imported", title: "Imported Queue Plan", project_id: "owner/imported-repo" },
+          phases: [
+            { id: "p1", title: "Imported Phase 1", branch: "feat/p1", depends_on: [], ladder: "backend" },
+          ],
         } as T;
 
       case "plan.exportQueue":

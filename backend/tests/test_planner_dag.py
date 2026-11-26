@@ -173,6 +173,7 @@ def test_queue_json_import_export_round_trip() -> None:
     assert exported["repo"] == legacy_payload["repo"]
     assert exported["local_repo"] == legacy_payload["local_repo"]
     assert exported["desktop_apk_dir"] == legacy_payload["desktop_apk_dir"]
+    assert exported["artifact_glob"] == "*.apk"
     assert exported["auto_merge"] == legacy_payload["auto_merge"]
     assert exported["auto_release"] == legacy_payload["auto_release"]
     assert exported["max_ci_retries"] == legacy_payload["max_ci_retries"]

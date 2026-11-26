@@ -335,14 +335,19 @@ class BridgeAPI:
             if not queue_payload:
                 return {"ok": False, "error": "No queue data provided to import."}
             try:
-                imported = import_queue_json(queue_payload)
+                raw_cfg = (
+                    json.loads(queue_payload.strip().lstrip("\ufeff"))
+                    if isinstance(queue_payload, str)
+                    else dict(queue_payload)
+                )
+                imported = import_queue_json(raw_cfg)
                 for ph in imported["phases"]:
                     existing = self._store.get_phase(ph.id)
                     if existing and existing["plan_id"] != imported["plan"]["id"]:
                         return {"ok": False, "error": f"Phase ID {ph.id} belongs to another plan."}
                 proj = imported["project"]
                 if not self._store.get_project(proj["id"]):
-                    self._store.create_project(
+                    proj = self._store.create_project(
                         proj["id"],
                         proj["name"],
                         proj["repo"],
@@ -352,12 +357,21 @@ class BridgeAPI:
                         output_dir=proj.get("output_dir", ""),
                     )
                 else:
-                    self._store.update_project(
-                        proj["id"],
-                        local_path=proj["local_path"],
-                        build_rules=proj.get("build_rules", ""),
-                        artifact_glob=proj.get("artifact_glob", "*.apk"),
-                        output_dir=proj.get("output_dir", ""),
+                    updates: dict[str, Any] = {}
+                    if "name" in raw_cfg:
+                        updates["name"] = proj["name"]
+                    if "local_repo" in raw_cfg:
+                        updates["local_path"] = proj["local_path"]
+                    if "build_rules" in raw_cfg:
+                        updates["build_rules"] = proj.get("build_rules", "")
+                    if "artifact_glob" in raw_cfg:
+                        updates["artifact_glob"] = proj.get("artifact_glob", "*.apk")
+                    if "desktop_apk_dir" in raw_cfg:
+                        updates["output_dir"] = proj.get("output_dir", "")
+                    proj = (
+                        self._store.update_project(proj["id"], **updates)
+                        if updates
+                        else (self._store.get_project(proj["id"]) or proj)
                     )
                 plan = imported["plan"]
                 self._store.create_plan(plan["id"], proj["id"], plan["title"], plan.get("goal", ""))

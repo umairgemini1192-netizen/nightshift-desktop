@@ -71,6 +71,7 @@ export default function PlanBuilderPage() {
       setPlan(res?.plan ?? null);
       const loaded = (res?.phases ?? []).map((phase) => ({
         ...phase,
+        prompt: phase.prompt ?? "",
         depends_on: phase.depends_on ?? JSON.parse((phase as PlanPhase & { depends_on_json?: string }).depends_on_json ?? "[]"),
         auto_merge: Boolean(phase.auto_merge),
         release_after_merge: Boolean(phase.release_after_merge),
@@ -202,7 +203,17 @@ export default function PlanBuilderPage() {
       );
       if (res?.phases) {
         setPlan(res.plan);
-        setPhases(res.phases.map((phase) => ({ ...phase, auto_merge: Boolean(phase.auto_merge), release_after_merge: Boolean(phase.release_after_merge), force_rerun: Boolean(phase.force_rerun) })));
+        setPhases(
+          res.phases.map((phase) => ({
+            ...phase,
+            prompt: phase.prompt ?? "",
+            depends_on: phase.depends_on ?? [],
+            timeout_minutes: phase.timeout_minutes ?? 90,
+            auto_merge: Boolean(phase.auto_merge),
+            release_after_merge: Boolean(phase.release_after_merge),
+            force_rerun: Boolean(phase.force_rerun),
+          })),
+        );
         if (res.phases.length > 0) {
           setSelectedId(res.phases[0].id);
         }
@@ -648,7 +659,7 @@ export default function PlanBuilderPage() {
                   <CodeEditor
                     id="phase-prompt"
                     label="Implementation prompt (.nightshift_prompt.md)"
-                    value={activePhase.prompt}
+                    value={activePhase.prompt ?? ""}
                     onChange={(val) => updateActivePhase({ prompt: val })}
                     language="prompt"
                     rows={8}

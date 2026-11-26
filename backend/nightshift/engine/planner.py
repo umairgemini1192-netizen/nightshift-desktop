@@ -290,11 +290,13 @@ def export_queue_json(
 
     local_repo = str(project.get("local_path") or project.get("local_repo") or "")
     desktop_apk_dir = str(project.get("output_dir") or project.get("output_folder") or project.get("desktop_apk_dir") or "")
+    artifact_glob = str(project.get("artifact_glob") or "*.apk")
 
     return {
         "repo": str(project.get("repo", "")),
         "local_repo": local_repo,
         "desktop_apk_dir": desktop_apk_dir,
+        "artifact_glob": artifact_glob,
         "auto_merge": bool(st.get("auto_merge", True)),
         "auto_release": bool(st.get("auto_release", True)),
         "max_ci_retries": int(st.get("max_ci_retries", 2)),

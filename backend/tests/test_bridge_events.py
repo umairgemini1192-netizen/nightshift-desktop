@@ -260,6 +260,10 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     reimp_resp = bridge.call("plan.importQueue", {"queue": {**import_payload, "artifact_glob": "dist/*.exe"}})
     assert reimp_resp["ok"]
     assert store.get_project("owner/imported")["artifact_glob"] == "dist/*.exe"
+    minimal_reimp = bridge.call("plan.importQueue", {"queue": {"repo": "owner/imported", "phases": import_payload["phases"]}})
+    assert minimal_reimp["ok"]
+    assert store.get_project("owner/imported")["artifact_glob"] == "dist/*.exe"
+    assert store.get_project("owner/imported")["local_path"] == "/local/imported"
 
     # runs.get
     run_detail = bridge.call("runs.get", {"runId": "plan1"})

@@ -52,6 +52,9 @@ describe("Phase 5 Core Modules UI", () => {
     await waitFor(() => expect(call.mock.calls.filter(([method]) => method === "plan.setImplementer")).toHaveLength(2));
     const secondSave = call.mock.calls.filter(([method]) => method === "plan.save")[1][1] as { phases: { implementer?: string; overrideImplementer?: string }[] };
     expect(secondSave.phases.some((phase) => phase.implementer !== phase.overrideImplementer && phase.overrideImplementer)).toBe(true);
+    await user.click(screen.getByRole("button", { name: /Import queue\.json/i }));
+    await user.click(screen.getByRole("button", { name: /Import plan/i }));
+    expect(await screen.findByText(/Imported Phase 1/i)).toBeInTheDocument();
     call.mockRestore();
   });
 
