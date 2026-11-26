@@ -1,7 +1,7 @@
 import { NavLink, useLocation } from "react-router-dom";
 import { motion, useReducedMotion } from "framer-motion";
 import { Badge, Icon } from "../design";
-import type { ModuleManifest, ModuleSection } from "./moduleTypes";
+import type { ModuleSection, RoutedModuleManifest } from "./moduleTypes";
 import { getModulesBySection, MODULES } from "./registry";
 import { useAppStore } from "./store";
 
@@ -23,7 +23,7 @@ export function Sidebar() {
     ? { duration: 0 }
     : { duration: 0.24, ease: [0.16, 1, 0.3, 1] as const };
 
-  const renderItem = (mod: ModuleManifest) => {
+  const renderItem = (mod: RoutedModuleManifest) => {
     const badge = mod.statusBadge?.(snapshot) ?? null;
     const to = location.search ? `${mod.route}${location.search}` : mod.route;
 

@@ -234,3 +234,62 @@ test("interactive shell: command palette and theme switching", async ({ page }) 
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "Command palette" })).toBeHidden();
 });
+
+test("phone status bridge settings card states and screenshots", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
+
+  for (const scenario of ["idle", "running", "failure"] as const) {
+    await page.goto(`/settings?scenario=${scenario}`, { waitUntil: "networkidle" });
+    await page.locator("main h1").waitFor({ state: "visible" });
+    const card = page.locator("#phone-status-bridge-card");
+    await card.waitFor({ state: "visible" });
+    await card.scrollIntoViewIfNeeded();
+    await card.screenshot({
+      path: path.join(SCREENSHOTS_DIR, `phone-status-card-${scenario}.png`),
+    });
+  }
+
+  // Light theme capture of enabled card
+  await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "light" });
+  await page.goto("/settings?scenario=running", { waitUntil: "networkidle" });
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "light";
+  });
+  const lightCard = page.locator("#phone-status-bridge-card");
+  await lightCard.waitFor({ state: "visible" });
+  await lightCard.scrollIntoViewIfNeeded();
+  await lightCard.screenshot({
+    path: path.join(SCREENSHOTS_DIR, "phone-status-card-running-light.png"),
+  });
+
+  // Validation error and interactive test update from idle state
+  await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
+  await page.goto("/settings?scenario=idle", { waitUntil: "networkidle" });
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "dark";
+  });
+  const interactiveCard = page.locator("#phone-status-bridge-card");
+  await interactiveCard.waitFor({ state: "visible" });
+  await interactiveCard.scrollIntoViewIfNeeded();
+
+  await page.getByLabel(/Apps Script web app URL/i).fill("http://not-https.example/exec");
+  await expect(page.getByText(/Use the https:\/\/ Web app URL/i)).toBeVisible();
+  await interactiveCard.screenshot({
+    path: path.join(SCREENSHOTS_DIR, "phone-status-card-validation-error.png"),
+  });
+
+  await page.getByLabel(/Apps Script web app URL/i).fill("https://script.google.com/macros/s/demo/exec");
+  await page.getByLabel(/Shared secret/i).fill("demo-secret");
+  await page.getByRole("button", { name: /Send test update/i }).click();
+  await expect(page.getByText("ok 05:25")).toBeVisible();
+  await interactiveCard.screenshot({
+    path: path.join(SCREENSHOTS_DIR, "phone-status-card-test-ok.png"),
+  });
+
+  const axeResults = await new AxeBuilder({ page }).include("#phone-status-bridge-card").analyze();
+  const blocking = axeResults.violations.filter(
+    (v) => v.impact === "serious" || v.impact === "critical",
+  );
+  expect(blocking).toEqual([]);
+});

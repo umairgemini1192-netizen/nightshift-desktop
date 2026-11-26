@@ -244,7 +244,7 @@ class CiPipelineManager:
             prompt_file = worktree_dir / ".nightshift_prompt.md"
             prompt_file.write_text(fix_prompt, encoding="utf-8")
 
-            runner = self.runners.get(active_engine)
+            runner = self.runners.get(active_engine) or self.runners.get(active_engine.split("-")[0])
             if not runner:
                 return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected CI fixer {active_engine} is unavailable.", last_engine=active_engine)
 

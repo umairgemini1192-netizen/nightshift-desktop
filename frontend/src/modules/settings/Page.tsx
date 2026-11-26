@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import {
   Badge,
   Button,
@@ -9,11 +9,13 @@ import {
   Icon,
   PageHeader,
   SegmentedControl,
+  Skeleton,
   TextField,
   Toggle,
 } from "../../design";
 import type { ProjectConfigItem } from "../../bridge/types";
 import type { ThemeMode } from "../../design/tokens";
+import { SETTINGS_MODULES } from "../../app/registry";
 import { useAppStore } from "../../app/store";
 
 const THEME_OPTIONS = [
@@ -90,6 +92,15 @@ export default function SettingsPage() {
     maxRunInvocations: 30,
     runnerTimeoutMinutes: 90,
   });
+
+  const moduleSettingsCards = useMemo(
+    () =>
+      SETTINGS_MODULES.map((mod) => ({
+        id: mod.id,
+        Component: lazy(mod.settings),
+      })),
+    [],
+  );
 
   // System automation state
   const [keepAwake, setKeepAwake] = useState(true);
@@ -614,6 +625,20 @@ export default function SettingsPage() {
           />
         </div>
       </GlassCard>
+
+      {/* Module settings sections discovered from registry (BLUEPRINT section 4) */}
+      {moduleSettingsCards.map(({ id, Component }) => (
+        <Suspense
+          key={id}
+          fallback={
+            <GlassCard>
+              <Skeleton lines={2} />
+            </GlassCard>
+          }
+        >
+          <Component />
+        </Suspense>
+      ))}
 
       {/* Automation & System */}
       <GlassCard title="Automation & System" icon="Cpu">

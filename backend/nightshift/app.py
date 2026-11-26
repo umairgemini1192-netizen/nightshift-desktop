@@ -73,7 +73,7 @@ def main() -> None:
         print("Another instance of Night-Shift is already running.")
         return
 
-    store, events, _registry, bridge, engine = create_app_components()
+    store, events, registry, bridge, engine = create_app_components()
     engine_thread = start_engine_thread(engine)
     dist_index = Path(__file__).resolve().parents[2] / "frontend" / "dist" / "index.html"
     url = dist_index.as_uri() if dist_index.exists() else "http://localhost:5173"
@@ -96,6 +96,7 @@ def main() -> None:
     finally:
         if "unsubscribe" in locals():
             unsubscribe()
+        registry.stop_all()
         store.close()
         lock.release()
 
