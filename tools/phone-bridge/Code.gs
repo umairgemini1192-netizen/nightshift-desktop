@@ -234,7 +234,6 @@ function redrawDoc_(props, cards, nowMs) {
   const doc = getOrCreateDoc_(props);
   const body = doc.getBody();
   body.clear();
-  body.setBackgroundColor(TOKENS.bgCanvas);
   body.setMarginTop(24);
   body.setMarginBottom(24);
   body.setMarginLeft(24);
@@ -242,7 +241,7 @@ function redrawDoc_(props, cards, nowMs) {
 
   const title = body.appendParagraph('NIGHT-SHIFT LIVE STATUS');
   title.setHeading(DocumentApp.ParagraphHeading.HEADING2);
-  title.editAsText().setForegroundColor(TOKENS.textMuted).setFontSize(11).setBold(true);
+  title.editAsText().setForegroundColor(TOKENS.bgAbyss).setFontSize(11).setBold(true);
 
   const list = Object.keys(cards).map(function (k) { return cards[k]; });
   const order = { working: 0, attention: 1, good: 2, stopped: 3 };
@@ -255,7 +254,7 @@ function redrawDoc_(props, cards, nowMs) {
 
   if (list.length === 0) {
     const empty = body.appendParagraph('No active Night-Shift projects yet.');
-    empty.editAsText().setForegroundColor(TOKENS.textSecondary).setFontSize(12);
+    empty.editAsText().setForegroundColor(TOKENS.bgAbyss).setFontSize(12);
     doc.saveAndClose();
     return;
   }
