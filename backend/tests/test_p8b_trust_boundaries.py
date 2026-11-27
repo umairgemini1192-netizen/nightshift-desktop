@@ -586,3 +586,82 @@ async def test_state_machine_creates_task_contract_and_blocks_autonomous_merge_b
         assert merged_task is not None
         assert merged_task["status"] == "MERGED"
         assert merged_task["approved_sha"] == "sha_verified_777"
+
+
+def test_parse_name_status_diff_nul_delimited_preserves_literal_filenames() -> None:
+    raw = (
+        "A\0tests/test_é.py\0"
+        "M\0 tests/leading space.py\0"
+        "R100\0tests/old_é.py\0tests/new name\twith_tab.py\0"
+        "C090\0scripts/check_tokens.py\0src/copied é.py\0"
+    )
+    entries = parse_name_status_diff(raw, nul_delimited=True)
+    assert entries == [
+        DiffPathEntry(status="A", path="tests/test_é.py"),
+        DiffPathEntry(status="M", path=" tests/leading space.py"),
+        DiffPathEntry(status="R", old_path="tests/old_é.py", path="tests/new name\twith_tab.py"),
+        DiffPathEntry(status="C", old_path="scripts/check_tokens.py", path="src/copied é.py"),
+    ]
+    assert parse_name_status_diff("", nul_delimited=True) == []
+
+
+def test_subprocess_vcs_preserves_unicode_filenames_for_governance_and_snapshots(tmp_path: Path) -> None:
+    import subprocess
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    repo = tmp_path / "unicode_repo"
+    repo.mkdir()
+
+    def _git(*args: str) -> None:
+        res = subprocess.run(
+            ["git", *args],
+            cwd=str(repo),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=True,
+        )
+        assert res.returncode == 0
+
+    _git("init")
+    _git("config", "user.email", "test@example.com")
+    _git("config", "user.name", "Test User")
+    # Explicitly ensure git's default path quoting is enabled.
+    _git("config", "core.quotepath", "true")
+
+    (repo / "README.md").write_text("init\n", encoding="utf-8")
+    _git("add", "README.md")
+    _git("commit", "-m", "initial")
+
+    tests_dir = repo / "tests"
+    tests_dir.mkdir()
+    unicode_test = tests_dir / "test_é.py"
+    original_src = "def test_unicode():\n    assert 1 == 1\n    assert 2 == 2\n"
+    unicode_test.write_text(original_src, encoding="utf-8")
+    _git("add", "--all")
+    _git("commit", "-m", "add unicode test")
+
+    vcs = SubprocessGitGh()
+    entries = vcs.list_changed_entries(repo, base="HEAD~1")
+    assert entries == [DiffPathEntry(status="A", path="tests/test_é.py")]
+    assert vcs.list_changed_files(repo, base="HEAD~1") == ["tests/test_é.py"]
+    assert is_governance_path(entries[0].path) is True
+
+    added_snaps = vcs.get_test_file_snapshots(repo, entries, base="HEAD~1")
+    assert "tests/test_é.py" in added_snaps
+    assert added_snaps["tests/test_é.py"] == (None, original_src)
+
+    # Relax assertion in the Unicode test file and verify snapshot + relaxation detector catches it.
+    relaxed_src = "def test_unicode():\n    assert 1 == 1\n"
+    unicode_test.write_text(relaxed_src, encoding="utf-8")
+    mod_entries = vcs.list_changed_entries(repo, base="HEAD")
+    assert mod_entries == [DiffPathEntry(status="M", path="tests/test_é.py")]
+    mod_snaps = vcs.get_test_file_snapshots(repo, mod_entries, base="HEAD")
+    assert "tests/test_é.py" in mod_snaps
+    assert mod_snaps["tests/test_é.py"][0] is not None
+    assert "assert 2 == 2" in mod_snaps["tests/test_é.py"][0]
+    assert mod_snaps["tests/test_é.py"][1] == relaxed_src
+
+    findings = detect_assertion_relaxation_for_files(mod_snaps)
+    assert any(f.guard == "assertion_relaxation" for f in findings)
+

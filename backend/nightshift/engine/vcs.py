@@ -389,22 +389,24 @@ class SubprocessGitGh:
 
     def list_changed_files(self, worktree_dir: Path, base: str = "origin/main") -> list[str]:
         rc, out, _, _ = run_subprocess_with_timeout(
-            ["git", "diff", "--name-only", base],
+            ["git", "diff", "--name-only", "-z", base],
             cwd=worktree_dir,
             timeout_seconds=60,
+            strip_output=False,
         )
-        return [l.strip() for l in out.splitlines() if l.strip()] if rc == 0 else []
+        return [p for p in out.split("\0") if p] if rc == 0 else []
 
     def list_changed_entries(self, worktree_dir: Path, base: str = "origin/main") -> list[DiffPathEntry]:
-        """Extract rename/copy/delete-aware diff entries using ``git diff --name-status -M -C``."""
+        """Extract rename/copy/delete-aware diff entries using ``git diff --name-status -M -C -z``."""
         from nightshift.engine.pipeline_contracts import parse_name_status_diff
 
         rc, out, _, _ = run_subprocess_with_timeout(
-            ["git", "diff", "--name-status", "-M", "-C", base],
+            ["git", "diff", "--name-status", "-M", "-C", "-z", base],
             cwd=worktree_dir,
             timeout_seconds=60,
+            strip_output=False,
         )
-        return parse_name_status_diff(out) if rc == 0 else []
+        return parse_name_status_diff(out, nul_delimited=True) if rc == 0 else []
 
     def get_test_file_snapshots(
         self,

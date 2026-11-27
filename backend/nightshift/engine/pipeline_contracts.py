@@ -192,24 +192,52 @@ class DiffPathEntry:
         return [self.path]
 
 
-def parse_name_status_diff(output: str) -> list[DiffPathEntry]:
-    """Parse ``git diff --name-status -M -C`` output preserving both old and new paths."""
+def parse_name_status_diff(output: str, *, nul_delimited: bool | None = None) -> list[DiffPathEntry]:
+    """Parse ``git diff --name-status -M -C [-z]`` output preserving both old and new paths.
+
+    When ``nul_delimited`` is True (or auto-detected from NUL bytes in ``output``),
+    paths are extracted verbatim without stripping or interpreting filename characters.
+    """
+    use_nul = ("\0" in output) if nul_delimited is None else nul_delimited
     entries: list[DiffPathEntry] = []
+    if use_nul:
+        tokens = output.split("\0")
+        if tokens and tokens[-1] == "":
+            tokens.pop()
+        idx = 0
+        total = len(tokens)
+        while idx < total:
+            code = tokens[idx]
+            if not code:
+                idx += 1
+                continue
+            kind = code[0].upper()
+            if kind in ("R", "C"):
+                if idx + 2 >= total:
+                    break
+                entries.append(DiffPathEntry(status=kind, old_path=tokens[idx + 1], path=tokens[idx + 2]))
+                idx += 3
+            else:
+                if idx + 1 >= total:
+                    break
+                entries.append(DiffPathEntry(status=kind, path=tokens[idx + 1]))
+                idx += 2
+        return entries
+
     for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if not line:
+        if not raw_line or not raw_line.strip():
             continue
-        parts = line.split("\t")
+        parts = raw_line.split("\t")
         if len(parts) < 2:
-            parts = line.split()
+            parts = raw_line.split()
         if len(parts) < 2:
             continue
         code = parts[0].strip()
         kind = code[0].upper()
         if kind in ("R", "C") and len(parts) >= 3:
-            entries.append(DiffPathEntry(status=kind, old_path=parts[1].strip(), path=parts[2].strip()))
+            entries.append(DiffPathEntry(status=kind, old_path=parts[1], path=parts[2]))
         else:
-            entries.append(DiffPathEntry(status=kind, path=parts[1].strip()))
+            entries.append(DiffPathEntry(status=kind, path=parts[1]))
     return entries
 
 

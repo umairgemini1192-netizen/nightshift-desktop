@@ -214,6 +214,7 @@ def run_subprocess_with_timeout(
     *,
     scrub_env: bool = False,
     max_output_bytes: int = MAX_RUNNER_OUTPUT_BYTES,
+    strip_output: bool = True,
 ) -> tuple[int, str, str, bool]:
     """Execute command with strict timeout, optional env scrubbing, and process-tree termination.
 
@@ -239,19 +240,19 @@ def run_subprocess_with_timeout(
         if env:
             exec_env.update(env)
 
+    popen_kwargs: dict[str, object] = {
+        "cwd": str(cwd) if cwd else None,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "shell": False,
+        "env": exec_env,
+        "creationflags": NO_WINDOW,
+    }
+    if strip_output:
+        popen_kwargs.update({"text": True, "encoding": "utf-8", "errors": "replace"})
+
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(cwd) if cwd else None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            shell=False,
-            env=exec_env,
-            creationflags=NO_WINDOW,
-        )
+        proc = subprocess.Popen(cmd, **popen_kwargs)  # type: ignore[arg-type]
     except Exception as e:
         return 1, "", str(e), False
 
@@ -259,10 +260,16 @@ def run_subprocess_with_timeout(
 
     try:
         out, err = proc.communicate(timeout=timeout_seconds)
+        if strip_output:
+            raw_out = (out or "").strip()
+            raw_err = (err or "").strip()
+        else:
+            raw_out = (out or b"").decode("utf-8", errors="replace") if isinstance(out, bytes) else (out or "")
+            raw_err = (err or b"").decode("utf-8", errors="replace") if isinstance(err, bytes) else (err or "")
         return (
             proc.returncode,
-            _truncate_output((out or "").strip(), max_output_bytes),
-            _truncate_output((err or "").strip(), max_output_bytes),
+            _truncate_output(raw_out, max_output_bytes),
+            _truncate_output(raw_err, max_output_bytes),
             False,
         )
     except subprocess.TimeoutExpired:
@@ -280,6 +287,8 @@ def run_subprocess_with_timeout(
             out, err = proc.communicate(timeout=10)
         except Exception:
             out, err = "", ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
         return 124, (out or "").strip()[-2000:], f"Command timed out after {timeout_seconds}s", True
     except Exception as e:
         return 1, "", str(e), False
