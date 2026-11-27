@@ -1603,6 +1603,62 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def list_tasks(
+        self,
+        *,
+        status: str | None = None,
+        plan_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if plan_id is not None:
+            clauses.append("plan_id = ?")
+            params.append(plan_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM tasks {where} ORDER BY created_at ASC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_task_transitions(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM task_transitions WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_remote_operation(self, idempotency_key: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM remote_operations WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_remote_operations(
+        self,
+        *,
+        task_id: str | None = None,
+        op_kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if op_kind is not None:
+            clauses.append("op_kind = ?")
+            params.append(op_kind)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM remote_operations {where} ORDER BY id ASC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def get_task_contract(self, contract_id: str) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM task_contracts WHERE id = ?", (contract_id,)).fetchone()
         return dict(row) if row is not None else None
@@ -1791,13 +1847,20 @@ class Store:
             "status",
             "blocked_from_status",
             "risk_class",
+            "active_attempt_id",
             "pr_number",
             "head_sha",
             "expected_base_sha",
+            "ci_run_id",
             "review_sha",
             "approved_sha",
             "merge_sha",
             "merged_at",
+            "release_tag",
+            "smoke_verified_at",
+            "attempt_count",
+            "ci_fix_rounds",
+            "review_fix_rounds",
             "block_reason",
             "block_detail",
             "next_step",
@@ -1867,6 +1930,24 @@ class Store:
             "SELECT * FROM evidence_records WHERE task_id = ? ORDER BY id ASC",
             (task_id,),
         ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_evidence_records(
+        self,
+        task_id: str,
+        *,
+        commit_sha: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if commit_sha is not None:
+            rows = self._conn.execute(
+                "SELECT * FROM evidence_records WHERE task_id = ? AND commit_sha = ? ORDER BY id ASC",
+                (task_id, commit_sha),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM evidence_records WHERE task_id = ? ORDER BY id ASC",
+                (task_id,),
+            ).fetchall()
         return [dict(r) for r in rows]
 
 
