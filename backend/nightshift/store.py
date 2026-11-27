@@ -333,11 +333,222 @@ def _migration_004_token_optimizer_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_005_agent_pipeline(conn: sqlite3.Connection) -> None:
+    """Create tables and immutability triggers for the role-based agent pipeline (AGENT_PIPELINE §5)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            phase_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            branch TEXT NOT NULL UNIQUE,
+            risk_class TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'QUEUED',
+            blocked_from_status TEXT NOT NULL DEFAULT '',
+            contract_id TEXT NOT NULL,
+            contract_sha256 TEXT NOT NULL,
+            active_attempt_id INTEGER,
+            pr_number INTEGER,
+            head_sha TEXT,
+            expected_base_sha TEXT,
+            ci_run_id TEXT,
+            review_sha TEXT,
+            approved_sha TEXT,
+            merge_sha TEXT,
+            merged_at TEXT,
+            release_tag TEXT,
+            smoke_verified_at TEXT,
+            contributing_providers_json TEXT NOT NULL DEFAULT '[]',
+            owner_override_engine TEXT,
+            owner_approved_by TEXT,
+            owner_approved_sha TEXT,
+            owner_approved_at TEXT,
+            assertion_waiver_sha TEXT,
+            assertion_waiver_reason TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            ci_fix_rounds INTEGER NOT NULL DEFAULT 0,
+            review_fix_rounds INTEGER NOT NULL DEFAULT 0,
+            block_reason TEXT NOT NULL DEFAULT '',
+            block_detail TEXT NOT NULL DEFAULT '',
+            next_step TEXT NOT NULL DEFAULT '',
+            failure_reason TEXT NOT NULL DEFAULT '',
+            worker_pid INTEGER,
+            lease_token TEXT,
+            lease_expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT,
+            FOREIGN KEY (phase_id) REFERENCES phases(id) ON DELETE CASCADE,
+            FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS task_contracts (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            risk_class TEXT NOT NULL,
+            risk_factors_json TEXT NOT NULL,
+            acceptance_criteria_json TEXT NOT NULL,
+            allowed_globs_json TEXT NOT NULL,
+            forbidden_globs_json TEXT NOT NULL,
+            budget_json TEXT NOT NULL,
+            owner_approval_required INTEGER NOT NULL DEFAULT 0,
+            canonical_json TEXT NOT NULL,
+            contract_sha256 TEXT NOT NULL,
+            frozen_at TEXT NOT NULL,
+            UNIQUE (task_id, version),
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_task_contracts_no_update
+        BEFORE UPDATE ON task_contracts
+        BEGIN
+            SELECT RAISE(ABORT, 'task_contracts rows are immutable; insert a new version instead');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_task_contracts_no_delete
+        BEFORE DELETE ON task_contracts
+        BEGIN
+            SELECT RAISE(ABORT, 'task_contracts rows are append-only and cannot be deleted');
+        END;
+
+        CREATE TABLE IF NOT EXISTS task_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            role TEXT NOT NULL,
+            engine_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            input_ref TEXT NOT NULL,
+            output_ref TEXT NOT NULL,
+            decision_reason TEXT NOT NULL DEFAULT '',
+            head_sha_before TEXT,
+            head_sha_after TEXT,
+            rc INTEGER,
+            outcome TEXT NOT NULL,
+            wall_seconds REAL NOT NULL DEFAULT 0.0,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS task_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            reason TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS remote_operations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            op_kind TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            lease_token TEXT NOT NULL,
+            target_ref TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS pipeline_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            attempt_id INTEGER,
+            role TEXT NOT NULL,
+            engine_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            risk_class TEXT NOT NULL,
+            tokens_in INTEGER NOT NULL DEFAULT 0,
+            tokens_out INTEGER NOT NULL DEFAULT 0,
+            est_token_cost_usd REAL NOT NULL DEFAULT 0.0,
+            ci_minutes REAL NOT NULL DEFAULT 0.0,
+            artifact_mb REAL NOT NULL DEFAULT 0.0,
+            wall_seconds REAL NOT NULL DEFAULT 0.0,
+            outcome TEXT NOT NULL,
+            is_estimate INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (attempt_id) REFERENCES task_attempts(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS model_scores (
+            engine_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            role TEXT NOT NULL,
+            risk_class TEXT NOT NULL,
+            sample_tasks INTEGER NOT NULL DEFAULT 0,
+            accepted_tasks INTEGER NOT NULL DEFAULT 0,
+            total_attempts INTEGER NOT NULL DEFAULT 0,
+            regression_count INTEGER NOT NULL DEFAULT 0,
+            avg_retries REAL NOT NULL DEFAULT 0.0,
+            avg_turnaround_min REAL NOT NULL DEFAULT 0.0,
+            total_cost_usd_est REAL NOT NULL DEFAULT 0.0,
+            cost_per_accepted_usd_est REAL NOT NULL DEFAULT 0.0,
+            benchmark_graduated INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (engine_id, model, role, risk_class)
+        );
+
+        CREATE TABLE IF NOT EXISTS evidence_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            contract_sha256 TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            build_id TEXT NOT NULL DEFAULT '',
+            duration_seconds REAL NOT NULL DEFAULT 0.0,
+            artifact_paths_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            verified INTEGER NOT NULL DEFAULT 0,
+            rejection_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS release_verifications (
+            tag TEXT PRIMARY KEY,
+            task_id TEXT,
+            repo TEXT NOT NULL,
+            merge_sha TEXT NOT NULL,
+            previous_good_tag TEXT,
+            artifact_sha256 TEXT NOT NULL,
+            smoke_command TEXT NOT NULL,
+            smoke_status TEXT NOT NULL,
+            smoke_detail TEXT NOT NULL DEFAULT '',
+            verified_at TEXT,
+            rolled_back_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_phase_id ON tasks(phase_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_task_contracts_task ON task_contracts(task_id, version);
+        CREATE INDEX IF NOT EXISTS idx_task_attempts_task ON task_attempts(task_id, id);
+        CREATE INDEX IF NOT EXISTS idx_task_transitions_task ON task_transitions(task_id, id);
+        CREATE INDEX IF NOT EXISTS idx_remote_ops_task ON remote_operations(task_id, op_kind);
+        CREATE INDEX IF NOT EXISTS idx_pipeline_ledger_task ON pipeline_ledger(task_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_evidence_records_task ON evidence_records(task_id, commit_sha);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
     (3, "003_nullable_router_step", _migration_003_nullable_router_step),
     (4, "004_token_optimizer_tables", _migration_004_token_optimizer_tables),
+    (5, "005_agent_pipeline", _migration_005_agent_pipeline),
 ]
 
 
@@ -1237,4 +1448,623 @@ class Store:
             params,
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Agent Pipeline persistence (migration 005_agent_pipeline)
+    # ------------------------------------------------------------------
+
+    def create_task_with_contract(
+        self,
+        *,
+        task_id: str,
+        phase_id: str,
+        plan_id: str,
+        title: str,
+        branch: str,
+        risk_class: str,
+        risk_factors: dict[str, Any],
+        acceptance_criteria: list[dict[str, Any]],
+        allowed_globs: list[str],
+        forbidden_globs: list[str],
+        budget: dict[str, Any],
+        owner_approval_required: bool = False,
+        owner_override_engine: str | None = None,
+        contract_id: str | None = None,
+        frozen_at: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Atomically create a task in QUEUED state and freeze version 1 of its contract."""
+        from nightshift.engine.pipeline_contracts import canonical_contract_json, compute_contract_sha256
+
+        now = frozen_at or _utc_now()
+        cid = contract_id or f"{task_id}-v1"
+        payload = {
+            "task_id": task_id,
+            "version": 1,
+            "phase_id": phase_id,
+            "title": title,
+            "risk_class": risk_class,
+            "risk_factors": risk_factors,
+            "acceptance_criteria": acceptance_criteria,
+            "allowed_globs": allowed_globs,
+            "forbidden_globs": forbidden_globs,
+            "budget": budget,
+            "owner_approval_required": bool(owner_approval_required),
+            "frozen_at": now,
+        }
+        canonical = canonical_contract_json(payload)
+        digest = compute_contract_sha256(canonical)
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, phase_id, plan_id, title, branch, risk_class, status,
+                    contract_id, contract_sha256, owner_override_engine,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    phase_id,
+                    plan_id,
+                    title,
+                    branch,
+                    risk_class,
+                    cid,
+                    digest,
+                    owner_override_engine,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO task_contracts (
+                    id, task_id, version, risk_class, risk_factors_json,
+                    acceptance_criteria_json, allowed_globs_json, forbidden_globs_json,
+                    budget_json, owner_approval_required, canonical_json, contract_sha256, frozen_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cid,
+                    task_id,
+                    risk_class,
+                    json.dumps(risk_factors, sort_keys=True),
+                    json.dumps(acceptance_criteria, sort_keys=True),
+                    json.dumps(allowed_globs),
+                    json.dumps(forbidden_globs),
+                    json.dumps(budget, sort_keys=True),
+                    1 if owner_approval_required else 0,
+                    canonical,
+                    digest,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+        task = self.get_task(task_id)
+        contract = self.get_task_contract(cid)
+        assert task is not None and contract is not None
+        return task, contract
+
+    def revise_task_contract(
+        self,
+        *,
+        task_id: str,
+        risk_class: str,
+        risk_factors: dict[str, Any],
+        acceptance_criteria: list[dict[str, Any]],
+        allowed_globs: list[str],
+        forbidden_globs: list[str],
+        budget: dict[str, Any],
+        owner_approval_required: bool = False,
+        actor: str = "owner",
+        reason: str = "Contract revised",
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Append version + 1 to task_contracts and invalidate prior evidence, review, and approvals."""
+        from nightshift.engine.pipeline_contracts import canonical_contract_json, compute_contract_sha256
+
+        now = _utc_now()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            task_row = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if task_row is None:
+                raise KeyError(f"Unknown task: {task_id}")
+            ver_row = self._conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM task_contracts WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            next_version = int(ver_row["v"]) + 1
+            cid = f"{task_id}-v{next_version}"
+            payload = {
+                "task_id": task_id,
+                "version": next_version,
+                "phase_id": str(task_row["phase_id"]),
+                "title": str(task_row["title"]),
+                "risk_class": risk_class,
+                "risk_factors": risk_factors,
+                "acceptance_criteria": acceptance_criteria,
+                "allowed_globs": allowed_globs,
+                "forbidden_globs": forbidden_globs,
+                "budget": budget,
+                "owner_approval_required": bool(owner_approval_required),
+                "frozen_at": now,
+            }
+            canonical = canonical_contract_json(payload)
+            digest = compute_contract_sha256(canonical)
+            self._conn.execute(
+                """
+                INSERT INTO task_contracts (
+                    id, task_id, version, risk_class, risk_factors_json,
+                    acceptance_criteria_json, allowed_globs_json, forbidden_globs_json,
+                    budget_json, owner_approval_required, canonical_json, contract_sha256, frozen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    cid,
+                    task_id,
+                    next_version,
+                    risk_class,
+                    json.dumps(risk_factors, sort_keys=True),
+                    json.dumps(acceptance_criteria, sort_keys=True),
+                    json.dumps(allowed_globs),
+                    json.dumps(forbidden_globs),
+                    json.dumps(budget, sort_keys=True),
+                    1 if owner_approval_required else 0,
+                    canonical,
+                    digest,
+                    now,
+                ),
+            )
+            # Invalidate prior evidence records, review_sha, approved_sha, and owner approvals
+            self._conn.execute(
+                """
+                UPDATE evidence_records
+                SET verified = 0, rejection_reason = 'invalidated_by_contract_revision'
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+            prev_status = str(task_row["status"])
+            self._conn.execute(
+                """
+                UPDATE tasks SET
+                    risk_class = ?,
+                    contract_id = ?,
+                    contract_sha256 = ?,
+                    status = 'QUEUED',
+                    blocked_from_status = '',
+                    block_reason = '',
+                    block_detail = '',
+                    next_step = '',
+                    review_sha = NULL,
+                    approved_sha = NULL,
+                    owner_approved_by = NULL,
+                    owner_approved_sha = NULL,
+                    owner_approved_at = NULL,
+                    assertion_waiver_sha = NULL,
+                    assertion_waiver_reason = '',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (risk_class, cid, digest, now, task_id),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO task_transitions (
+                    task_id, from_status, to_status, idempotency_key, reason, actor, created_at
+                ) VALUES (?, ?, 'QUEUED', ?, ?, ?, ?)
+                """,
+                (task_id, prev_status, f"contract-rev:{task_id}:v{next_version}", reason, actor, now),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+        task = self.get_task(task_id)
+        contract = self.get_task_contract(cid)
+        assert task is not None and contract is not None
+        return task, contract
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_tasks(self, *, plan_id: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if plan_id:
+            clauses.append("plan_id = ?")
+            params.append(plan_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(f"SELECT * FROM tasks {where} ORDER BY created_at DESC", params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_task_contract(self, contract_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM task_contracts WHERE id = ?", (contract_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_task_contracts(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM task_contracts WHERE task_id = ? ORDER BY version ASC",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_task_fields(self, task_id: str, **fields: Any) -> dict[str, Any]:
+        if not fields:
+            task = self.get_task(task_id)
+            if task is None:
+                raise KeyError(f"Unknown task: {task_id}")
+            return task
+        fields["updated_at"] = _utc_now()
+        assignments = ", ".join(f"{k} = ?" for k in fields)
+        params = list(fields.values()) + [task_id]
+        with self._conn:
+            self._conn.execute(f"UPDATE tasks SET {assignments} WHERE id = ?", params)
+        task = self.get_task(task_id)
+        assert task is not None
+        return task
+
+    def record_task_attempt(
+        self,
+        *,
+        task_id: str,
+        stage: str,
+        role: str,
+        engine_id: str,
+        provider: str,
+        model: str = "",
+        input_ref: str = "",
+        output_ref: str = "",
+        decision_reason: str = "",
+        head_sha_before: str | None = None,
+        head_sha_after: str | None = None,
+        rc: int | None = None,
+        outcome: str = "ok",
+        wall_seconds: float = 0.0,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+    ) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO task_attempts (
+                    task_id, stage, role, engine_id, provider, model,
+                    input_ref, output_ref, decision_reason,
+                    head_sha_before, head_sha_after, rc, outcome,
+                    wall_seconds, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    stage,
+                    role,
+                    engine_id,
+                    provider,
+                    model,
+                    input_ref,
+                    output_ref,
+                    decision_reason,
+                    head_sha_before,
+                    head_sha_after,
+                    rc,
+                    outcome,
+                    float(wall_seconds),
+                    started_at or now,
+                    finished_at or now,
+                ),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_task_attempts(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM task_attempts WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def list_task_transitions(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM task_transitions WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_evidence(
+        self,
+        *,
+        task_id: str,
+        contract_sha256: str,
+        commit_sha: str,
+        kind: str,
+        source: str,
+        build_id: str = "",
+        duration_seconds: float = 0.0,
+        artifact_paths: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        verified: bool = False,
+        rejection_reason: str = "",
+    ) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO evidence_records (
+                    task_id, contract_sha256, commit_sha, kind, source, build_id,
+                    duration_seconds, artifact_paths_json, metadata_json,
+                    verified, rejection_reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    contract_sha256,
+                    commit_sha,
+                    kind,
+                    source,
+                    build_id,
+                    float(duration_seconds),
+                    json.dumps(artifact_paths or []),
+                    json.dumps(metadata or {}, sort_keys=True),
+                    1 if verified else 0,
+                    rejection_reason,
+                    now,
+                ),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_evidence_records(
+        self,
+        task_id: str,
+        *,
+        commit_sha: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses = ["task_id = ?"]
+        params: list[Any] = [task_id]
+        if commit_sha:
+            clauses.append("commit_sha = ?")
+            params.append(commit_sha)
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        rows = self._conn.execute(
+            f"SELECT * FROM evidence_records WHERE {' AND '.join(clauses)} ORDER BY id ASC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_pipeline_ledger(
+        self,
+        *,
+        task_id: str,
+        role: str,
+        engine_id: str,
+        provider: str,
+        model: str,
+        risk_class: str,
+        outcome: str,
+        attempt_id: int | None = None,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        est_token_cost_usd: float = 0.0,
+        ci_minutes: float = 0.0,
+        artifact_mb: float = 0.0,
+        wall_seconds: float = 0.0,
+        is_estimate: bool = True,
+        created_at: str | None = None,
+    ) -> int:
+        ts = created_at or _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO pipeline_ledger (
+                    task_id, attempt_id, role, engine_id, provider, model, risk_class,
+                    tokens_in, tokens_out, est_token_cost_usd, ci_minutes, artifact_mb,
+                    wall_seconds, outcome, is_estimate, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    attempt_id,
+                    role,
+                    engine_id,
+                    provider,
+                    model,
+                    risk_class,
+                    int(tokens_in),
+                    int(tokens_out),
+                    float(est_token_cost_usd),
+                    float(ci_minutes),
+                    float(artifact_mb),
+                    float(wall_seconds),
+                    outcome,
+                    1 if is_estimate else 0,
+                    ts,
+                ),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_pipeline_ledger(
+        self,
+        *,
+        task_id: str | None = None,
+        since_iso: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if since_iso:
+            clauses.append("created_at >= ?")
+            params.append(since_iso)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM pipeline_ledger {where} ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_model_score(
+        self,
+        *,
+        engine_id: str,
+        model: str,
+        role: str,
+        risk_class: str,
+        sample_tasks: int,
+        accepted_tasks: int,
+        total_attempts: int,
+        regression_count: int,
+        avg_retries: float,
+        avg_turnaround_min: float,
+        total_cost_usd_est: float,
+        cost_per_accepted_usd_est: float,
+        benchmark_graduated: bool,
+    ) -> dict[str, Any]:
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO model_scores (
+                    engine_id, model, role, risk_class, sample_tasks, accepted_tasks,
+                    total_attempts, regression_count, avg_retries, avg_turnaround_min,
+                    total_cost_usd_est, cost_per_accepted_usd_est, benchmark_graduated, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(engine_id, model, role, risk_class) DO UPDATE SET
+                    sample_tasks = excluded.sample_tasks,
+                    accepted_tasks = excluded.accepted_tasks,
+                    total_attempts = excluded.total_attempts,
+                    regression_count = excluded.regression_count,
+                    avg_retries = excluded.avg_retries,
+                    avg_turnaround_min = excluded.avg_turnaround_min,
+                    total_cost_usd_est = excluded.total_cost_usd_est,
+                    cost_per_accepted_usd_est = excluded.cost_per_accepted_usd_est,
+                    benchmark_graduated = excluded.benchmark_graduated,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    engine_id,
+                    model,
+                    role,
+                    risk_class,
+                    int(sample_tasks),
+                    int(accepted_tasks),
+                    int(total_attempts),
+                    int(regression_count),
+                    float(avg_retries),
+                    float(avg_turnaround_min),
+                    float(total_cost_usd_est),
+                    float(cost_per_accepted_usd_est),
+                    1 if benchmark_graduated else 0,
+                    now,
+                ),
+            )
+        row = self._conn.execute(
+            "SELECT * FROM model_scores WHERE engine_id = ? AND model = ? AND role = ? AND risk_class = ?",
+            (engine_id, model, role, risk_class),
+        ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def list_model_scores(
+        self,
+        *,
+        role: str | None = None,
+        risk_class: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if role:
+            clauses.append("role = ?")
+            params.append(role)
+        if risk_class:
+            clauses.append("risk_class = ?")
+            params.append(risk_class)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM model_scores {where} ORDER BY cost_per_accepted_usd_est ASC, engine_id ASC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_release_verification(
+        self,
+        *,
+        tag: str,
+        repo: str,
+        merge_sha: str,
+        artifact_sha256: str,
+        smoke_command: str,
+        smoke_status: str,
+        task_id: str | None = None,
+        previous_good_tag: str | None = None,
+        smoke_detail: str = "",
+        verified_at: str | None = None,
+        rolled_back_at: str | None = None,
+    ) -> dict[str, Any]:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO release_verifications (
+                    tag, task_id, repo, merge_sha, previous_good_tag,
+                    artifact_sha256, smoke_command, smoke_status, smoke_detail,
+                    verified_at, rolled_back_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tag) DO UPDATE SET
+                    smoke_status = excluded.smoke_status,
+                    smoke_detail = excluded.smoke_detail,
+                    verified_at = COALESCE(excluded.verified_at, release_verifications.verified_at),
+                    rolled_back_at = COALESCE(excluded.rolled_back_at, release_verifications.rolled_back_at)
+                """,
+                (
+                    tag,
+                    task_id,
+                    repo,
+                    merge_sha,
+                    previous_good_tag,
+                    artifact_sha256,
+                    smoke_command,
+                    smoke_status,
+                    smoke_detail,
+                    verified_at,
+                    rolled_back_at,
+                ),
+            )
+        row = self._conn.execute("SELECT * FROM release_verifications WHERE tag = ?", (tag,)).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def list_release_verifications(self, *, repo: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        if repo:
+            rows = self._conn.execute(
+                "SELECT * FROM release_verifications WHERE repo = ? ORDER BY rowid DESC LIMIT ?",
+                (repo, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM release_verifications ORDER BY rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_release_verification(self, tag: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM release_verifications WHERE tag = ?", (tag,)).fetchone()
+        return dict(row) if row is not None else None
+
 
