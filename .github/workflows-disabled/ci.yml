@@ -89,7 +89,12 @@ jobs:
           Push-Location frontend; npm ci; npm run tokens; npm run build; Pop-Location
           python -m pip install -e "backend[dev,package]"
           python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
-          Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip
+          $selfTestOut = & dist\NightShift\NightShift.exe --self-test
+          if ($LASTEXITCODE -ne 0) { throw "NightShift.exe --self-test exited with $LASTEXITCODE" }
+          $trimmed = ($selfTestOut | Out-String).Trim()
+          if ($trimmed -ne "OK") { throw "Unexpected --self-test output: $trimmed" }
+          Write-Output "Smoke test passed: $trimmed"
+          Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip -Force
       - uses: actions/upload-artifact@v4
         if: hashFiles('backend/packaging/nightshift.spec') != ''
         with:

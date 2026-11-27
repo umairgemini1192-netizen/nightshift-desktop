@@ -293,3 +293,28 @@ test("phone status bridge settings card states and screenshots", async ({ page }
   );
   expect(blocking).toEqual([]);
 });
+
+test("first-run legacy queue.json import flow and screenshot", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
+
+  await page.goto("/?scenario=empty", { waitUntil: "networkidle" });
+  await page.locator("#first-run-import-card").waitFor({ state: "visible" });
+  await page.screenshot({
+    path: path.join(SCREENSHOTS_DIR, "mission-control-first-run-import-card.png"),
+    fullPage: true,
+  });
+
+  await page.getByRole("button", { name: /Import legacy queue\.json/i }).click();
+  await expect(page.getByRole("dialog", { name: /Import legacy queue\.json/i })).toBeVisible();
+  await page.screenshot({
+    path: path.join(SCREENSHOTS_DIR, "mission-control-first-run-import-dialog.png"),
+    fullPage: true,
+  });
+
+  const axeResults = await new AxeBuilder({ page }).analyze();
+  const blocking = axeResults.violations.filter(
+    (v) => v.impact === "serious" || v.impact === "critical",
+  );
+  expect(blocking).toEqual([]);
+});

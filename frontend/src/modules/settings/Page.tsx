@@ -111,11 +111,12 @@ export default function SettingsPage() {
 
   const loadSettingsData = useCallback(async () => {
     try {
-      const [projRes, prioRes, guardsRes, folderRes] = await Promise.all([
+      const [projRes, prioRes, guardsRes, folderRes, autostartRes] = await Promise.all([
         bridge.call<ProjectConfigItem[]>("settings.getProjects"),
         bridge.call<PriorityItem[]>("settings.getPriorityList"),
         bridge.call<GuardLimits>("settings.getGuardLimits"),
         bridge.call<{ path: string }>("settings.getDataFolder"),
+        bridge.call<{ enabled: boolean }>("settings.getAutostart"),
       ]);
 
       setProjects(projRes ?? []);
@@ -127,6 +128,9 @@ export default function SettingsPage() {
       }
       if (folderRes?.path) {
         setDataFolder(folderRes.path);
+      }
+      if (typeof autostartRes?.enabled === "boolean") {
+        setAutostart(autostartRes.enabled);
       }
     } catch (err) {
       pushToast({
@@ -256,6 +260,33 @@ export default function SettingsPage() {
         : "Notifications silenced.",
       tone: "info",
     });
+  };
+
+  const handleToggleAutostart = async (enabled: boolean) => {
+    const previous = autostart;
+    setAutostart(enabled);
+    try {
+      const res = await bridge.call<{ enabled: boolean; detail?: string }>("settings.setAutostart", {
+        enabled,
+      });
+      setAutostart(Boolean(res?.enabled ?? enabled));
+      pushToast({
+        title: enabled ? "Autostart enabled" : "Autostart turned off",
+        description:
+          res?.detail ??
+          (enabled
+            ? "Night-Shift will start on Windows sign-in using a per-user scheduled task."
+            : "Night-Shift will no longer start automatically on sign-in."),
+        tone: "info",
+      });
+    } catch (err) {
+      setAutostart(previous);
+      pushToast({
+        title: "Could not update autostart",
+        description: String(err),
+        tone: "danger",
+      });
+    }
   };
 
   const handleOpenDataFolder = async () => {
@@ -662,10 +693,10 @@ export default function SettingsPage() {
 
           <Toggle
             id="toggle-autostart"
-            label="Start Night-Shift on Windows login (per-user)"
-            helperText="Launches minimized to system tray when logging into Windows."
+            label="Start Night-Shift on Windows sign-in (per-user)"
+            helperText="Uses a per-user Windows Task Scheduler task with limited rights (no administrator needed) and starts minimized to the system tray."
             checked={autostart}
-            onChange={setAutostart}
+            onChange={(c) => void handleToggleAutostart(c)}
           />
 
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border-subtle pt-3">

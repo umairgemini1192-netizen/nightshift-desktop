@@ -53,6 +53,8 @@ export class MockBridge implements Bridge {
   private snapshot: AppSnapshot;
   private listeners = new Map<string, Set<BridgeEventCallback>>();
   private stopArmed = false;
+  private autostartEnabled = false;
+  private firstRunDismissed = false;
   private phoneStatus: {
     enabled: boolean;
     url: string;
@@ -108,6 +110,19 @@ export class MockBridge implements Bridge {
           mode: "mock",
           modules: ["mission-control", "plan-builder", "runs-history", "engines-quota", "settings"],
         } as T;
+
+      case "app.firstRunStatus": {
+        const hasProjects = this.snapshot.projects.length > 0;
+        return {
+          isFirstRun: this.snapshot.scenario === "empty" && !this.firstRunDismissed && !hasProjects,
+          dismissed: this.firstRunDismissed,
+          hasProjects,
+        } as T;
+      }
+
+      case "app.dismissFirstRun":
+        this.firstRunDismissed = true;
+        return { dismissed: true } as T;
 
       case "app.selectProject": {
         const projectId = typeof args?.projectId === "string" ? args.projectId : null;
@@ -369,8 +384,14 @@ export class MockBridge implements Bridge {
         const existingProjects = this.snapshot.projects.some((p) => p.id === importedProject.id)
           ? this.snapshot.projects
           : [...this.snapshot.projects, importedProject];
+        this.firstRunDismissed = true;
         this.snapshot = {
           ...this.snapshot,
+          scenario: this.snapshot.scenario === "empty" ? "idle" : this.snapshot.scenario,
+          headline:
+            this.snapshot.scenario === "empty"
+              ? "Ready - Imported legacy queue.json for owner/imported-repo."
+              : this.snapshot.headline,
           activeProjectId: importedProject.id,
           projects: existingProjects,
         };
@@ -678,6 +699,25 @@ export class MockBridge implements Bridge {
 
       case "settings.setKeepAwake":
         return { ok: true, keepAwake: Boolean(args?.enabled) } as T;
+
+      case "settings.getAutostart":
+        return {
+          enabled: this.autostartEnabled,
+          supported: true,
+          method: "task-scheduler",
+        } as T;
+
+      case "settings.setAutostart": {
+        this.autostartEnabled = Boolean(args?.enabled);
+        return {
+          enabled: this.autostartEnabled,
+          supported: true,
+          method: "task-scheduler",
+          detail: this.autostartEnabled
+            ? "Night-Shift will start on Windows sign-in (per-user task)."
+            : "Autostart turned off.",
+        } as T;
+      }
 
       case "settings.get":
         return { key: args?.key, value: "default" } as T;

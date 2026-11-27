@@ -14,9 +14,6 @@ workflows:
             - desktop-gates
             - desktop-backend
             - desktop-frontend
-          filters:
-            branches:
-              only: main
 
 jobs:
   desktop-gates:
@@ -99,7 +96,16 @@ jobs:
               Pop-Location
               python -m pip install -e "backend[dev,package]"
               python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
-              Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip
+              $selfTestOut = & dist\NightShift\NightShift.exe --self-test
+              if ($LASTEXITCODE -ne 0) {
+                throw "NightShift.exe --self-test failed with exit code $LASTEXITCODE"
+              }
+              $trimmed = ($selfTestOut | Out-String).Trim()
+              if ($trimmed -ne "OK") {
+                throw "NightShift.exe --self-test printed unexpected output: $trimmed"
+              }
+              Write-Output "Smoke test passed: $trimmed"
+              Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip -Force
             } else {
               Write-Output "backend/packaging/nightshift.spec not present; skipping."
             }
