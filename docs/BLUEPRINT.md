@@ -473,6 +473,20 @@ Script source ships in `tools/phone-bridge/Code.gs` with a one-page setup guide.
 Reference implementation (legacy, running since 2026-11-25): `Gemini-Supervisor/status_bridge.py`
 (client) and `Gemini-Supervisor/gas-bridge/Code.gs` (web app v6).
 
+## 5j. Role-based agent pipeline (AI assembly line)
+
+The engine evolves into a 9-stage role-based assembly line (PLAN, CODE, MECHANICAL, TRIAGE, FIX,
+REVIEW, GATES, MERGE/RELEASE, LEDGER+SCORES) where plain code handles every mechanical step and AI
+handles only judgment, governed by the 2026-11-27 GPT Governance Amendment (protected test authority,
+frozen requirement contracts, risk-based routing, durable task state machine, least-privilege workers
+within Windows no-admin limits, evidence integrity, provider-independent review, post-release smoke +
+one-click rollback, cost-per-accepted-change economics, and explicit maturity labels).
+
+Full design specification, SQLite migration `005_agent_pipeline`, staged build order (Phases 8b–8f),
+UI module specification, test plan, and independent cross-provider review sign-off live in
+[`docs/AGENT_PIPELINE.md`](AGENT_PIPELINE.md).
+*(Note: numbered `5j` because `5i` is already occupied by Phone status bridge.)*
+
 ## 6. Data model (SQLite)
 
 `projects`, `plans`, `phases(status, attempt, pr_number, branch, started_at, finished_at)`,
