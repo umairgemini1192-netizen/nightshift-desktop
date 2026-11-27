@@ -20,7 +20,7 @@ from nightshift.engine.ci import CiPipelineManager, CiWatchResult
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
 from nightshift.engine.pipeline_contracts import MergeGate, provider_for_engine
-from nightshift.engine.pipeline_orchestrator import TaskOrchestrator, _parse_iso, is_process_alive
+from nightshift.engine.pipeline_orchestrator import LeaseHeartbeat, TaskOrchestrator, is_process_alive
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
 from nightshift.engine.release import ReleaseManager
 from nightshift.engine.scheduler import Scheduler
@@ -162,6 +162,8 @@ class EngineStateMachine:
         login_checker: LoginHealthChecker | None = None,
         network_backoff_seconds: float = 30.0,
         merge_gate: MergeGate | None = None,
+        lease_seconds: int = 1800,
+        lease_heartbeat_interval: float | None = None,
     ) -> None:
         self.store = store
         self.events = event_bus
@@ -170,6 +172,8 @@ class EngineStateMachine:
         self.runners = runners or {}
         self.logins = login_checker or LoginHealthChecker(store=store, quota_ledger=quota_ledger)
         self._network_backoff_seconds = network_backoff_seconds
+        self._lease_seconds = lease_seconds
+        self._lease_heartbeat_interval = lease_heartbeat_interval
         # Single mandatory merge-gate chokepoint (AGENT_PIPELINE §1).
         # Autonomous merge stays OFF by default until Phases 8b-8e reach Integration-tested.
         self.merge_gate = merge_gate or MergeGate(autonomous_merge_enabled=False)
@@ -580,19 +584,26 @@ class EngineStateMachine:
         # Ensure a durable pipeline task + frozen requirement contract exists before coding/merging (AGENT_PIPELINE §3.1)
         pipeline_task, pipeline_contract = self._ensure_pipeline_task(project, phase, plan_id)
         task_id = str(pipeline_task["id"])
-        lease_token = self.task_orchestrator.acquire_lease(task_id)
+        lease_token = self.task_orchestrator.acquire_lease(task_id, lease_seconds=self._lease_seconds)
         try:
-            return await self._execute_phase_leased(
-                project=project,
-                phase=phase,
-                plan_id=plan_id,
-                base_branch=base_branch,
-                dependencies_merged=dependencies_merged,
-                wt_dir=wt_dir,
-                pipeline_task=pipeline_task,
-                pipeline_contract=pipeline_contract,
-                lease_token=lease_token,
-            )
+            with LeaseHeartbeat(
+                self.task_orchestrator,
+                task_id,
+                lease_token,
+                lease_seconds=self._lease_seconds,
+                interval_seconds=self._lease_heartbeat_interval,
+            ):
+                return await self._execute_phase_leased(
+                    project=project,
+                    phase=phase,
+                    plan_id=plan_id,
+                    base_branch=base_branch,
+                    dependencies_merged=dependencies_merged,
+                    wt_dir=wt_dir,
+                    pipeline_task=pipeline_task,
+                    pipeline_contract=pipeline_contract,
+                    lease_token=lease_token,
+                )
         finally:
             self.task_orchestrator.release_lease(task_id, lease_token)
 
@@ -623,19 +634,6 @@ class EngineStateMachine:
             f"- Commit cleanly, push `{phase.branch}`, and open a PR targeting `main` (if PR exists, push to it).\n"
             "- NEVER merge to `main` or cut releases yourself; the orchestrator merges after CI passes.\n\n"
         )
-
-        # Lease renewal helper (P1: renew throughout phase execution)
-        async def renew_lease_if_needed() -> None:
-            """Renew lease if it's nearing expiry (30s before expiry)."""
-            current_task = self.store.get_task(task_id)
-            if not current_task:
-                return
-            exp_dt = _parse_iso(current_task.get("lease_expires_at"))
-            if exp_dt is not None:
-                remaining = (exp_dt - datetime.now(timezone.utc)).total_seconds()
-                if remaining < 30:
-                    new_expires = self.task_orchestrator.renew_lease(task_id, lease_token, lease_seconds=1800)
-                    logger.debug("Renewed task %s lease to %s", task_id, new_expires)
 
         if project.ui_contract:
             guardrail_header += f"{project.ui_contract}\n\n"
@@ -708,8 +706,6 @@ class EngineStateMachine:
                 plain_text=f"PR #{pr_number} already open for {phase.branch} -> skipping implementation, resuming at CI watch.",
                 phase_id=phase.id,
             ))
-            # Renew lease after PR adoption (P1)
-            await renew_lease_if_needed()
         else:
             # Implementation ladder loop with mid-phase handoff & fast switch-back
             cur_task = self.store.get_task(task_id)
@@ -954,8 +950,6 @@ class EngineStateMachine:
                         phase_id=phase.id,
                         raw_path=str(raw_log_path),
                     ))
-                    # Renew lease after successful delivery (P1)
-                    await renew_lease_if_needed()
                     break
 
                 # Failure, diff-guard finding, or quota exhaustion -> self-heal / mid-phase handoff
@@ -1098,8 +1092,6 @@ class EngineStateMachine:
                 )
             else:
                 self.store.update_task_fields(task_id, **task_updates)
-            # Renew lease after CI watch (P1)
-            await renew_lease_if_needed()
 
         guard_failure = park_on_diff_guard()
         if guard_failure:
@@ -1333,8 +1325,6 @@ class EngineStateMachine:
                 phase_id=phase.id,
                 payload={"project_id": project.id},
             ))
-            # Renew lease after merge approval (P1)
-            await renew_lease_if_needed()
             detail = f"Merged PR #{pr_number}"
 
             merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
@@ -1376,9 +1366,28 @@ class EngineStateMachine:
         merge_sha = (merged_pr.get("mergeCommit") or {}).get("oid")
         task = self.store.get_task_by_branch(phase.branch) or self.store.get_task(f"task-{phase.id}")
         acquired_temp_lease: str | None = None
+        temp_heartbeat: LeaseHeartbeat | None = None
+        rel_work_tmp: Path | None = None
         try:
             if not merge_sha:
                 raise RuntimeError("Could not determine the merged commit SHA")
+
+            effective_lease = lease_token
+            if task is not None and not effective_lease:
+                t_id = str(task["id"])
+                acquired_temp_lease = self.task_orchestrator.acquire_lease(
+                    t_id,
+                    lease_seconds=self._lease_seconds,
+                )
+                effective_lease = acquired_temp_lease
+                temp_heartbeat = LeaseHeartbeat(
+                    self.task_orchestrator,
+                    t_id,
+                    acquired_temp_lease,
+                    lease_seconds=self._lease_seconds,
+                    interval_seconds=self._lease_heartbeat_interval,
+                ).start()
+
             ok, msg, run_id = self.vcs.watch_workflow_run(project.repo, branch="main", workflow=project.release_workflow, timeout_seconds=3600, commit_sha=merge_sha)
             if ok is False:
                 reverted, revert_msg = self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
@@ -1403,18 +1412,25 @@ class EngineStateMachine:
             # Durable release reconciliation via remote_operations outbox (AGENT_PIPELINE §4)
             rel_op_key: str | None = None
             asset_op_key: str | None = None
-            effective_lease = lease_token
+            prepared_artifacts: list[Path] | None = None
             if task is not None:
                 t_id = str(task["id"])
-                if not effective_lease:
-                    acquired_temp_lease = self.task_orchestrator.acquire_lease(t_id)
-                    effective_lease = acquired_temp_lease
-                # P1: Verify at least one artifact matching project.artifact_glob exists alongside SHA256SUMS.txt
+                assert effective_lease is not None
+                # Derive exact required artifact names and SHA-256 checksums from the verified workflow output
+                # before reconciling or adopting any existing GitHub release.
+                rel_work_tmp = project.output_dir / "temp_download"
+                prepared_artifacts, expected_checksums = self.release_mgr.prepare_verified_artifacts(
+                    project.repo,
+                    run_id,
+                    rel_work_tmp,
+                    artifact_glob=project.artifact_glob,
+                )
                 expected_globs = [project.artifact_glob] if project.artifact_glob else []
                 rel_reconcile = self.task_orchestrator.reconcile_release_for_merge_sha(
                     task_id=t_id,
                     merge_sha=str(merge_sha),
-                    expected_asset_names=[],
+                    expected_asset_names=list(expected_checksums.keys()),
+                    expected_checksums=expected_checksums,
                     expected_asset_globs=expected_globs,
                     lease_token=effective_lease,
                     release_list_lookup=lambda: self.vcs.list_releases(project.repo),
@@ -1446,11 +1462,20 @@ class EngineStateMachine:
                 rel_op_key = str(rel_reconcile.data.get("op_key") or "")
                 asset_op_key = str(rel_reconcile.data.get("asset_op_key") or "")
 
-            tag, files = self.release_mgr.publish_verified_release(
-                repo=project.repo, merge_sha=merge_sha, output_dir=project.output_dir,
-                title_note=phase.title, workflow_name=project.release_workflow,
-                artifact_glob=project.artifact_glob, tag_prefix=project.tag_prefix, run_id=run_id,
-            )
+            publish_kwargs: dict[str, Any] = {
+                "repo": project.repo,
+                "merge_sha": merge_sha,
+                "output_dir": project.output_dir,
+                "title_note": phase.title,
+                "workflow_name": project.release_workflow,
+                "artifact_glob": project.artifact_glob,
+                "tag_prefix": project.tag_prefix,
+                "run_id": run_id,
+            }
+            if prepared_artifacts is not None:
+                publish_kwargs["prepared_artifacts"] = prepared_artifacts
+                publish_kwargs["temp_dir"] = rel_work_tmp
+            tag, files = self.release_mgr.publish_verified_release(**publish_kwargs)
             if task is not None and rel_op_key and asset_op_key:
                 self.task_orchestrator.complete_remote_operation(
                     rel_op_key,
@@ -1479,5 +1504,9 @@ class EngineStateMachine:
             self._park_phase(project.id, phase, reason=str(rel_err), next_step="Inspect the main build or release and resume")
             return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": f"Post-merge failure: {rel_err}"}
         finally:
+            if rel_work_tmp is not None and rel_work_tmp.exists():
+                shutil.rmtree(rel_work_tmp, ignore_errors=True)
+            if temp_heartbeat is not None:
+                temp_heartbeat.stop()
             if task is not None and acquired_temp_lease:
                 self.task_orchestrator.release_lease(str(task["id"]), acquired_temp_lease)

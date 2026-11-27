@@ -26,6 +26,42 @@ class ReleaseManager:
     def __init__(self, vcs: GitGhClient) -> None:
         self.vcs = vcs
 
+    def prepare_verified_artifacts(
+        self,
+        repo: str,
+        run_id: int,
+        work_tmp: Path,
+        *,
+        artifact_glob: str = "*.apk",
+    ) -> tuple[list[Path], dict[str, str]]:
+        """Download artifacts from a verified workflow run, filter by glob, and compute SHA-256 checksums."""
+        if work_tmp.exists():
+            shutil.rmtree(work_tmp, ignore_errors=True)
+        work_tmp.mkdir(parents=True, exist_ok=True)
+
+        downloaded_files = self.vcs.download_run_artifact(repo, run_id, work_tmp)
+        effective_glob = artifact_glob.strip() if artifact_glob else "*"
+        matching_artifacts: list[Path] = []
+        for f in downloaded_files:
+            if f.name == "SHA256SUMS.txt":
+                continue
+            if fnmatch.fnmatch(f.name, effective_glob) or fnmatch.fnmatch(str(f), effective_glob):
+                matching_artifacts.append(f)
+
+        if not matching_artifacts:
+            # Fallback: if glob didn't match nested paths, check all files
+            matching_artifacts = [
+                f
+                for f in work_tmp.rglob("*")
+                if f.is_file() and f.name != "SHA256SUMS.txt" and fnmatch.fnmatch(f.name, effective_glob)
+            ]
+
+        if not matching_artifacts:
+            raise RuntimeError(f"No artifact matching glob '{effective_glob}' found in workflow run {run_id}")
+
+        checksums = {art.name: compute_sha256(art) for art in matching_artifacts}
+        return matching_artifacts, checksums
+
     def publish_verified_release(
         self,
         repo: str,
@@ -38,6 +74,7 @@ class ReleaseManager:
         tag_prefix: str = "v1.0.0-preview.",
         temp_dir: Path | None = None,
         run_id: int | None = None,
+        prepared_artifacts: list[Path] | None = None,
     ) -> tuple[str, list[Path]]:
         """Watch post-merge build, download artifacts, compute SHA256, create release, copy to output_dir.
 
@@ -49,24 +86,21 @@ class ReleaseManager:
             if not ok or run_id is None:
                 raise RuntimeError(f"Main workflow '{workflow_name}' failed or not found: {msg}")
 
-        # 2. Download artifacts
+        # 2. Download artifacts (or reuse already-prepared artifacts from release reconciliation)
         work_tmp = temp_dir or (output_dir / "temp_download")
-        if work_tmp.exists():
-            shutil.rmtree(work_tmp, ignore_errors=True)
-        work_tmp.mkdir(parents=True, exist_ok=True)
-
-        downloaded_files = self.vcs.download_run_artifact(repo, run_id, work_tmp)
-        matching_artifacts: list[Path] = []
-        for f in downloaded_files:
-            if fnmatch.fnmatch(f.name, artifact_glob) or fnmatch.fnmatch(str(f), artifact_glob):
-                matching_artifacts.append(f)
-
-        if not matching_artifacts:
-            # Fallback: if glob didn't match nested paths, check all files
-            matching_artifacts = [f for f in work_tmp.rglob("*") if f.is_file() and fnmatch.fnmatch(f.name, artifact_glob)]
-
-        if not matching_artifacts:
-            raise RuntimeError(f"No artifact matching glob '{artifact_glob}' found in workflow run {run_id}")
+        if prepared_artifacts is not None:
+            work_tmp.mkdir(parents=True, exist_ok=True)
+            matching_artifacts = list(prepared_artifacts)
+            if not matching_artifacts:
+                raise RuntimeError(f"No artifact matching glob '{artifact_glob}' found in workflow run {run_id}")
+            checksums = {art.name: compute_sha256(art) for art in matching_artifacts}
+        else:
+            matching_artifacts, checksums = self.prepare_verified_artifacts(
+                repo,
+                run_id,
+                work_tmp,
+                artifact_glob=artifact_glob,
+            )
 
         # 3. Create next release tag
         tag = self.vcs.next_preview_tag(repo, tag_prefix=tag_prefix)
@@ -75,7 +109,7 @@ class ReleaseManager:
         sums_path = work_tmp / "SHA256SUMS.txt"
         sums_lines: list[str] = []
         for art in matching_artifacts:
-            sha = compute_sha256(art)
+            sha = checksums[art.name]
             sums_lines.append(f"{sha}  {art.name}")
         sums_path.write_text("\n".join(sums_lines) + "\n", encoding="utf-8")
 

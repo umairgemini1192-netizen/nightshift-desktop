@@ -6,8 +6,10 @@ Covers docs/AGENT_PIPELINE.md sections 4, 5, and 12.1 Phase 8c requirements (Ame
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -647,12 +649,17 @@ async def test_e2e_crash_mid_merged_zero_duplicate_releases_and_partial_release_
         store.migrate()
         quota = QuotaLedger(store)
         vcs = FakeGitGh()
+        expected_zip_sha = hashlib.sha256(b"PK\x03\x04mock_zip_content").hexdigest()
         vcs.merged_prs["feat/p1"] = {"number": 88, "state": "MERGED", "mergeCommit": {"oid": "merge_88"}}
         vcs.releases.append(
             {
                 "tag": "v1.0.0-preview.5",
                 "title": "repo v1.0.0-preview.5",
-                "body": "Auto-build\n<!-- nightshift-merge-sha: merge_88 -->",
+                "body": (
+                    "Auto-build\n"
+                    "<!-- nightshift-merge-sha: merge_88 -->\n\n"
+                    f"Checksums:\n```\n{expected_zip_sha}  NightShift-test.zip\n```"
+                ),
                 "assets": [{"name": "NightShift-test.zip"}, {"name": "SHA256SUMS.txt"}],
             }
         )
@@ -916,5 +923,280 @@ async def test_phase_execution_renews_near_expiry_lease_without_error(tmp_path: 
 
         assert rows[0]["status"] == "COMPLETED"
         assert "task-p-renew" in renew_calls
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_renews_during_blocking_ci_and_main_build_watches(tmp_path: Path) -> None:
+    """Background LeaseHeartbeat continuously renews a short lease while blocking watches exceed the lease TTL."""
+    class BlockingWatchVcs(FakeGitGh):
+        def watch_pr_checks(
+            self,
+            repo: str,
+            pr_number: int,
+            worktree_dir: Path,
+            timeout_seconds: int = 3600,
+        ) -> tuple[bool, str]:
+            time.sleep(1.25)
+            return super().watch_pr_checks(repo, pr_number, worktree_dir, timeout_seconds=timeout_seconds)
+
+        def watch_workflow_run(
+            self,
+            repo: str,
+            branch: str,
+            workflow: str,
+            timeout_seconds: int = 3600,
+            commit_sha: str = "",
+        ) -> tuple[bool, str, int | None]:
+            time.sleep(1.25)
+            return super().watch_workflow_run(
+                repo, branch, workflow, timeout_seconds=timeout_seconds, commit_sha=commit_sha
+            )
+
+    with Store(tmp_path / "blocking_heartbeat.db") as store:
+        store.migrate()
+        quota = QuotaLedger(store)
+        vcs = BlockingWatchVcs()
+        vcs.add_pr("feat/p-block", number=502, head_sha="sha_502")
+
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+        engine = EngineStateMachine(
+            store,
+            EventBus(store),
+            quota,
+            vcs=vcs,
+            runners={},
+            login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
+            lease_seconds=1,
+            lease_heartbeat_interval=0.2,
+        )
+        renew_calls: list[str] = []
+        orig_renew = engine.task_orchestrator.renew_lease
+
+        def tracking_renew(task_id: str, lease_token: str, *, lease_seconds: int = 1800) -> str:
+            renew_calls.append(task_id)
+            return orig_renew(task_id, lease_token, lease_seconds=lease_seconds)
+
+        project = ProjectConfig(
+            id="p",
+            name="P",
+            repo="o/r",
+            local_path=tmp_path,
+            output_dir=tmp_path / "out",
+            release_workflow="Desktop build",
+            artifact_glob="*.zip",
+        )
+        with (
+            patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"),
+            patch.object(engine.task_orchestrator, "renew_lease", side_effect=tracking_renew),
+        ):
+            rows = await engine.execute_plan(
+                project,
+                [PhaseDefinition(id="p-block", title="Blocking watch phase", branch="feat/p-block", release_after_merge=True)],
+            )
+
+        assert rows[0]["status"] == "COMPLETED"
+        # Blocking watches took ~2.5s total (> 1s TTL); heartbeat must have renewed multiple times.
+        assert len(renew_calls) >= 4
+        assert store.get_task("task-p-block")["lease_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_recover_dead_worker_leases_in_post_coding_states_without_checkpointing_or_false_positives(
+    tmp_path: Path,
+) -> None:
+    """Dead-worker leases in VERIFYING/REVIEWING/APPROVED/MERGED are cleared immediately without WIP-checkpointing,
+    unleased post-coding tasks are skipped, and a dead VERIFYING worker resumes cleanly."""
+    with Store(tmp_path / "post_coding_recover.db") as store:
+        store.migrate()
+        orch = TaskOrchestrator(store)
+        for status in ("VERIFYING", "REVIEWING", "APPROVED", "MERGED"):
+            tid = f"t-{status.lower()}"
+            _setup_task(store, task_id=tid, branch=f"feat/{status.lower()}")
+            orch.acquire_lease(tid, worker_pid=77700, lease_seconds=1800)
+            _set_task_status_directly(store, tid, status)
+
+        # Already-unleased MERGED task should NOT be recovered or checkpointed
+        _setup_task(store, task_id="t-clean-merged", branch="feat/clean-merged")
+        _set_task_status_directly(store, "t-clean-merged", "MERGED")
+
+        checkpointed: list[str] = []
+        recovered = orch.recover_orphaned_running_tasks(
+            is_pid_alive=lambda _pid: False,
+            checkpoint_fn=lambda t: checkpointed.append(str(t["id"])),
+        )
+        assert set(recovered) == {"t-verifying", "t-reviewing", "t-approved", "t-merged"}
+        assert checkpointed == []
+        assert "t-clean-merged" not in recovered
+
+        # Immediate lease reacquisition succeeds without waiting 30 min
+        for tid in ("t-verifying", "t-reviewing", "t-approved", "t-merged"):
+            new_tok = orch.acquire_lease(tid, worker_pid=88800, lease_seconds=600)
+            assert new_tok
+            orch.release_lease(tid, new_tok)
+
+    # E2E: dead worker crashed in VERIFYING with unexpired lease -> restart recovers and completes PR
+    with Store(tmp_path / "e2e_dead_verifying.db") as store:
+        store.migrate()
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        store.create_project("p", "P", "o/r", str(tmp_path))
+        store.create_plan("plan_default", "p", "Plan")
+        store.upsert_phase("p1", "plan_default", "P1", "feat/dead-verify", status="watching_ci", pr_number=701)
+        task, _ = store.create_task_with_contract(
+            task_id="task-p1",
+            phase_id="p1",
+            plan_id="plan_default",
+            title="P1",
+            branch="feat/dead-verify",
+        )
+        orch = TaskOrchestrator(store)
+        orch.acquire_lease(task["id"], worker_pid=999998, lease_seconds=1800)
+        orch.transition(task["id"], "RUNNING", idempotency_key="dv1", reason="start")
+        orch.transition(task["id"], "VERIFYING", idempotency_key="dv2", reason="ci", updates={"pr_number": 701, "head_sha": "sha_701"})
+        vcs.add_pr("feat/dead-verify", number=701, head_sha="sha_701")
+
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+        engine = EngineStateMachine(
+            store,
+            EventBus(store),
+            quota,
+            vcs=vcs,
+            runners={},
+            login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
+        )
+        project = ProjectConfig(id="p", name="P", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        with (
+            patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"),
+            patch("nightshift.engine.state_machine.is_process_alive", return_value=False),
+        ):
+            rows = await engine.execute_plan(
+                project,
+                [PhaseDefinition(id="p1", title="P1", branch="feat/dead-verify", release_after_merge=False)],
+            )
+
+        assert rows[0]["status"] == "COMPLETED"
+        assert vcs.merged_prs["feat/dead-verify"]["number"] == 701
+        assert store.get_task("task-p1")["lease_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_e2e_release_reconciliation_rejects_checksum_only_partial_multi_artifact_and_bad_checksum(
+    tmp_path: Path,
+) -> None:
+    """Release adoption derives required artifact names and checksums from the verified workflow output."""
+    expected_sha = hashlib.sha256(b"PK\x03\x04mock_zip_content").hexdigest()
+
+    # 1. Checksum-only release (even with empty artifact_glob) -> BLOCKED (partial_release_repair)
+    with Store(tmp_path / "rel_checksum_only.db") as store:
+        store.migrate()
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.artifacts_to_create = ["NightShift-app.zip"]
+        vcs.merged_prs["feat/r1"] = {"number": 801, "state": "MERGED", "mergeCommit": {"oid": "merge_801"}}
+        vcs.releases.append(
+            {
+                "tag": "v1.0.0-preview.20",
+                "title": "repo v1.0.0-preview.20",
+                "body": f"<!-- nightshift-merge-sha: merge_801 -->\n{expected_sha}  NightShift-app.zip",
+                "assets": [{"name": "SHA256SUMS.txt"}],
+            }
+        )
+        store.create_project("p", "P", "o/r", str(tmp_path))
+        store.create_plan("plan_default", "p", "Plan")
+        store.upsert_phase("r1", "plan_default", "R1", "feat/r1", status="releasing", pr_number=801)
+        store.create_task_with_contract(task_id="task-r1", phase_id="r1", plan_id="plan_default", title="R1", branch="feat/r1")
+        store.update_task_fields("task-r1", status="MERGED", merge_sha="merge_801")
+
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={}, login_checker=logins)
+        project = ProjectConfig(
+            id="p", name="P", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out",
+            release_workflow="Desktop build", artifact_glob="",
+        )
+        rows = await engine.execute_plan(
+            project,
+            [PhaseDefinition(id="r1", title="R1", branch="feat/r1", release_after_merge=True)],
+        )
+        assert rows[0]["status"] == "PARKED"
+        assert store.get_task("task-r1")["block_reason"] == "partial_release_repair"
+        assert len(vcs.releases) == 1
+
+    # 2. Multi-artifact workflow where only 1 of 2 artifacts uploaded -> BLOCKED (partial_release_repair)
+    with Store(tmp_path / "rel_multi_partial.db") as store:
+        store.migrate()
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.artifacts_to_create = ["app-arm64.apk", "app-universal.apk"]
+        vcs.merged_prs["feat/r2"] = {"number": 802, "state": "MERGED", "mergeCommit": {"oid": "merge_802"}}
+        vcs.releases.append(
+            {
+                "tag": "v1.0.0-preview.21",
+                "title": "repo v1.0.0-preview.21",
+                "body": (
+                    "<!-- nightshift-merge-sha: merge_802 -->\n"
+                    f"{expected_sha}  app-arm64.apk\n{expected_sha}  app-universal.apk"
+                ),
+                "assets": [{"name": "app-arm64.apk"}, {"name": "SHA256SUMS.txt"}],
+            }
+        )
+        store.create_project("p", "P", "o/r", str(tmp_path))
+        store.create_plan("plan_default", "p", "Plan")
+        store.upsert_phase("r2", "plan_default", "R2", "feat/r2", status="releasing", pr_number=802)
+        store.create_task_with_contract(task_id="task-r2", phase_id="r2", plan_id="plan_default", title="R2", branch="feat/r2")
+        store.update_task_fields("task-r2", status="MERGED", merge_sha="merge_802")
+
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={}, login_checker=logins)
+        project = ProjectConfig(
+            id="p", name="P", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out",
+            release_workflow="Android build", artifact_glob="*.apk",
+        )
+        rows = await engine.execute_plan(
+            project,
+            [PhaseDefinition(id="r2", title="R2", branch="feat/r2", release_after_merge=True)],
+        )
+        assert rows[0]["status"] == "PARKED"
+        assert "app-universal.apk" in rows[0]["detail"]
+        assert store.get_task("task-r2")["block_reason"] == "partial_release_repair"
+        assert len(vcs.releases) == 1
+
+    # 3. All filenames present, but checksum mismatches verified workflow output -> BLOCKED
+    with Store(tmp_path / "rel_bad_checksum.db") as store:
+        store.migrate()
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.artifacts_to_create = ["NightShift-test.zip"]
+        vcs.merged_prs["feat/r3"] = {"number": 803, "state": "MERGED", "mergeCommit": {"oid": "merge_803"}}
+        vcs.releases.append(
+            {
+                "tag": "v1.0.0-preview.22",
+                "title": "repo v1.0.0-preview.22",
+                "body": f"<!-- nightshift-merge-sha: merge_803 -->\n{'0' * 64}  NightShift-test.zip",
+                "assets": [{"name": "NightShift-test.zip"}, {"name": "SHA256SUMS.txt"}],
+            }
+        )
+        store.create_project("p", "P", "o/r", str(tmp_path))
+        store.create_plan("plan_default", "p", "Plan")
+        store.upsert_phase("r3", "plan_default", "R3", "feat/r3", status="releasing", pr_number=803)
+        store.create_task_with_contract(task_id="task-r3", phase_id="r3", plan_id="plan_default", title="R3", branch="feat/r3")
+        store.update_task_fields("task-r3", status="MERGED", merge_sha="merge_803")
+
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={}, login_checker=logins)
+        project = ProjectConfig(
+            id="p", name="P", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out",
+            release_workflow="Desktop build", artifact_glob="*.zip",
+        )
+        rows = await engine.execute_plan(
+            project,
+            [PhaseDefinition(id="r3", title="R3", branch="feat/r3", release_after_merge=True)],
+        )
+        assert rows[0]["status"] == "PARKED"
+        assert "NightShift-test.zip" in rows[0]["detail"]
+        assert store.get_task("task-r3")["block_reason"] == "partial_release_repair"
+        assert len(vcs.releases) == 1
+
 
 

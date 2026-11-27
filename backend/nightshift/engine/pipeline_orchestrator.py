@@ -9,9 +9,13 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import json
+import logging
 import os
+import re
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -20,6 +24,29 @@ from typing import Any, Awaitable, Callable, TypeVar
 
 from nightshift.engine.pipeline_contracts import verify_contract_integrity
 from nightshift.store import Store
+
+logger = logging.getLogger(__name__)
+
+_CHECKSUM_LINE_RE = re.compile(r"^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$")
+_LEASE_RECOVERY_STATUSES: tuple[str, ...] = (
+    "QUEUED",
+    "RUNNING",
+    "VERIFYING",
+    "REVIEWING",
+    "APPROVED",
+    "MERGED",
+    "BLOCKED",
+)
+
+
+def _parse_release_body_checksums(body: str) -> dict[str, str]:
+    """Parse ``<sha256>  <filename>`` lines from GitHub release notes."""
+    checksums: dict[str, str] = {}
+    for line in body.splitlines():
+        m = _CHECKSUM_LINE_RE.match(line)
+        if m:
+            checksums[m.group(2).strip()] = m.group(1).lower()
+    return checksums
 
 T = TypeVar("T")
 
@@ -254,6 +281,7 @@ class TaskOrchestrator:
 
     def __init__(self, store: Store) -> None:
         self.store = store
+        self._memory_lock = threading.RLock()
 
     def _assert_active_lease_locked(
         self,
@@ -419,30 +447,53 @@ class TaskOrchestrator:
         *,
         lease_seconds: int = 1800,
     ) -> str:
-        """Extend an active lease's expiry inside ``BEGIN IMMEDIATE``; fails if fenced out."""
-        conn = self.store.connection
+        """Extend an active lease's expiry inside ``BEGIN IMMEDIATE``; fails if fenced out.
+
+        Uses a dedicated short-lived WAL connection for file-backed SQLite stores so
+        background heartbeat threads can renew leases safely even while the main thread
+        runs blocking workflow watches or writes to ``self.store.connection``.
+        """
         now = _utc_now()
         now_iso = _utc_iso(now)
         expires_iso = _utc_iso(now + timedelta(seconds=lease_seconds))
 
-        conn.execute("BEGIN IMMEDIATE")
+        db_path_str = str(self.store.db_path)
+        own_conn = db_path_str != ":memory:"
+        if own_conn:
+            conn = sqlite3.connect(db_path_str, timeout=30.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 5000;")
+        else:
+            conn = self.store.connection
+
+        def _do_renew() -> str:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT lease_token, lease_expires_at FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"Unknown task: {task_id}")
+                self._assert_active_lease_locked(row, task_id, lease_token, now)
+                conn.execute(
+                    "UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_token = ?",
+                    (expires_iso, now_iso, task_id, lease_token),
+                )
+                conn.commit()
+                return expires_iso
+            except Exception:
+                conn.rollback()
+                raise
+
         try:
-            row = conn.execute(
-                "SELECT lease_token, lease_expires_at FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-            if row is None:
-                raise KeyError(f"Unknown task: {task_id}")
-            self._assert_active_lease_locked(row, task_id, lease_token, now)
-            conn.execute(
-                "UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE id = ? AND lease_token = ?",
-                (expires_iso, now_iso, task_id, lease_token),
-            )
-            conn.commit()
-            return expires_iso
-        except Exception:
-            conn.rollback()
-            raise
+            if own_conn:
+                return _do_renew()
+            with self._memory_lock:
+                return _do_renew()
+        finally:
+            if own_conn:
+                conn.close()
 
     def verify_lease(self, task_id: str, lease_token: str) -> None:
         """Raise ``LeaseConflictError`` if ``lease_token`` is not the active non-expired lease."""
@@ -1018,12 +1069,21 @@ class TaskOrchestrator:
                 for name in present_assets
             ):
                 missing.append(pattern)
+        if not expected_asset_names and not expected_asset_globs:
+            if not any(name != "SHA256SUMS.txt" for name in present_assets):
+                missing.append("<application_artifact>")
 
         checksum_mismatches: list[str] = []
         if not missing and expected_checksums:
-            remote_checksums = dict(rel.get("checksums") or {})
+            remote_checksums = {
+                str(k): str(v).lower() for k, v in dict(rel.get("checksums") or {}).items()
+            }
+            if not remote_checksums:
+                remote_checksums = _parse_release_body_checksums(
+                    str(rel.get("body") or rel.get("notes") or "")
+                )
             for fname, exp_sha in expected_checksums.items():
-                if remote_checksums.get(fname) != exp_sha:
+                if remote_checksums.get(fname) != str(exp_sha).lower():
                     checksum_mismatches.append(fname)
 
         if not missing and not checksum_mismatches:
@@ -1078,25 +1138,39 @@ class TaskOrchestrator:
         is_pid_alive: Callable[[int], bool] = is_process_alive,
         checkpoint_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[str]:
-        """On startup, WIP-checkpoint and release leases for RUNNING and post-coding tasks whose worker died or lease expired (P1)."""
+        """On startup, recover dead-worker or expired leases across all active execution stages.
+
+        - ``RUNNING`` tasks with a dead worker, expired lease, or missing worker PID are
+          WIP-checkpointed (when ``checkpoint_fn`` is provided) and have their lease cleared.
+        - Post-coding / non-coding tasks (``QUEUED``, ``VERIFYING``, ``REVIEWING``,
+          ``APPROVED``, ``MERGED``, ``BLOCKED``) that still hold a dead or expired lease
+          have their lease cleared without WIP-checkpointing so PR heads and merged
+          branches are never mutated and resume does not have to wait for lease expiry.
+        - Tasks in post-coding / non-coding states with no attached lease are skipped.
+        """
         recovered: list[str] = []
         now = _utc_now()
-        # P1: Also recover post-coding states (VERIFYING, REVIEWING, APPROVED, MERGED)
-        orphan_statuses = ("RUNNING", "VERIFYING", "REVIEWING", "APPROVED", "MERGED")
-        orphan_tasks = [
+        candidate_tasks = [
             task for task in self.store.list_tasks()
-            if task.get("status") in orphan_statuses
+            if task.get("status") in _LEASE_RECOVERY_STATUSES
         ]
-        for task in orphan_tasks:
+        for task in candidate_tasks:
+            status = str(task.get("status") or "")
             pid = task.get("worker_pid")
-            exp_dt = _parse_iso(task.get("lease_expires_at"))
+            expected_token = task.get("lease_token")
+            exp_raw = task.get("lease_expires_at")
+            has_attached_lease = expected_token is not None or pid is not None or exp_raw is not None
+
+            if status != "RUNNING" and not has_attached_lease:
+                continue
+
+            exp_dt = _parse_iso(exp_raw)
             expired = exp_dt is None or exp_dt <= now
             dead = pid is not None and not is_pid_alive(int(pid))
             if not (dead or expired or pid is None):
                 continue
 
-            expected_token = task.get("lease_token")
-            if checkpoint_fn is not None:
+            if status == "RUNNING" and checkpoint_fn is not None:
                 checkpoint_fn(task)
 
             conn = self.store.connection
@@ -1107,18 +1181,18 @@ class TaskOrchestrator:
                         """
                         UPDATE tasks
                         SET lease_token = NULL, lease_expires_at = NULL, worker_pid = NULL, updated_at = ?
-                        WHERE id = ? AND status IN ('RUNNING', 'VERIFYING', 'REVIEWING', 'APPROVED', 'MERGED') AND lease_token IS NULL
+                        WHERE id = ? AND status = ? AND lease_token IS NULL
                         """,
-                        (_utc_iso(), task["id"]),
+                        (_utc_iso(), task["id"], status),
                     )
                 else:
                     cur = conn.execute(
                         """
                         UPDATE tasks
                         SET lease_token = NULL, lease_expires_at = NULL, worker_pid = NULL, updated_at = ?
-                        WHERE id = ? AND status IN ('RUNNING', 'VERIFYING', 'REVIEWING', 'APPROVED', 'MERGED') AND lease_token = ?
+                        WHERE id = ? AND status = ? AND lease_token = ?
                         """,
-                        (_utc_iso(), task["id"], expected_token),
+                        (_utc_iso(), task["id"], status, expected_token),
                     )
                 conn.commit()
                 if cur.rowcount > 0:
@@ -1127,3 +1201,88 @@ class TaskOrchestrator:
                 conn.rollback()
                 raise
         return recovered
+
+
+class LeaseHeartbeat:
+    """Background daemon thread that continuously renews a task lease across async and blocking stages."""
+
+    def __init__(
+        self,
+        orchestrator: TaskOrchestrator,
+        task_id: str,
+        lease_token: str,
+        *,
+        lease_seconds: int = 1800,
+        interval_seconds: float | None = None,
+    ) -> None:
+        self.orchestrator = orchestrator
+        self.task_id = task_id
+        self.lease_token = lease_token
+        self.lease_seconds = lease_seconds
+        self.interval_seconds = interval_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.last_error: BaseException | None = None
+
+    def _effective_interval(self) -> float:
+        if self.interval_seconds is not None:
+            return max(0.05, float(self.interval_seconds))
+        return max(0.05, min(self.lease_seconds / 3.0, 300.0))
+
+    def _renew_once(self) -> bool:
+        try:
+            self.orchestrator.renew_lease(
+                self.task_id,
+                self.lease_token,
+                lease_seconds=self.lease_seconds,
+            )
+            return True
+        except (LeaseConflictError, KeyError) as exc:
+            self.last_error = exc
+            logger.warning("Stopping lease heartbeat for task %s: %s", self.task_id, exc)
+            return False
+        except Exception as exc:
+            self.last_error = exc
+            logger.warning("Transient lease renewal failure for task %s: %s", self.task_id, exc)
+            return True
+
+    def _run(self, wait_interval: float) -> None:
+        while not self._stop_event.wait(wait_interval):
+            if not self._renew_once():
+                break
+
+    def start(self) -> LeaseHeartbeat:
+        if self._thread is not None:
+            return self
+        self._stop_event.clear()
+        wait_interval = self._effective_interval()
+        # If the initial lease is already near expiry (e.g., short lease TTL), renew promptly.
+        task_row = self.orchestrator.store.get_task(self.task_id)
+        if task_row is not None:
+            exp_dt = _parse_iso(task_row.get("lease_expires_at"))
+            if exp_dt is not None:
+                remaining = (exp_dt - _utc_now()).total_seconds()
+                if remaining < 30.0:
+                    self._renew_once()
+                elif self.interval_seconds is None:
+                    wait_interval = min(wait_interval, max(0.05, remaining / 3.0))
+        self._thread = threading.Thread(
+            target=self._run,
+            args=(wait_interval,),
+            name=f"lease-heartbeat-{self.task_id}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def __enter__(self) -> LeaseHeartbeat:
+        return self.start()
+
+    def __exit__(self, *_exc: object) -> None:
+        self.stop()
