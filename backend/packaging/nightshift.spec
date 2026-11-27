@@ -36,9 +36,12 @@ hidden_imports = [
     "webview.platforms.edgechromium",
 ]
 
+TOOLS_LOCK = REPO_ROOT / "tools.lock.json"
+
 datas = [
     (str(FRONTEND_DIST), "frontend/dist"),
     (str(ICON_PATH), "packaging"),
+    (str(TOOLS_LOCK), "."),
 ]
 
 block_cipher = None

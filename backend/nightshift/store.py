@@ -297,10 +297,47 @@ def _migration_003_nullable_router_step(conn: sqlite3.Connection) -> None:
     conn.execute("ALTER TABLE router_decisions_new RENAME TO router_decisions")
 
 
+def _migration_004_token_optimizer_tables(conn: sqlite3.Connection) -> None:
+    """Create tables for token optimizer tool states and A/B measurement runs (BLUEPRINT 5g)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS token_tool_states (
+            tool TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            installed_version TEXT NOT NULL DEFAULT '',
+            sha256_verified INTEGER NOT NULL DEFAULT 0,
+            isolation_passed INTEGER NOT NULL DEFAULT 0,
+            isolation_method TEXT NOT NULL DEFAULT '',
+            auto_disabled INTEGER NOT NULL DEFAULT 0,
+            warning TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS token_ab_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tool TEXT NOT NULL,
+            enabled INTEGER NOT NULL,
+            phase_kind TEXT NOT NULL DEFAULT 'default',
+            engine TEXT NOT NULL DEFAULT '',
+            tokens_in INTEGER NOT NULL DEFAULT 0,
+            tokens_out INTEGER NOT NULL DEFAULT 0,
+            turns INTEGER NOT NULL DEFAULT 1,
+            retry_turns INTEGER NOT NULL DEFAULT 0,
+            success INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_token_ab_runs_tool_kind
+            ON token_ab_runs(tool, phase_kind, enabled);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
     (3, "003_nullable_router_step", _migration_003_nullable_router_step),
+    (4, "004_token_optimizer_tables", _migration_004_token_optimizer_tables),
 ]
 
 
@@ -1074,4 +1111,130 @@ class Store:
                 return False
             expected_prev = row["hash"]
         return True
+
+    def upsert_token_tool_state(
+        self,
+        tool: str,
+        *,
+        enabled: bool | None = None,
+        installed_version: str | None = None,
+        sha256_verified: bool | None = None,
+        isolation_passed: bool | None = None,
+        isolation_method: str | None = None,
+        auto_disabled: bool | None = None,
+        warning: str | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_token_tool_state(tool) or {
+            "tool": tool,
+            "enabled": 0,
+            "installed_version": "",
+            "sha256_verified": 0,
+            "isolation_passed": 0,
+            "isolation_method": "",
+            "auto_disabled": 0,
+            "warning": "",
+        }
+        now = _utc_now()
+        next_enabled = int(enabled) if enabled is not None else int(existing["enabled"])
+        next_ver = installed_version if installed_version is not None else str(existing["installed_version"])
+        next_sha = int(sha256_verified) if sha256_verified is not None else int(existing["sha256_verified"])
+        next_iso = int(isolation_passed) if isolation_passed is not None else int(existing["isolation_passed"])
+        next_iso_m = isolation_method if isolation_method is not None else str(existing["isolation_method"])
+        next_auto = int(auto_disabled) if auto_disabled is not None else int(existing["auto_disabled"])
+        next_warn = warning if warning is not None else str(existing["warning"])
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO token_tool_states (
+                    tool, enabled, installed_version, sha256_verified,
+                    isolation_passed, isolation_method, auto_disabled, warning, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(tool) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    installed_version = excluded.installed_version,
+                    sha256_verified = excluded.sha256_verified,
+                    isolation_passed = excluded.isolation_passed,
+                    isolation_method = excluded.isolation_method,
+                    auto_disabled = excluded.auto_disabled,
+                    warning = excluded.warning,
+                    updated_at = excluded.updated_at
+                """,
+                (tool, next_enabled, next_ver, next_sha, next_iso, next_iso_m, next_auto, next_warn, now),
+            )
+        row = self._conn.execute("SELECT * FROM token_tool_states WHERE tool = ?", (tool,)).fetchone()
+        return dict(row)
+
+    def get_token_tool_state(self, tool: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM token_tool_states WHERE tool = ?", (tool,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_token_tool_states(self) -> list[dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM token_tool_states ORDER BY tool ASC").fetchall()
+        return [dict(r) for r in rows]
+
+    def record_token_ab_run(
+        self,
+        *,
+        tool: str,
+        enabled: bool,
+        phase_kind: str = "default",
+        engine: str = "",
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        turns: int = 1,
+        retry_turns: int = 0,
+        success: bool = True,
+        created_at: str | None = None,
+    ) -> int:
+        ts = created_at or _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO token_ab_runs (
+                    tool, enabled, phase_kind, engine, tokens_in, tokens_out,
+                    turns, retry_turns, success, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tool,
+                    1 if enabled else 0,
+                    phase_kind,
+                    engine,
+                    int(tokens_in),
+                    int(tokens_out),
+                    int(turns),
+                    int(retry_turns),
+                    1 if success else 0,
+                    ts,
+                ),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_token_ab_runs(
+        self,
+        *,
+        tool: str | None = None,
+        phase_kind: str | None = None,
+        since_iso: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if tool:
+            clauses.append("tool = ?")
+            params.append(tool)
+        if phase_kind:
+            clauses.append("phase_kind = ?")
+            params.append(phase_kind)
+        if since_iso:
+            clauses.append("created_at >= ?")
+            params.append(since_iso)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM token_ab_runs {where} ORDER BY id ASC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
 

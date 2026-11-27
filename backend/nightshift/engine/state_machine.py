@@ -25,6 +25,9 @@ from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient, SubprocessGitGh
 from nightshift.engine.verify import assess_diff_risk, check_diff_guards, redact_secrets, verify_deliverable
 from nightshift.events import Event, EventBus
+from nightshift.optimizer.ab_framework import ABFramework
+from nightshift.optimizer.repomix import RepomixAdapter, ensure_worktree_git_excluded
+from nightshift.optimizer.tool_manager import ToolManager
 from nightshift.quota.ledger import QuotaLedger
 from nightshift.runners.base import Runner, RunnerResult
 from nightshift.runners.template import TemplateRunner
@@ -517,7 +520,23 @@ class EngineStateMachine:
             ))
 
             prompt_path = wt_dir / ".nightshift_prompt.md"
-            prompt_path.write_text(guardrail_header + phase.prompt, encoding="utf-8")
+            prompt_body = guardrail_header + phase.prompt
+            if (wt_dir / ".git").exists():
+                ensure_worktree_git_excluded(wt_dir)
+            repomix_state = self.store.get_token_tool_state("repomix")
+            if repomix_state and bool(repomix_state.get("enabled", 0)):
+                tm = ToolManager(store=self.store)
+                rm_res = RepomixAdapter(tm).generate_repo_map(wt_dir)
+                if rm_res.ok and rm_res.content:
+                    prompt_body = RepomixAdapter.inject_into_prompt(prompt_body, rm_res.content)
+                elif rm_res.warning:
+                    self.events.emit(Event(
+                        kind="token_optimizer.warning",
+                        plain_text=rm_res.warning,
+                        level="warn",
+                        phase_id=phase.id,
+                    ))
+            prompt_path.write_text(prompt_body, encoding="utf-8")
 
             implement_attempts = 0
             diff_guard_retries = 0

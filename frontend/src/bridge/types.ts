@@ -83,6 +83,7 @@ export interface DeckPayload {
     tokens_saved: number;
     estimate_label: string;
   };
+  token_savings_tonight?: TokenSavingsTonight;
   guards?: GuardStatusItem[];
   problems?: string | null;
   updated_at: string;
@@ -247,6 +248,72 @@ export interface PhoneStatusTestResult {
   ok: boolean;
   lastResult: string;
   lastResultAt: string;
+}
+
+export interface TokenSavingsToolItem {
+  tool: string;
+  enabled: boolean;
+  autoDisabled: boolean;
+  tokensSavedTonight: number;
+  estimateLabel: string;
+  abAction: "keep_enabled" | "auto_disable" | "keep_measuring";
+  abReason: string;
+  warning: string;
+}
+
+export interface TokenSavingsTonight {
+  totalTokensSaved: number;
+  estimateLabel: string;
+  perTool: TokenSavingsToolItem[];
+  warnings: string[];
+  isEstimate: boolean;
+}
+
+export interface TokenOptimizerToolItem {
+  name: string;
+  displayName: string;
+  role: string;
+  version: string;
+  artifact: string;
+  sha256: string;
+  license: string;
+  runners: string[];
+  catalogueOnly: boolean;
+  isolationGateRequired: boolean;
+  isolationPassed: boolean;
+  isolationMethod: string;
+  sha256Verified: boolean;
+  enabled: boolean;
+  autoDisabled: boolean;
+  status:
+    | "enabled"
+    | "disabled"
+    | "auto_disabled"
+    | "isolation_blocked"
+    | "hash_mismatch"
+    | "catalogue_only";
+  warning: string;
+  tokensSavedTonight: number;
+  estimateLabel: string;
+  abAction: "keep_enabled" | "auto_disable" | "keep_measuring";
+  abReason: string;
+}
+
+export interface TokenOptimizerState {
+  tools: TokenOptimizerToolItem[];
+  totalTokensSaved: number;
+  estimateLabel: string;
+  warnings: string[];
+  toolsRoot: string;
+  telemetryOff: boolean;
+  isEstimate: boolean;
+  probeResult?: {
+    passed: boolean;
+    method: string;
+    reason: string;
+    globalConfigModified: boolean;
+    candidatesTried: string[];
+  };
 }
 
 export interface Bridge {
