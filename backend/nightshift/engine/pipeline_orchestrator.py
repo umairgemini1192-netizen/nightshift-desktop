@@ -1070,11 +1070,13 @@ class TaskOrchestrator:
         is_pid_alive: Callable[[int], bool] = is_process_alive,
         checkpoint_fn: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[str]:
-        """On startup, WIP-checkpoint and release leases for RUNNING tasks whose worker died or lease expired."""
+        """On startup, WIP-checkpoint and release leases for RUNNING and post-coding tasks whose worker died or lease expired (P1)."""
         recovered: list[str] = []
         now = _utc_now()
-        running = self.store.list_tasks(status="RUNNING")
-        for task in running:
+        # P1: Also recover post-coding states (VERIFYING, REVIEWING, APPROVED, MERGED)
+        orphan_statuses = ("RUNNING", "VERIFYING", "REVIEWING", "APPROVED", "MERGED")
+        orphan_tasks = self.store.list_tasks(status__in=orphan_statuses)
+        for task in orphan_tasks:
             pid = task.get("worker_pid")
             exp_dt = _parse_iso(task.get("lease_expires_at"))
             expired = exp_dt is None or exp_dt <= now
@@ -1094,7 +1096,7 @@ class TaskOrchestrator:
                         """
                         UPDATE tasks
                         SET lease_token = NULL, lease_expires_at = NULL, worker_pid = NULL, updated_at = ?
-                        WHERE id = ? AND status = 'RUNNING' AND lease_token IS NULL
+                        WHERE id = ? AND status IN ('RUNNING', 'VERIFYING', 'REVIEWING', 'APPROVED', 'MERGED') AND lease_token IS NULL
                         """,
                         (_utc_iso(), task["id"]),
                     )
@@ -1103,7 +1105,7 @@ class TaskOrchestrator:
                         """
                         UPDATE tasks
                         SET lease_token = NULL, lease_expires_at = NULL, worker_pid = NULL, updated_at = ?
-                        WHERE id = ? AND status = 'RUNNING' AND lease_token = ?
+                        WHERE id = ? AND status IN ('RUNNING', 'VERIFYING', 'REVIEWING', 'APPROVED', 'MERGED') AND lease_token = ?
                         """,
                         (_utc_iso(), task["id"], expected_token),
                     )

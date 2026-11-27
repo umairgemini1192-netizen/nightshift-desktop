@@ -596,6 +596,25 @@ class EngineStateMachine:
         finally:
             self.task_orchestrator.release_lease(task_id, lease_token)
 
+    def _extract_expected_assets_from_glob(self, glob_pattern: str) -> list[str]:
+        """Extract common artifact names from glob pattern for release verification (P1)."""
+        # Common artifact names for each glob pattern
+        glob_artifact_map: dict[str, list[str]] = {
+            "*.apk": ["app-release.apk", "app-debug.apk", "app-universal.apk", "app-release-unsigned.apk"],
+            "*.aab": ["app-release.aab", "app-bundle.aab", "app-release.aab"],
+            "*.jar": ["app.jar", "library.jar", "core.jar"],
+            "*.zip": ["app.zip", "release.zip", "package.zip"],
+            "*.tar.gz": ["app.tar.gz", "release.tar.gz", "package.tar.gz"],
+            "*.exe": ["app.exe", "installer.exe", "setup.exe"],
+            "*.dmg": ["app.dmg", "installer.dmg", "setup.dmg"],
+        }
+        # Extract base pattern (e.g., "*.apk" -> "apk")
+        base_pattern = glob_pattern.lstrip("*.").lower()
+        if base_pattern in glob_artifact_map:
+            return glob_artifact_map[base_pattern]
+        # Fallback: return common names for generic pattern
+        return ["artifact", "release", "package"]
+
     async def _execute_phase_leased(
         self,
         *,
@@ -623,6 +642,21 @@ class EngineStateMachine:
             f"- Commit cleanly, push `{phase.branch}`, and open a PR targeting `main` (if PR exists, push to it).\n"
             "- NEVER merge to `main` or cut releases yourself; the orchestrator merges after CI passes.\n\n"
         )
+
+        # Lease renewal helper (P1: renew throughout phase execution)
+        async def renew_lease_if_needed() -> None:
+            """Renew lease if it's nearing expiry (30s before expiry)."""
+            from datetime import datetime, timezone
+            exp_dt = _parse_iso(task_row.get("lease_expires_at"))
+            if exp_dt:
+                remaining = (exp_dt - datetime.now(timezone.utc)).total_seconds()
+                if remaining < 30:
+                    new_expires = _utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1800))
+                    self.task_orchestrator.renew_lease(task_id, lease_token, lease_seconds=1800)
+                    logger.debug(f"Renewed task {task_id} lease to {new_expires}")
+
+        # Get initial task row for lease tracking
+        task_row = self.store.get_task(task_id)
         if project.ui_contract:
             guardrail_header += f"{project.ui_contract}\n\n"
 
@@ -694,6 +728,8 @@ class EngineStateMachine:
                 plain_text=f"PR #{pr_number} already open for {phase.branch} -> skipping implementation, resuming at CI watch.",
                 phase_id=phase.id,
             ))
+            # Renew lease after PR adoption (P1)
+            await renew_lease_if_needed()
         else:
             # Implementation ladder loop with mid-phase handoff & fast switch-back
             cur_task = self.store.get_task(task_id)
@@ -938,6 +974,8 @@ class EngineStateMachine:
                         phase_id=phase.id,
                         raw_path=str(raw_log_path),
                     ))
+                    # Renew lease after successful delivery (P1)
+                    await renew_lease_if_needed()
                     break
 
                 # Failure, diff-guard finding, or quota exhaustion -> self-heal / mid-phase handoff
@@ -1080,6 +1118,8 @@ class EngineStateMachine:
                 )
             else:
                 self.store.update_task_fields(task_id, **task_updates)
+            # Renew lease after CI watch (P1)
+            await renew_lease_if_needed()
 
         guard_failure = park_on_diff_guard()
         if guard_failure:
@@ -1313,6 +1353,8 @@ class EngineStateMachine:
                 phase_id=phase.id,
                 payload={"project_id": project.id},
             ))
+            # Renew lease after merge approval (P1)
+            await renew_lease_if_needed()
             detail = f"Merged PR #{pr_number}"
 
             merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
@@ -1387,10 +1429,12 @@ class EngineStateMachine:
                 if not effective_lease:
                     acquired_temp_lease = self.task_orchestrator.acquire_lease(t_id)
                     effective_lease = acquired_temp_lease
+                # P1: Verify required artifacts exist before adopting release (not just SHA256SUMS.txt)
+                expected_assets = self._extract_expected_assets_from_glob(project.artifact_glob)
                 rel_reconcile = self.task_orchestrator.reconcile_release_for_merge_sha(
                     task_id=t_id,
                     merge_sha=str(merge_sha),
-                    expected_asset_names=[],
+                    expected_asset_names=expected_assets,
                     lease_token=effective_lease,
                     release_list_lookup=lambda: self.vcs.list_releases(project.repo),
                 )
