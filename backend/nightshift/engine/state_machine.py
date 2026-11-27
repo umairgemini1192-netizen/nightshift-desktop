@@ -24,6 +24,7 @@ from nightshift.engine.pipeline_evidence import (
     DEFAULT_MIN_BUILD_DURATION_S,
     DEFAULT_MIN_GATE_DURATION_S,
     DEFAULT_NIGHTSHIFT_REQUIRED_JOBS,
+    EvidenceValidationResult,
     persist_ci_evidence,
     persist_screenshot_evidence,
     validate_ci_evidence,
@@ -84,6 +85,7 @@ class ProjectConfig:
     min_gate_duration_seconds: float = DEFAULT_MIN_GATE_DURATION_S
     min_build_duration_seconds: float = DEFAULT_MIN_BUILD_DURATION_S
     screenshot_manifest_path: str = ""
+    screenshot_job_name: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProjectConfig:
@@ -152,6 +154,7 @@ class ProjectConfig:
             min_gate_duration_seconds=min_gate,
             min_build_duration_seconds=min_build,
             screenshot_manifest_path=str(data.get("screenshot_manifest_path") or ""),
+            screenshot_job_name=str(data.get("screenshot_job_name") or ""),
         )
 
 
@@ -1200,20 +1203,43 @@ class EngineStateMachine:
 
             if project.screenshot_manifest_path:
                 manifest_p = Path(project.screenshot_manifest_path)
-                frontend_job = next(
-                    (
-                        j
-                        for j in observed_jobs
-                        if j.name == "desktop-frontend" and j.commit_sha == ci_res.checked_sha and j.build_id
-                    ),
-                    None,
-                )
-                expected_shot_build = frontend_job.build_id if frontend_job is not None else None
-                shot_ev = validate_screenshot_manifest(
-                    manifest_p,
-                    expected_commit_sha=ci_res.checked_sha,
-                    expected_build_id=expected_shot_build,
-                )
+                producer_job_name = project.screenshot_job_name.strip()
+                if not producer_job_name and "desktop-frontend" in project.required_ci_jobs:
+                    producer_job_name = "desktop-frontend"
+
+                producer_job = None
+                if producer_job_name and ci_ev.job_results.get(producer_job_name) == (True, ""):
+                    producer_job = next(
+                        (
+                            j
+                            for j in reversed(observed_jobs)
+                            if j.name == producer_job_name
+                            and j.commit_sha == ci_res.checked_sha
+                            and (j.status or "").strip().lower() == "success"
+                            and j.build_id
+                        ),
+                        None,
+                    )
+
+                if producer_job is None:
+                    detail_msg = (
+                        f"Configured screenshot producer job '{producer_job_name}' has no verified successful build on {ci_res.checked_sha[:7]}."
+                        if producer_job_name
+                        else "No screenshot_job_name configured and default 'desktop-frontend' is not in required_ci_jobs; cannot verify screenshot producer build."
+                    )
+                    shot_ev = EvidenceValidationResult(
+                        verified=False,
+                        rejection_reason="missing_screenshot_producer_job",
+                        details=[detail_msg],
+                    )
+                    expected_shot_build = ""
+                else:
+                    expected_shot_build = producer_job.build_id
+                    shot_ev = validate_screenshot_manifest(
+                        manifest_p,
+                        expected_commit_sha=ci_res.checked_sha,
+                        expected_build_id=expected_shot_build,
+                    )
                 persist_screenshot_evidence(
                     self.store,
                     task_id=task_id,
@@ -1221,7 +1247,7 @@ class EngineStateMachine:
                     commit_sha=ci_res.checked_sha,
                     manifest_path=manifest_p,
                     validation=shot_ev,
-                    build_id=expected_shot_build or "",
+                    build_id=expected_shot_build,
                 )
                 if not shot_ev.verified:
                     shot_reason = f"Screenshot manifest rejected ({shot_ev.rejection_reason}): {'; '.join(shot_ev.details)}"

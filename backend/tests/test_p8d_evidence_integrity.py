@@ -893,6 +893,7 @@ def test_subprocess_git_gh_circleci_status_resolves_build_num_duration_and_artif
     from nightshift.engine.vcs import SubprocessGitGh
 
     wf_id = "daf4a8fa-1bb8-4aab-a88d-3f56bb91f7d0"
+    pipe_id = "6b33c8ab-90b5-4a12-90f8-123456789abc"
     fe_uuid = "4cd387cd-f053-4ef0-bb63-2d3160104ae4"
     pkg_uuid = "94bb1474-ba72-4c46-b510-95c8b44a814c"
     slug = "circleci/org123/proj456"
@@ -938,6 +939,19 @@ def test_subprocess_git_gh_circleci_status_resolves_build_num_duration_and_artif
 
     def fake_http_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any] | None:
         http_calls.append(url)
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}":
+            return {
+                "id": wf_id,
+                "pipeline_id": pipe_id,
+                "project_slug": slug,
+                "status": "success",
+            }
+        if url == f"https://circleci.com/api/v2/pipeline/{pipe_id}":
+            return {
+                "id": pipe_id,
+                "project_slug": slug,
+                "vcs": {"revision": "sha_circle_1", "branch": "feat/p8d"},
+            }
         if url == f"https://circleci.com/api/v2/workflow/{wf_id}/job":
             return {
                 "items": [
@@ -997,8 +1011,10 @@ def test_subprocess_git_gh_circleci_status_resolves_build_num_duration_and_artif
     jobs = vcs.get_commit_ci_checks("owner/nightshift-desktop", "sha_circle_1", branch="feat/p8d")
 
     assert len(jobs) == 2
-    # Workflow endpoint is queried once and cached for all jobs in that workflow.
+    # Workflow jobs, workflow metadata, and pipeline revision are queried once and cached for all jobs.
     assert http_calls.count(f"https://circleci.com/api/v2/workflow/{wf_id}/job") == 1
+    assert http_calls.count(f"https://circleci.com/api/v2/workflow/{wf_id}") == 1
+    assert http_calls.count(f"https://circleci.com/api/v2/pipeline/{pipe_id}") == 1
 
     fe_job = next(j for j in jobs if j.name == "desktop-frontend")
     pkg_job = next(j for j in jobs if j.name == "desktop-package")
@@ -1246,3 +1262,337 @@ def test_desktop_bridge_persists_project_evidence_config_for_android_and_desktop
         assert q_cfg.min_gate_duration_seconds == 4.0
         assert q_cfg.min_build_duration_seconds == 20.0
         assert q_cfg.screenshot_manifest_path == "shots/screenshot-manifest.json"
+
+
+def test_subprocess_git_gh_rejects_circleci_build_with_mismatched_or_missing_revision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    wf_stale = "11111111-1111-4111-8111-111111111111"
+    pipe_stale = "22222222-2222-4222-8222-222222222222"
+    wf_missing = "33333333-3333-4333-8333-333333333333"
+    pipe_legacy_bad = "44444444-4444-4444-8444-444444444444"
+    slug = "circleci/org123/proj456"
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (0, json.dumps({"total_count": 0, "check_runs": []}), "", False)
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "sha": "sha_new_2",
+                        "state": "success",
+                        "statuses": [
+                            {
+                                "id": 7001,
+                                "context": "ci/circleci: desktop-backend",
+                                "state": "success",
+                                "target_url": f"https://app.circleci.com/workflow/{wf_stale}/job/aaaa",
+                            },
+                            {
+                                "id": 7002,
+                                "context": "ci/circleci: desktop-gates",
+                                "state": "success",
+                                "target_url": f"https://app.circleci.com/workflow/{wf_missing}/job/bbbb",
+                            },
+                            {
+                                "id": 7003,
+                                "context": "ci/circleci: desktop-package",
+                                "state": "success",
+                                "target_url": "https://circleci.com/gh/owner/nightshift-desktop/77",
+                            },
+                        ],
+                    }
+                ),
+                "",
+                False,
+            )
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    http_calls: list[str] = []
+
+    def fake_http_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any] | None:
+        http_calls.append(url)
+        if url == f"https://circleci.com/api/v2/workflow/{wf_stale}":
+            return {"id": wf_stale, "pipeline_id": pipe_stale}
+        if url == f"https://circleci.com/api/v2/pipeline/{pipe_stale}":
+            return {"id": pipe_stale, "vcs": {"revision": "sha_old_1"}}
+        if url == f"https://circleci.com/api/v2/workflow/{wf_stale}/job":
+            return {
+                "items": [
+                    {
+                        "id": "aaaa",
+                        "job_number": 90,
+                        "name": "desktop-backend",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T21:00:00Z",
+                        "stopped_at": "2026-11-27T21:05:00Z",
+                    }
+                ]
+            }
+        if url == f"https://circleci.com/api/v2/workflow/{wf_missing}":
+            return None
+        if url == f"https://circleci.com/api/v2/workflow/{wf_missing}/job":
+            return {
+                "items": [
+                    {
+                        "id": "bbbb",
+                        "job_number": 91,
+                        "name": "desktop-gates",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T21:00:00Z",
+                        "stopped_at": "2026-11-27T21:01:00Z",
+                    }
+                ]
+            }
+        if url == "https://circleci.com/api/v2/project/gh/owner/nightshift-desktop/job/77":
+            return {
+                "status": "success",
+                "started_at": "2026-11-27T21:00:00Z",
+                "stopped_at": "2026-11-27T21:03:00Z",
+                "pipeline": {"id": pipe_legacy_bad},
+            }
+        if url == f"https://circleci.com/api/v2/pipeline/{pipe_legacy_bad}":
+            return {"id": pipe_legacy_bad, "vcs": {"revision": "sha_legacy_old"}}
+        return None
+
+    vcs = SubprocessGitGh(http_json_get=fake_http_json, http_artifact_size=lambda *_: 4096)
+    jobs = vcs.get_commit_ci_checks("owner/nightshift-desktop", "sha_new_2", branch="feat/p8d")
+
+    by_name = {j.name: j for j in jobs}
+    # Older CircleCI build is NOT relabeled to sha_new_2; duration & artifacts are rejected.
+    assert by_name["desktop-backend"].commit_sha == "sha_old_1"
+    assert by_name["desktop-backend"].duration_seconds == 0.0
+    assert by_name["desktop-backend"].artifacts == []
+
+    # Unresolvable CircleCI revision fails closed with empty commit_sha.
+    assert by_name["desktop-gates"].commit_sha == ""
+    assert by_name["desktop-gates"].duration_seconds == 0.0
+    assert by_name["desktop-gates"].artifacts == []
+
+    # Legacy direct CircleCI job URL also checks pipeline revision and rejects mismatch.
+    assert by_name["desktop-package"].commit_sha == "sha_legacy_old"
+    assert by_name["desktop-package"].duration_seconds == 0.0
+    assert by_name["desktop-package"].artifacts == []
+
+    # Artifacts endpoint must never be fetched for mismatched/unverified revisions.
+    assert not any("/artifacts" in u for u in http_calls)
+
+    ev = validate_ci_evidence(
+        expected_commit_sha="sha_new_2",
+        required_jobs=["desktop-backend", "desktop-gates", "desktop-package"],
+        observed_jobs=jobs,
+    )
+    assert ev.verified is False
+    assert ev.rejection_reason == "stale_commit_sha"
+
+
+@pytest.mark.asyncio
+async def test_e2e_screenshot_manifest_requires_verified_producer_for_custom_job_names(tmp_path: Path) -> None:
+    # 1. Custom Android job names with NO screenshot_job_name configured: must fail closed!
+    vcs1 = FakeGitGh()
+    vcs1.add_pr("feat/android-noproducer", number=820, head_sha="sha_and_1")
+    vcs1.commit_ci_checks["sha_and_1"] = [
+        CiJobCheck(
+            name="android-lint",
+            status="success",
+            commit_sha="sha_and_1",
+            build_id="and-10",
+            duration_seconds=20.0,
+            branch="feat/android-noproducer",
+        ),
+        CiJobCheck(
+            name="android-ui-tests",
+            status="success",
+            commit_sha="sha_and_1",
+            build_id="and-42",
+            duration_seconds=95.0,
+            artifacts=[CiArtifact(path="shots/screenshot-manifest.json", size_bytes=1024, build_id="and-42")],
+            branch="feat/android-noproducer",
+        ),
+    ]
+    unrelated_manifest = _make_valid_manifest(
+        tmp_path / "shots-unrelated",
+        commit_sha="sha_and_1",
+        build_id="unrelated-999",
+    )
+    store1, engine1 = _build_engine(tmp_path / "s1", vcs1)
+    try:
+        project1 = ProjectConfig(
+            id="proj-and-1",
+            name="DriveLift",
+            repo="owner/drivelift",
+            local_path=tmp_path / "repo1",
+            output_dir=tmp_path / "out1",
+            required_ci_jobs=["android-lint", "android-ui-tests"],
+            screenshot_manifest_path=str(unrelated_manifest),
+        )
+        phase1 = PhaseDefinition(
+            id="p-and-1",
+            title="Android UI without producer job configured",
+            prompt="Implement UI",
+            branch="feat/android-noproducer",
+            auto_merge=True,
+            release_after_merge=False,
+        )
+        rows1 = await engine1.execute_plan(project1, [phase1], plan_id="plan-and-1")
+        assert rows1[0]["status"] == "PARKED"
+        assert "missing_screenshot_producer_job" in rows1[0]["detail"]
+        assert "feat/android-noproducer" not in vcs1.merged_prs
+    finally:
+        store1.close()
+
+    # 2. Custom Android screenshot_job_name configured, but manifest build_id does NOT match: rejected!
+    vcs2 = FakeGitGh()
+    vcs2.add_pr("feat/android-badbuild", number=821, head_sha="sha_and_2")
+    vcs2.commit_ci_checks["sha_and_2"] = [
+        CiJobCheck(
+            name="android-ui-tests",
+            status="success",
+            commit_sha="sha_and_2",
+            build_id="and-42",
+            duration_seconds=95.0,
+            branch="feat/android-badbuild",
+        ),
+    ]
+    bad_build_manifest = _make_valid_manifest(
+        tmp_path / "shots-badbuild",
+        commit_sha="sha_and_2",
+        build_id="unrelated-999",
+    )
+    store2, engine2 = _build_engine(tmp_path / "s2", vcs2)
+    try:
+        project2 = ProjectConfig(
+            id="proj-and-2",
+            name="DriveLift",
+            repo="owner/drivelift",
+            local_path=tmp_path / "repo2",
+            output_dir=tmp_path / "out2",
+            required_ci_jobs=["android-ui-tests"],
+            screenshot_manifest_path=str(bad_build_manifest),
+            screenshot_job_name="android-ui-tests",
+        )
+        phase2 = PhaseDefinition(
+            id="p-and-2",
+            title="Android UI mismatched build id",
+            prompt="Implement UI",
+            branch="feat/android-badbuild",
+            auto_merge=True,
+            release_after_merge=False,
+        )
+        rows2 = await engine2.execute_plan(project2, [phase2], plan_id="plan-and-2")
+        assert rows2[0]["status"] == "PARKED"
+        assert "screenshot_build_id_mismatch" in rows2[0]["detail"]
+        assert "feat/android-badbuild" not in vcs2.merged_prs
+    finally:
+        store2.close()
+
+    # 3. Custom Android screenshot_job_name configured AND manifest build_id matches verified producer: passes!
+    vcs3 = FakeGitGh()
+    vcs3.add_pr("feat/android-good", number=822, head_sha="sha_and_3")
+    vcs3.commit_ci_checks["sha_and_3"] = [
+        CiJobCheck(
+            name="android-ui-tests",
+            status="success",
+            commit_sha="sha_and_3",
+            build_id="and-42",
+            duration_seconds=95.0,
+            branch="feat/android-good",
+        ),
+    ]
+    vcs3.commit_ci_checks["sha_merge_123"] = [
+        CiJobCheck(
+            name="android-ui-tests",
+            status="success",
+            commit_sha="sha_merge_123",
+            build_id="and-post-43",
+            duration_seconds=95.0,
+            branch="main",
+        ),
+    ]
+    good_manifest = _make_valid_manifest(
+        tmp_path / "shots-good",
+        commit_sha="sha_and_3",
+        build_id="and-42",
+    )
+    store3, engine3 = _build_engine(tmp_path / "s3", vcs3)
+    try:
+        project3 = ProjectConfig(
+            id="proj-and-3",
+            name="DriveLift",
+            repo="owner/drivelift",
+            local_path=tmp_path / "repo3",
+            output_dir=tmp_path / "out3",
+            required_ci_jobs=["android-ui-tests"],
+            screenshot_manifest_path=str(good_manifest),
+            screenshot_job_name="android-ui-tests",
+        )
+        phase3 = PhaseDefinition(
+            id="p-and-3",
+            title="Android UI matching producer job",
+            prompt="Implement UI",
+            branch="feat/android-good",
+            auto_merge=True,
+            release_after_merge=False,
+        )
+        rows3 = await engine3.execute_plan(project3, [phase3], plan_id="plan-and-3")
+        assert rows3[0]["status"] == "COMPLETED", rows3[0].get("detail")
+        assert "feat/android-good" in vcs3.merged_prs
+    finally:
+        store3.close()
+
+
+def test_queue_export_import_preserves_duration_thresholds_and_screenshot_job_name(tmp_path: Path) -> None:
+    from nightshift.bridge import BridgeAPI
+    from nightshift.engine.planner import export_queue_json, import_queue_json
+    from nightshift.modules.registry import ModuleRegistry
+
+    with Store(tmp_path / "src.db") as src_store:
+        src_store.migrate()
+        proj = src_store.create_project(
+            "owner/custom-thresholds",
+            "Custom Thresholds",
+            "owner/custom-thresholds",
+            str(tmp_path / "repo"),
+            required_ci_jobs_json=json.dumps(["fast-gate", "android-ui-tests"]),
+            required_artifacts_by_job_json=json.dumps({"android-ui-tests": ["shots/screenshot-manifest.json"]}),
+            min_gate_duration_seconds=1.5,
+            min_build_duration_seconds=2.5,
+            screenshot_manifest_path="shots/screenshot-manifest.json",
+            screenshot_job_name="android-ui-tests",
+        )
+        plan = src_store.create_plan("plan-th", proj["id"], "Threshold Plan")
+        phase = PhaseDefinition(id="p1", title="P1", branch="feat/p1")
+
+        exported = export_queue_json(proj, plan, [phase])
+        assert exported["min_gate_duration_seconds"] == 1.5
+        assert exported["min_build_duration_seconds"] == 2.5
+        assert exported["screenshot_manifest_path"] == "shots/screenshot-manifest.json"
+        assert exported["screenshot_job_name"] == "android-ui-tests"
+
+        reimported = import_queue_json(exported)
+        assert reimported["project"]["min_gate_duration_seconds"] == 1.5
+        assert reimported["project"]["min_build_duration_seconds"] == 2.5
+        assert reimported["project"]["screenshot_job_name"] == "android-ui-tests"
+
+    # Full round-trip into a fresh Store via BridgeAPI plan.importQueue
+    with Store(tmp_path / "dst.db") as dst_store:
+        dst_store.migrate()
+        bridge = BridgeAPI(dst_store, EventBus(store=dst_store), ModuleRegistry())
+        resp = bridge.call("plan.importQueue", {"queue": exported})
+        assert resp["ok"] is True
+
+        fresh_row = dst_store.get_project("owner/custom-thresholds")
+        assert fresh_row is not None
+        cfg = ProjectConfig.from_dict(fresh_row)
+        assert cfg.min_gate_duration_seconds == 1.5
+        assert cfg.min_build_duration_seconds == 2.5
+        assert cfg.screenshot_manifest_path == "shots/screenshot-manifest.json"
+        assert cfg.screenshot_job_name == "android-ui-tests"

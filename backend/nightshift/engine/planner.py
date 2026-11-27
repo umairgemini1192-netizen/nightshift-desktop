@@ -204,6 +204,8 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
         project["min_build_duration_seconds"] = float(cfg["min_build_duration_seconds"])
     if "screenshot_manifest_path" in cfg and cfg["screenshot_manifest_path"] is not None:
         project["screenshot_manifest_path"] = str(cfg["screenshot_manifest_path"])
+    if "screenshot_job_name" in cfg and cfg["screenshot_job_name"] is not None:
+        project["screenshot_job_name"] = str(cfg["screenshot_job_name"])
 
     plan_id = str(cfg.get("plan_id") or f"plan_{project_id}")
     plan = {
@@ -342,8 +344,14 @@ def export_queue_json(
             raw_req_arts = None
     if isinstance(raw_req_arts, dict) and raw_req_arts:
         exported["required_artifacts_by_job"] = raw_req_arts
+    if project.get("min_gate_duration_seconds") is not None:
+        exported["min_gate_duration_seconds"] = float(project["min_gate_duration_seconds"])
+    if project.get("min_build_duration_seconds") is not None:
+        exported["min_build_duration_seconds"] = float(project["min_build_duration_seconds"])
     if project.get("screenshot_manifest_path"):
         exported["screenshot_manifest_path"] = str(project["screenshot_manifest_path"])
+    if project.get("screenshot_job_name"):
+        exported["screenshot_job_name"] = str(project["screenshot_job_name"])
     return exported
 
 

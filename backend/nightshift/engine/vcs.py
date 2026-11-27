@@ -314,16 +314,69 @@ class SubprocessGitGh:
             headers["Circle-Token"] = token
         return headers
 
+    def _resolve_circleci_pipeline_revision(
+        self,
+        pipeline_id: str,
+        headers: dict[str, str],
+        pipeline_revision_cache: dict[str, str],
+    ) -> str:
+        if not pipeline_id:
+            return ""
+        if pipeline_id not in pipeline_revision_cache:
+            pipe_url = f"https://circleci.com/api/v2/pipeline/{pipeline_id}"
+            pipe_payload = self._http_json_get(pipe_url, headers, 30)
+            rev = ""
+            if pipe_payload:
+                vcs_info = pipe_payload.get("vcs")
+                if isinstance(vcs_info, dict) and vcs_info.get("revision"):
+                    rev = str(vcs_info["revision"]).strip()
+                elif pipe_payload.get("revision"):
+                    rev = str(pipe_payload["revision"]).strip()
+            pipeline_revision_cache[pipeline_id] = rev
+        return pipeline_revision_cache[pipeline_id]
+
+    def _resolve_circleci_workflow_revision(
+        self,
+        workflow_id: str,
+        headers: dict[str, str],
+        workflow_revision_cache: dict[str, str],
+        pipeline_revision_cache: dict[str, str],
+    ) -> str:
+        if not workflow_id:
+            return ""
+        if workflow_id not in workflow_revision_cache:
+            wf_meta_url = f"https://circleci.com/api/v2/workflow/{workflow_id}"
+            wf_meta = self._http_json_get(wf_meta_url, headers, 30)
+            rev = ""
+            if wf_meta:
+                if wf_meta.get("vcs_revision"):
+                    rev = str(wf_meta["vcs_revision"]).strip()
+                elif isinstance(wf_meta.get("vcs"), dict) and wf_meta["vcs"].get("revision"):
+                    rev = str(wf_meta["vcs"]["revision"]).strip()
+                else:
+                    pipeline_id = str(wf_meta.get("pipeline_id") or "").strip()
+                    if pipeline_id:
+                        rev = self._resolve_circleci_pipeline_revision(
+                            pipeline_id,
+                            headers,
+                            pipeline_revision_cache,
+                        )
+            workflow_revision_cache[workflow_id] = rev
+        return workflow_revision_cache[workflow_id]
+
     def _resolve_circleci_job(
         self,
         *,
         target_url: str,
         repo: str,
         job_name: str,
+        expected_commit_sha: str,
         workflow_cache: dict[str, list[dict[str, Any]]],
+        workflow_revision_cache: dict[str, str],
+        pipeline_revision_cache: dict[str, str],
         artifacts_cache: dict[tuple[str, str], list[CiArtifact]],
-    ) -> tuple[str, float, list[CiArtifact], str] | None:
-        """Resolve authoritative CircleCI build number, duration, artifacts, and status."""
+    ) -> tuple[str, float, list[CiArtifact], str, str] | None:
+        """Resolve authoritative CircleCI build number, duration, artifacts, status, and VCS revision."""
         from nightshift.engine.pipeline_evidence import CiArtifact
 
         parsed = _parse_circleci_target(target_url, repo)
@@ -337,8 +390,15 @@ class SubprocessGitGh:
         job_number = parsed["job_number"]
         duration = 0.0
         ci_status = ""
+        circle_revision = ""
 
         if workflow_id:
+            circle_revision = self._resolve_circleci_workflow_revision(
+                workflow_id,
+                headers,
+                workflow_revision_cache,
+                pipeline_revision_cache,
+            )
             if workflow_id not in workflow_cache:
                 wf_items: list[dict[str, Any]] = []
                 page_token = ""
@@ -384,18 +444,41 @@ class SubprocessGitGh:
                 if started and stopped:
                     duration = max(0.0, (stopped - started).total_seconds())
 
-        if job_number and project_slug and duration <= 0.0:
+        if job_number and project_slug and (duration <= 0.0 or not circle_revision):
             job_url = f"https://circleci.com/api/v2/project/{project_slug}/job/{job_number}"
             job_payload = self._http_json_get(job_url, headers, 30)
             if job_payload:
                 if not ci_status and job_payload.get("status"):
                     ci_status = str(job_payload["status"]).strip().lower()
-                started = _parse_iso_dt(job_payload.get("started_at"))
-                stopped = _parse_iso_dt(job_payload.get("stopped_at"))
-                if started and stopped:
-                    duration = max(0.0, (stopped - started).total_seconds())
-                elif isinstance(job_payload.get("duration"), (int, float)) and job_payload["duration"] > 0:
-                    duration = float(job_payload["duration"]) / 1000.0
+                if duration <= 0.0:
+                    started = _parse_iso_dt(job_payload.get("started_at"))
+                    stopped = _parse_iso_dt(job_payload.get("stopped_at"))
+                    if started and stopped:
+                        duration = max(0.0, (stopped - started).total_seconds())
+                    elif isinstance(job_payload.get("duration"), (int, float)) and job_payload["duration"] > 0:
+                        duration = float(job_payload["duration"]) / 1000.0
+                if not circle_revision:
+                    if job_payload.get("vcs_revision"):
+                        circle_revision = str(job_payload["vcs_revision"]).strip()
+                    elif isinstance(job_payload.get("vcs"), dict) and job_payload["vcs"].get("revision"):
+                        circle_revision = str(job_payload["vcs"]["revision"]).strip()
+                    elif isinstance(job_payload.get("pipeline"), dict) and job_payload["pipeline"].get("id"):
+                        circle_revision = self._resolve_circleci_pipeline_revision(
+                            str(job_payload["pipeline"]["id"]).strip(),
+                            headers,
+                            pipeline_revision_cache,
+                        )
+                    elif isinstance(job_payload.get("latest_workflow"), dict) and job_payload["latest_workflow"].get("id"):
+                        circle_revision = self._resolve_circleci_workflow_revision(
+                            str(job_payload["latest_workflow"]["id"]).strip(),
+                            headers,
+                            workflow_revision_cache,
+                            pipeline_revision_cache,
+                        )
+
+        # Reject unverified or mismatched CircleCI revisions before accepting duration or artifacts.
+        if expected_commit_sha and circle_revision != expected_commit_sha:
+            return (job_number, 0.0, [], ci_status, circle_revision)
 
         artifacts: list[CiArtifact] = []
         if job_number and project_slug:
@@ -445,7 +528,7 @@ class SubprocessGitGh:
                 artifacts_cache[cache_key] = collected
             artifacts = list(artifacts_cache[cache_key])
 
-        return (job_number, duration, artifacts, ci_status)
+        return (job_number, duration, artifacts, ci_status, circle_revision)
 
     def _fetch_gh_actions_artifacts(
         self,
@@ -703,6 +786,8 @@ class SubprocessGitGh:
             return "failed"
 
         workflow_cache: dict[str, list[dict[str, Any]]] = {}
+        workflow_revision_cache: dict[str, str] = {}
+        pipeline_revision_cache: dict[str, str] = {}
         circle_artifacts_cache: dict[tuple[str, str], list[CiArtifact]] = {}
         gh_artifacts_cache: dict[str, list[dict[str, Any]]] = {}
 
@@ -741,17 +826,26 @@ class SubprocessGitGh:
                         target_url=details_url,
                         repo=repo,
                         job_name=norm_name,
+                        expected_commit_sha=commit_sha,
                         workflow_cache=workflow_cache,
+                        workflow_revision_cache=workflow_revision_cache,
+                        pipeline_revision_cache=pipeline_revision_cache,
                         artifacts_cache=circle_artifacts_cache,
                     )
                     if circle_info is not None:
-                        c_build_id, c_duration, c_artifacts, c_status = circle_info
+                        c_build_id, c_duration, c_artifacts, c_status, c_revision = circle_info
                         if c_build_id:
                             build_id = c_build_id
-                        if c_duration > 0.0:
-                            duration = c_duration
-                        artifacts = c_artifacts
-                        eff_status = _map_circleci_status(c_status, eff_status)
+                        if c_revision == commit_sha:
+                            if c_duration > 0.0:
+                                duration = c_duration
+                            artifacts = c_artifacts
+                            eff_status = _map_circleci_status(c_status, eff_status)
+                        else:
+                            duration = 0.0
+                            artifacts = []
+                            eff_status = _map_circleci_status(c_status, "failed")
+                        head_oid = c_revision
                     else:
                         m_gha = _GH_ACTIONS_RUN_RE.search(details_url)
                         if m_gha:
@@ -802,21 +896,26 @@ class SubprocessGitGh:
                     duration = 0.0
                     build_id = str(st.get("id") or "")
                     artifacts = []
+                    resolved_commit_sha = str(st_payload.get("sha") or commit_sha)
 
                     circle_info = self._resolve_circleci_job(
                         target_url=target_url,
                         repo=repo,
                         job_name=norm_name,
+                        expected_commit_sha=commit_sha,
                         workflow_cache=workflow_cache,
+                        workflow_revision_cache=workflow_revision_cache,
+                        pipeline_revision_cache=pipeline_revision_cache,
                         artifacts_cache=circle_artifacts_cache,
                     )
                     if circle_info is not None:
-                        c_build_id, c_duration, c_artifacts, c_status = circle_info
+                        c_build_id, c_duration, c_artifacts, c_status, c_revision = circle_info
                         if c_build_id:
                             build_id = c_build_id
                         duration = c_duration
                         artifacts = c_artifacts
                         eff_status = _map_circleci_status(c_status, eff_status)
+                        resolved_commit_sha = c_revision
                     else:
                         m_gha = _GH_ACTIONS_RUN_RE.search(target_url)
                         if m_gha:
@@ -848,7 +947,7 @@ class SubprocessGitGh:
                         CiJobCheck(
                             name=norm_name,
                             status=eff_status,
-                            commit_sha=str(st_payload.get("sha") or commit_sha),
+                            commit_sha=resolved_commit_sha,
                             build_id=build_id,
                             duration_seconds=duration,
                             artifacts=artifacts,

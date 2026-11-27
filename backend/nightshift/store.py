@@ -69,6 +69,7 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
             min_gate_duration_seconds REAL NOT NULL DEFAULT 5.0,
             min_build_duration_seconds REAL NOT NULL DEFAULT 15.0,
             screenshot_manifest_path TEXT NOT NULL DEFAULT '',
+            screenshot_job_name TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -553,6 +554,7 @@ def _migration_006_project_evidence_columns(conn: sqlite3.Connection) -> None:
         ("min_gate_duration_seconds", "REAL NOT NULL DEFAULT 5.0"),
         ("min_build_duration_seconds", "REAL NOT NULL DEFAULT 15.0"),
         ("screenshot_manifest_path", "TEXT NOT NULL DEFAULT ''"),
+        ("screenshot_job_name", "TEXT NOT NULL DEFAULT ''"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
@@ -671,6 +673,7 @@ class Store:
         min_gate_duration_seconds: float = 5.0,
         min_build_duration_seconds: float = 15.0,
         screenshot_manifest_path: str = "",
+        screenshot_job_name: str = "",
     ) -> dict[str, Any]:
         now = _utc_now()
         effective_output = output_dir or output_folder
@@ -683,8 +686,8 @@ class Store:
                     output_folder, output_dir, critical_paths_json,
                     required_ci_jobs_json, required_artifacts_by_job_json,
                     min_gate_duration_seconds, min_build_duration_seconds,
-                    screenshot_manifest_path, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    screenshot_manifest_path, screenshot_job_name, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -705,6 +708,7 @@ class Store:
                     float(min_gate_duration_seconds),
                     float(min_build_duration_seconds),
                     screenshot_manifest_path,
+                    screenshot_job_name,
                     now,
                     now,
                 ),

@@ -156,6 +156,8 @@ class BridgeAPI:
             out["min_build_duration_seconds"] = float(p_data["min_build_duration_seconds"])
         if "screenshot_manifest_path" in p_data and p_data["screenshot_manifest_path"] is not None:
             out["screenshot_manifest_path"] = str(p_data["screenshot_manifest_path"])
+        if "screenshot_job_name" in p_data and p_data["screenshot_job_name"] is not None:
+            out["screenshot_job_name"] = str(p_data["screenshot_job_name"])
         return out
 
     def _enrich_phase_with_assignment(self, ph: dict[str, Any]) -> dict[str, Any]:

@@ -153,6 +153,7 @@ def test_upgrade_existing_project_columns(tmp_path: Path) -> None:
         assert row["min_gate_duration_seconds"] == 5.0
         assert row["min_build_duration_seconds"] == 15.0
         assert row["screenshot_manifest_path"] == ""
+        assert row["screenshot_job_name"] == ""
         assert store.migrate() == []
 
 
