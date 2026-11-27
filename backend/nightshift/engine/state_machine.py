@@ -115,6 +115,16 @@ class SingleInstanceLock:
                     check = subprocess.run(["tasklist", "/FI", f"PID eq {old_pid}"], capture_output=True, text=True)
                     if str(old_pid) in check.stdout:
                         return False
+                else:
+                    # POSIX: signal 0 only tests whether the process exists.
+                    try:
+                        os.kill(old_pid, 0)
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        return False
+                    else:
+                        return False
             except Exception:
                 pass
         try:

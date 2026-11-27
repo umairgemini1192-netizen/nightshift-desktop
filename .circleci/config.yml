@@ -1,0 +1,108 @@
+version: 2.1
+
+orbs:
+  win: circleci/windows@5.0
+
+workflows:
+  desktop-ci:
+    jobs:
+      - desktop-gates
+      - desktop-backend
+      - desktop-frontend
+      - desktop-package:
+          requires:
+            - desktop-gates
+            - desktop-backend
+            - desktop-frontend
+          filters:
+            branches:
+              only: main
+
+jobs:
+  desktop-gates:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Design gates
+          command: |
+            python3 scripts/check_tokens.py
+            python3 scripts/check_ui_rules.py
+
+  desktop-backend:
+    docker:
+      - image: cimg/python:3.12
+    resource_class: small
+    steps:
+      - checkout
+      - run:
+          name: Engine tests
+          command: |
+            if [ -f backend/pyproject.toml ]; then
+              python3 -m pip install -e "backend[dev]"
+              python3 -m pytest -q backend/tests
+            else
+              echo "backend/pyproject.toml not present; skipping."
+            fi
+
+  desktop-frontend:
+    docker:
+      - image: cimg/node:22-browsers
+    resource_class: medium
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - npm-v1-{{ checksum "frontend/package-lock.json" }}
+            - npm-v1-
+      - run:
+          name: Install, lint, typecheck, test, build, screenshots
+          command: |
+            if [ -f frontend/package.json ]; then
+              cd frontend
+              npm ci
+              npm run tokens
+              npm run lint
+              npm run typecheck
+              npm test
+              npm run build
+              npx playwright install chromium
+              npm run e2e
+            else
+              echo "frontend/package.json not present; skipping."
+            fi
+      - save_cache:
+          key: npm-v1-{{ checksum "frontend/package-lock.json" }}
+          paths:
+            - ~/.npm
+      - store_artifacts:
+          path: frontend/screenshots
+          destination: ui-screenshots
+          when: always
+
+  desktop-package:
+    executor:
+      name: win/default
+    steps:
+      - checkout
+      - run:
+          name: Build NightShift.exe
+          shell: powershell.exe
+          command: |
+            if (Test-Path "backend/packaging/nightshift.spec") {
+              Push-Location frontend
+              npm ci
+              npm run tokens
+              npm run build
+              Pop-Location
+              python -m pip install -e "backend[dev,package]"
+              python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
+              Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip
+            } else {
+              Write-Output "backend/packaging/nightshift.spec not present; skipping."
+            }
+      - store_artifacts:
+          path: NightShift-windows.zip
+          destination: nightshift-windows/NightShift-windows.zip
