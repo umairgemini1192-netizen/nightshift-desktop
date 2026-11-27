@@ -7,7 +7,7 @@ import struct
 from pathlib import Path
 from types import SimpleNamespace
 
-from nightshift.app import default_data_dir, main, parse_args, resolve_frontend_dist_index, run_self_test
+from nightshift.app import default_data_dir, frontend_window_target, main, parse_args, resolve_frontend_dist_index, run_self_test
 from nightshift.autostart import AutostartManager, CommandResult
 from nightshift.bridge import BridgeAPI
 from nightshift.events import EventBus
@@ -256,3 +256,18 @@ def test_bridge_first_run_and_autostart_and_window_controls(tmp_path: Path) -> N
     assert "frontend/dist" in spec_text
 
     store.close()
+
+
+def test_frontend_window_target_serves_build_over_http(tmp_path: Path) -> None:
+    index = tmp_path / "dist" / "index.html"
+    index.parent.mkdir(parents=True)
+    index.write_text('<script type="module" src="/assets/app.js"></script>', encoding="utf-8")
+    url, use_http_server = frontend_window_target(index)
+    assert use_http_server is True
+    assert not url.startswith("file:")
+    assert Path(url) == index
+
+
+def test_frontend_window_target_falls_back_to_dev_server(tmp_path: Path) -> None:
+    url, use_http_server = frontend_window_target(tmp_path / "missing" / "index.html")
+    assert (url, use_http_server) == ("http://localhost:5173", False)

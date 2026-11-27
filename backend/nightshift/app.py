@@ -52,6 +52,19 @@ def resolve_frontend_dist_index() -> Path:
     return Path(__file__).resolve().parents[2] / "frontend" / "dist" / "index.html"
 
 
+def frontend_window_target(dist_index: Path) -> tuple[str, bool]:
+    """Return (url, use_http_server) for the desktop window.
+
+    The Vite build references its assets with absolute paths (``/assets/...``). Opened as a
+    ``file://`` URI those resolve to the drive root, so the window stays blank. pywebview's
+    built-in HTTP server serves ``dist`` as the web root, which makes those paths resolve.
+    Falls back to the Vite dev server when no build is present.
+    """
+    if dist_index.exists():
+        return str(dist_index), True
+    return "http://localhost:5173", False
+
+
 def create_app_components(
     db_path: Path | None = None,
     engine: Any | None = None,
@@ -201,8 +214,7 @@ def main(argv: list[str] | None = None) -> int:
 
     store, events, registry, bridge, engine = create_app_components()
     _engine_thread = start_engine_thread(engine)
-    dist_index = resolve_frontend_dist_index()
-    url = dist_index.as_uri() if dist_index.exists() else "http://localhost:5173"
+    url, use_http_server = frontend_window_target(resolve_frontend_dist_index())
 
     tray: TrayController | None = None
     unsubscribe = None
@@ -250,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         tray.start()
 
         unsubscribe = attach_event_pump(events, window.evaluate_js)
-        webview.start(debug=False)
+        webview.start(debug=False, http_server=use_http_server)
     finally:
         if tray is not None:
             tray.stop()
