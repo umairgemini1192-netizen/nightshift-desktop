@@ -369,6 +369,28 @@ class SubprocessGitGh:
                     )
                     head_oid = str(run.get("head_sha") or commit_sha)
                     build_id = str(run.get("id") or run.get("external_id") or "")
+                    artifacts = []
+                    if build_id:
+                        # Query GitHub API for artifacts associated with this check run
+                        rc_art, out_art, _, _ = run_subprocess_with_timeout(
+                            ["gh", "api", f"repos/{repo}/check-runs/{build_id}/artifacts"],
+                            timeout_seconds=30,
+                        )
+                        if rc_art == 0 and out_art:
+                            try:
+                                art_payload = json.loads(out_art)
+                                for art in art_payload.get("artifacts") or []:
+                                    art_path = str(art.get("archive_download_url", "")).split("/")[-1]
+                                    artifacts.append(
+                                        CiArtifact(
+                                            path=art_path,
+                                            size_bytes=int(art.get("size_in_bytes") or 0),
+                                            build_id=build_id,
+                                            url=str(art.get("archive_download_url", "")),
+                                        )
+                                    )
+                            except Exception:
+                                pass
                     results.append(
                         CiJobCheck(
                             name=norm_name,
@@ -376,7 +398,7 @@ class SubprocessGitGh:
                             commit_sha=head_oid,
                             build_id=build_id,
                             duration_seconds=duration,
-                            artifacts=[],
+                            artifacts=artifacts,
                             compat_mode=False,
                             is_gate_job=norm_name in DEFAULT_GATE_JOB_NAMES,
                             branch=branch,
@@ -410,14 +432,37 @@ class SubprocessGitGh:
                         if created and updated
                         else 0.0
                     )
+                    build_id = str(st.get("id") or "")
+                    artifacts = []
+                    if build_id:
+                        # Query GitHub API for artifacts associated with this check run
+                        rc_art, out_art, _, _ = run_subprocess_with_timeout(
+                            ["gh", "api", f"repos/{repo}/check-runs/{build_id}/artifacts"],
+                            timeout_seconds=30,
+                        )
+                        if rc_art == 0 and out_art:
+                            try:
+                                art_payload = json.loads(out_art)
+                                for art in art_payload.get("artifacts") or []:
+                                    art_path = str(art.get("archive_download_url", "")).split("/")[-1]
+                                    artifacts.append(
+                                        CiArtifact(
+                                            path=art_path,
+                                            size_bytes=int(art.get("size_in_bytes") or 0),
+                                            build_id=build_id,
+                                            url=str(art.get("archive_download_url", "")),
+                                        )
+                                    )
+                            except Exception:
+                                pass
                     results.append(
                         CiJobCheck(
                             name=norm_name,
                             status=eff_status,
                             commit_sha=str(st_payload.get("sha") or commit_sha),
-                            build_id=str(st.get("id") or ""),
+                            build_id=build_id,
                             duration_seconds=duration,
-                            artifacts=[],
+                            artifacts=artifacts,
                             compat_mode=False,
                             is_gate_job=norm_name in DEFAULT_GATE_JOB_NAMES,
                             branch=branch,
