@@ -10,6 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+# The packaged app is windowed (no console). Without this flag every CLI it starts
+# (gh, git, agy, claude, ...) pops up its own console window on the owner's screen.
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 
 @dataclass(frozen=True)
 class RunnerResult:
@@ -75,6 +79,7 @@ def run_subprocess_with_timeout(
             errors="replace",
             shell=False,
             env=exec_env,
+            creationflags=NO_WINDOW,
         )
     except Exception as e:
         return 1, "", str(e), False
@@ -85,7 +90,7 @@ def run_subprocess_with_timeout(
     except subprocess.TimeoutExpired:
         # Full process-tree kill on timeout (agents spawn node/gradle/git children)
         if sys.platform == "win32":
-            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, creationflags=NO_WINDOW)
         else:
             try:
                 proc.kill()
