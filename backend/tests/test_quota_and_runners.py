@@ -174,3 +174,28 @@ def test_budget_percentage_preserves_caps(tmp_path):
         ledger.record_usage("codex", "", tokens_in=100)
         assert not ledger.check_budget_cap("codex", budget)
         assert not ledger.check_budget_cap("codex", {"weekly_percent": 0})
+
+
+def test_cli_subprocesses_never_open_console_windows(monkeypatch, tmp_path) -> None:
+    """The packaged app is windowed; every CLI it starts must run without a console window."""
+    import subprocess as _sp
+
+    from nightshift.runners import base
+
+    seen: dict = {}
+
+    class FakeProc:
+        pid = 1234
+        returncode = 0
+
+        def communicate(self, timeout=None):
+            return "ok", ""
+
+    def fake_popen(cmd, **kwargs):
+        seen.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(base.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(base, "resolve_bin", lambda name: name)
+    base.run_subprocess_with_timeout(["git", "--version"], cwd=tmp_path, timeout_seconds=5)
+    assert seen.get("creationflags") == getattr(_sp, "CREATE_NO_WINDOW", 0)

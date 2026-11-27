@@ -116,7 +116,7 @@ class SingleInstanceLock:
                 # Check if process is still running on Windows
                 if sys.platform == "win32":
                     import subprocess
-                    check = subprocess.run(["tasklist", "/FI", f"PID eq {old_pid}"], capture_output=True, text=True)
+                    check = subprocess.run(["tasklist", "/FI", f"PID eq {old_pid}"], capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     if str(old_pid) in check.stdout:
                         return False
                 else:
