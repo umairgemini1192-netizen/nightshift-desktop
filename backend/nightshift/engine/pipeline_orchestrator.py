@@ -1075,7 +1075,10 @@ class TaskOrchestrator:
         now = _utc_now()
         # P1: Also recover post-coding states (VERIFYING, REVIEWING, APPROVED, MERGED)
         orphan_statuses = ("RUNNING", "VERIFYING", "REVIEWING", "APPROVED", "MERGED")
-        orphan_tasks = self.store.list_tasks(status__in=orphan_statuses)
+        orphan_tasks = [
+            task for task in self.store.list_tasks()
+            if task.get("status") in orphan_statuses
+        ]
         for task in orphan_tasks:
             pid = task.get("worker_pid")
             exp_dt = _parse_iso(task.get("lease_expires_at"))
