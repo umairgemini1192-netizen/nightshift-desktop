@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { type ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Badge,
   Button,
+  CodeEditor,
   ConfirmDialog,
   EmptyState,
   GlassCard,
@@ -39,10 +40,95 @@ export default function MissionControlPage() {
   const [readinessModalOpen, setReadinessModalOpen] = useState(false);
   const [fixingTool, setFixingTool] = useState<string | null>(null);
   const [stopArmedLocal, setStopArmedLocal] = useState<boolean>(Boolean(snapshot.stopArmed));
+  const [isFirstRun, setIsFirstRun] = useState(false);
+  const [showFirstRunImport, setShowFirstRunImport] = useState(false);
+  const [firstRunQueueJson, setFirstRunQueueJson] = useState("");
+  const [importingQueue, setImportingQueue] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     setStopArmedLocal(Boolean(snapshot.stopArmed));
   }, [snapshot.stopArmed]);
+
+  useEffect(() => {
+    if (snapshot.scenario !== "empty") {
+      setIsFirstRun(false);
+      return;
+    }
+    let cancelled = false;
+    void bridge
+      .call<{ isFirstRun?: boolean }>("app.firstRunStatus")
+      .then((res) => {
+        if (!cancelled) {
+          setIsFirstRun(Boolean(res?.isFirstRun));
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setIsFirstRun(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bridge, snapshot.scenario]);
+
+  const handleDismissFirstRun = async () => {
+    try {
+      await bridge.call("app.dismissFirstRun");
+    } catch {
+      // Ignore dismiss failure and hide banner locally
+    }
+    setIsFirstRun(false);
+    setShowFirstRunImport(false);
+  };
+
+  const handleFirstRunFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      setFirstRunQueueJson(text);
+    } catch (err) {
+      pushToast({
+        title: "Could not read file",
+        description: String(err),
+        tone: "danger",
+      });
+    }
+  };
+
+  const handleFirstRunImport = async () => {
+    const payload =
+      firstRunQueueJson.trim() ||
+      JSON.stringify({
+        repo: "owner/imported-repo",
+        local_repo: "D:/Projects/imported-repo",
+        phases: [{ id: "p1", title: "Imported Phase 1", branch: "feat/p1", ladder: "backend" }],
+      });
+    setImportingQueue(true);
+    try {
+      const parsed = JSON.parse(payload);
+      await bridge.call("plan.importQueue", { queue: parsed });
+      setShowFirstRunImport(false);
+      setIsFirstRun(false);
+      setFirstRunQueueJson("");
+      pushToast({
+        title: "Legacy queue imported",
+        description: "Your project, phases, and failover ladders are ready in Plan Builder.",
+        tone: "success",
+      });
+      await refreshSnapshot();
+    } catch (err) {
+      pushToast({
+        title: "Could not import queue.json",
+        description: err instanceof Error ? err.message : String(err),
+        tone: "danger",
+      });
+    } finally {
+      setImportingQueue(false);
+    }
+  };
 
   // Re-check logins on window focus (BLUEPRINT 5f)
   useEffect(() => {
@@ -227,6 +313,42 @@ export default function MissionControlPage() {
           description={snapshot.headline}
           action={<StatusPill state={snapshot.runState} />}
         />
+
+        {isFirstRun && (
+          <div id="first-run-import-card">
+            <GlassCard
+              variant="hero"
+              title="Welcome to Night-Shift"
+              icon="Upload"
+              action={<Badge tone="info">First run</Badge>}
+            >
+              <div className="flex flex-col gap-4">
+                <p className="max-w-prose text-sm text-text-secondary">
+                  Already have a legacy queue.json from the previous Night-Shift script? Import it now to bring in
+                  your project, phases, and failover ladders without retyping.
+                </p>
+                <div className="flex flex-wrap items-center gap-3">
+                  <Button
+                    variant="primary"
+                    size="md"
+                    icon="Upload"
+                    onClick={() => setShowFirstRunImport(true)}
+                  >
+                    Import legacy queue.json
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    size="md"
+                    onClick={() => void handleDismissFirstRun()}
+                  >
+                    Start fresh
+                  </Button>
+                </div>
+              </div>
+            </GlassCard>
+          </div>
+        )}
+
         <EmptyState
           icon="Radar"
           title="Connect a project to start overnight runs"
@@ -234,6 +356,77 @@ export default function MissionControlPage() {
           actionLabel="Open Settings"
           onAction={() => navigate("/settings")}
         />
+
+        {showFirstRunImport && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="first-run-import-title"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-bg-canvas/80 p-4 backdrop-blur-sm"
+          >
+            <div className="ns-glass-strong w-full max-w-xl rounded-xl border border-border-subtle p-6 shadow-2xl">
+              <h2
+                id="first-run-import-title"
+                className="font-display text-lg font-semibold text-text-primary"
+              >
+                Import legacy queue.json
+              </h2>
+              <p className="mt-1 text-xs text-text-secondary">
+                Choose a queue.json file from your computer or paste its contents below. Night-Shift stores all
+                imported data locally in your per-user data folder.
+              </p>
+
+              <div className="mt-4 flex flex-col gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".json,application/json"
+                    aria-label="Choose legacy queue.json file"
+                    onChange={(e) => void handleFirstRunFileChange(e)}
+                    className="sr-only"
+                  />
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    icon="FileCode"
+                    onClick={() => fileInputRef.current?.click()}
+                  >
+                    Choose queue.json file
+                  </Button>
+                </div>
+
+                <CodeEditor
+                  id="first-run-queue-json"
+                  label="Legacy queue.json content"
+                  value={firstRunQueueJson}
+                  onChange={setFirstRunQueueJson}
+                  language="json"
+                  rows={8}
+                  placeholder='{"repo": "owner/project", "local_repo": "D:/Projects/project", "phases": [...]}'
+                  helperText="Supports legacy nightshift_legacy.py queue.json files."
+                />
+              </div>
+
+              <div className="mt-5 flex justify-end gap-2">
+                <Button
+                  variant="ghost"
+                  onClick={() => setShowFirstRunImport(false)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="primary"
+                  icon="Upload"
+                  loading={importingQueue}
+                  onClick={() => void handleFirstRunImport()}
+                >
+                  Import queue
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     );
   }

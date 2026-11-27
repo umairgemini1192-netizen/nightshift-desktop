@@ -1,0 +1,13 @@
+{
+  "head": "62284da31cd70778a09cd0150b9725dc8b1c4eab",
+  "reference": "docs/AI_CONTEXT.md and docs/UI_WORKFLOW.md",
+  "interactions": "Describe concrete tap/scroll/state transitions verified",
+  "accessibility": "Describe contentDescription, contrast, and touch target checks",
+  "reviewer": "NightShift automated review (pending visual sign-off)",
+  "exceptions": "None",
+  "screenshots": {
+    "standard": "https://github.com/umairgemini1192-netizen/nightshift-desktop/pull/22",
+    "large_font": "https://github.com/umairgemini1192-netizen/nightshift-desktop/pull/22",
+    "compact": "https://github.com/umairgemini1192-netizen/nightshift-desktop/pull/22"
+  }
+}

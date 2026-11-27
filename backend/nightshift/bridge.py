@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from nightshift import __version__
+from nightshift.autostart import AutostartManager
 from nightshift.engine.council import CouncilRoleResult, CouncilSessionResult, PlanningCouncil
 from nightshift.engine.credentials import CredentialStore, get_credential_store
 from nightshift.engine.deck import generate_deck_data
@@ -73,6 +74,7 @@ class BridgeAPI:
         registry: ModuleRegistry,
         engine: Any | None = None,
         creds: CredentialStore | None = None,
+        autostart: AutostartManager | None = None,
     ) -> None:
         self._store = store
         self._events = events
@@ -81,12 +83,19 @@ class BridgeAPI:
         self._quota = QuotaLedger(store)
         self._logins = LoginHealthChecker(store=store, quota_ledger=self._quota)
         self._creds = creds if creds is not None else get_credential_store()
+        self._autostart = autostart if autostart is not None else AutostartManager()
+        self._window: Any | None = None
+        self._maximized = False
         self._router: Router | None = None
         self._stop_armed = False
         self._active_project_id: str | None = None
         self._run_lock = threading.Lock()
         self._run_thread: threading.Thread | None = None
         self._registry.attach(store=self._store, events=self._events, creds=self._creds, engine=self._engine)
+
+    def attach_window(self, window: Any) -> None:
+        """Attach the active pywebview window for frameless titlebar controls."""
+        self._window = window
 
     def _enrich_phase_with_assignment(self, ph: dict[str, Any]) -> dict[str, Any]:
         assignment = self._store.get_phase_assignment(str(ph["id"]))
@@ -183,6 +192,37 @@ class BridgeAPI:
                     "modules": self._registry.list_ids(),
                 },
             }
+        if method == "app.firstRunStatus":
+            dismissed = self._store.get_setting("onboarding.completed") == "1"
+            has_projects = len(self._store.list_projects()) > 0
+            return {
+                "ok": True,
+                "data": {
+                    "isFirstRun": (not dismissed) and (not has_projects),
+                    "dismissed": dismissed,
+                    "hasProjects": has_projects,
+                },
+            }
+        if method == "app.dismissFirstRun":
+            self._store.set_setting("onboarding.completed", "1")
+            return {"ok": True, "data": {"dismissed": True}}
+        if method == "window.minimize":
+            if self._window is not None and hasattr(self._window, "minimize"):
+                self._window.minimize()
+            return {"ok": True, "data": {"minimized": True}}
+        if method == "window.toggleMaximize":
+            if self._window is not None:
+                if self._maximized and hasattr(self._window, "restore"):
+                    self._window.restore()
+                    self._maximized = False
+                elif hasattr(self._window, "maximize"):
+                    self._window.maximize()
+                    self._maximized = True
+            return {"ok": True, "data": {"maximized": self._maximized}}
+        if method == "window.close":
+            if self._window is not None and hasattr(self._window, "destroy"):
+                self._window.destroy()
+            return {"ok": True, "data": {"closed": True}}
         if method == "settings.get":
             key = str(payload.get("key", ""))
             return {"ok": True, "data": self._store.get_setting(key)}
@@ -444,6 +484,7 @@ class BridgeAPI:
                     self._upsert_planned_engine(ph.id, raw_ph.get("implementer"))
                 if imported.get("ladders"):
                     self._store.set_setting("engines.ladders", json.dumps(imported["ladders"]))
+                self._store.set_setting("onboarding.completed", "1")
                 return {
                     "ok": True,
                     "data": {
@@ -730,7 +771,7 @@ class BridgeAPI:
             proj_id = str(payload.get("projectId") or self._active_project_id or "")
             proj = self._store.get_project(proj_id) if proj_id else None
             folder = ((proj.get("output_dir") or proj.get("output_folder")) if proj else "") or str(
-                Path.home() / "NightShiftArtifacts"
+                self._store.db_path.parent / "artifacts"
             )
             try:
                 Path(folder).mkdir(parents=True, exist_ok=True)
@@ -1016,6 +1057,7 @@ class BridgeAPI:
                     artifact_glob=artifact_glob,
                     output_dir=output_dir,
                 )
+                self._store.set_setting("onboarding.completed", "1")
                 return {"ok": True, "data": created}
 
         if method == "settings.deleteProject":
@@ -1109,6 +1151,44 @@ class BridgeAPI:
             set_keep_awake(enabled)
             self._store.set_setting("system.keepAwake", "1" if enabled else "0")
             return {"ok": True, "data": {"keepAwake": enabled}}
+
+        if method == "settings.getAutostart":
+            enabled = (
+                self._autostart.is_enabled()
+                if self._autostart.supported
+                else self._store.get_setting("system.autostart") == "1"
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "enabled": enabled,
+                    "supported": self._autostart.supported,
+                    "method": "task-scheduler",
+                },
+            }
+
+        if method == "settings.setAutostart":
+            enabled = bool(payload.get("enabled", False))
+            ok, detail = self._autostart.set_enabled(enabled)
+            if not ok:
+                return {"ok": False, "error": detail}
+            self._store.set_setting("system.autostart", "1" if enabled else "0")
+            self._events.emit(
+                Event(
+                    kind="settings.autostart_updated",
+                    plain_text=detail,
+                    level="info",
+                )
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "enabled": enabled,
+                    "supported": self._autostart.supported,
+                    "method": "task-scheduler",
+                    "detail": detail,
+                },
+            }
 
         # Full app snapshot for desktop UI state
         if method in ("app.snapshot", "app.selectProject"):

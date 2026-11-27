@@ -25,12 +25,19 @@ class ModuleRegistry:
         for action, handler in module.api().items():
             self._handlers[f"{module.id}.{action}"] = handler
 
+    _FROZEN_FALLBACK_MODULES = ("phone_status",)
+
     def discover(self) -> list[str]:
         """Import sibling modules in ``nightshift.modules`` and register any ``Module`` class."""
-        for info in pkgutil.iter_modules(modules_pkg.__path__):
-            if info.name in {"base", "registry"} or info.name.startswith("_"):
-                continue
-            mod = importlib.import_module(f"nightshift.modules.{info.name}")
+        discovered_names = [
+            info.name
+            for info in pkgutil.iter_modules(modules_pkg.__path__)
+            if info.name not in {"base", "registry"} and not info.name.startswith("_")
+        ]
+        if not discovered_names:
+            discovered_names = list(self._FROZEN_FALLBACK_MODULES)
+        for name in discovered_names:
+            mod = importlib.import_module(f"nightshift.modules.{name}")
             cls = getattr(mod, "Module", None)
             if isinstance(cls, type) and issubclass(cls, ModuleBase) and cls is not ModuleBase:
                 self.register(cls())
