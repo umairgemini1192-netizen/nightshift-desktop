@@ -19,7 +19,19 @@ import {
   Tabs,
 } from "../../design";
 import { useAppStore } from "../../app/store";
+import type { PipelineState } from "../../bridge/types";
 import { TokenSavingsCard } from "../token-optimizer/TokenSavingsCard";
+
+const PIPELINE_RISK_LABELS: Record<
+  string,
+  { label: string; tone: "neutral" | "info" | "warning" | "danger" | "success" }
+> = {
+  docs_format: { label: "Docs", tone: "neutral" },
+  ui_cosmetic: { label: "UI", tone: "info" },
+  business_logic: { label: "Logic", tone: "info" },
+  high_risk: { label: "High risk", tone: "warning" },
+  governance: { label: "Governance", tone: "danger" },
+};
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   git: "Git",
@@ -45,7 +57,27 @@ export default function MissionControlPage() {
   const [showFirstRunImport, setShowFirstRunImport] = useState(false);
   const [firstRunQueueJson, setFirstRunQueueJson] = useState("");
   const [importingQueue, setImportingQueue] = useState(false);
+  const [pipelineState, setPipelineState] = useState<PipelineState | null>(null);
+  const [pipelineApproveOpen, setPipelineApproveOpen] = useState(false);
+  const [pipelineRollbackTag, setPipelineRollbackTag] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void bridge
+      .call<PipelineState>("pipeline.getState")
+      .then((res) => {
+        if (!cancelled && res && res.summary) {
+          setPipelineState(res);
+        }
+      })
+      .catch(() => {
+        // Pipeline state is optional on legacy mocks
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [bridge, snapshot.scenario]);
 
   useEffect(() => {
     setStopArmedLocal(Boolean(snapshot.stopArmed));
@@ -503,8 +535,10 @@ export default function MissionControlPage() {
         </div>
       </section>
 
-      {/* 2. Needs Attention Card (max 3 items, BLUEPRINT 5e) */}
-      {deck?.needs_you && deck.needs_you.length > 0 && (
+      {/* 2. Needs Attention Card (max 3 items, BLUEPRINT 5e + AGENT_PIPELINE §11.1) */}
+      {((deck?.needs_you && deck.needs_you.length > 0) ||
+        pipelineState?.activeTask?.status === "BLOCKED" ||
+        pipelineState?.releases.some((r) => r.smoke_status === "failed")) && (
         <GlassCard
           title="Needs your attention"
           icon="AlertTriangle"
@@ -512,35 +546,68 @@ export default function MissionControlPage() {
           className="border-status-danger/40"
         >
           <div className="flex flex-col gap-3">
-            {deck.needs_you.slice(0, 3).map((item, idx) => (
-              <div
-                key={idx}
-                className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-md border border-border-subtle bg-surface-raised p-3"
-              >
-                <div className="min-w-0">
-                  <p className="text-sm font-semibold text-status-danger">{item.headline}</p>
-                  <p className="mt-0.5 text-xs text-text-secondary">{item.detail}</p>
-                </div>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => {
-                    if (item.action.toLowerCase().includes("fix")) {
-                      const tool = unreadyLogins[0]?.[0];
-                      if (tool) handleFixTool(tool);
-                    } else {
-                      pushToast({
-                        title: item.headline,
-                        description: item.detail,
-                        tone: "warning",
-                      });
-                    }
-                  }}
+            {[
+              ...(pipelineState?.activeTask?.status === "BLOCKED"
+                ? [
+                    {
+                      kind: "pipeline-approve" as const,
+                      headline: `Owner approval required: ${pipelineState.activeTask.title}`,
+                      detail:
+                        pipelineState.activeTask.block_detail ||
+                        "Governance or high-risk changes require your explicit approval before merge.",
+                      action: "Review & approve",
+                    },
+                  ]
+                : []),
+              ...(pipelineState?.releases
+                .filter((r) => r.smoke_status === "failed" && r.previous_good_tag)
+                .slice(0, 1)
+                .map((r) => ({
+                  kind: "pipeline-rollback" as const,
+                  tag: r.tag,
+                  headline: `Post-release smoke test failed for ${r.tag}`,
+                  detail: r.smoke_detail,
+                  action: "Roll back release",
+                })) ?? []),
+              ...(deck?.needs_you ?? []).map((item) => ({
+                kind: "deck" as const,
+                ...item,
+              })),
+            ]
+              .slice(0, 3)
+              .map((item, idx) => (
+                <div
+                  key={idx}
+                  className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 rounded-md border border-border-subtle bg-surface-raised p-3"
                 >
-                  {item.action}
-                </Button>
-              </div>
-            ))}
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold text-status-danger">{item.headline}</p>
+                    <p className="mt-0.5 text-xs text-text-secondary">{item.detail}</p>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant={item.kind === "pipeline-rollback" ? "danger" : "secondary"}
+                    onClick={() => {
+                      if (item.kind === "pipeline-approve") {
+                        setPipelineApproveOpen(true);
+                      } else if (item.kind === "pipeline-rollback") {
+                        setPipelineRollbackTag(item.tag);
+                      } else if (item.action.toLowerCase().includes("fix")) {
+                        const tool = unreadyLogins[0]?.[0];
+                        if (tool) handleFixTool(tool);
+                      } else {
+                        pushToast({
+                          title: item.headline,
+                          description: item.detail,
+                          tone: "warning",
+                        });
+                      }
+                    }}
+                  >
+                    {item.action}
+                  </Button>
+                </div>
+              ))}
           </div>
         </GlassCard>
       )}
@@ -603,6 +670,15 @@ export default function MissionControlPage() {
                 <p className="mt-1 text-sm font-semibold text-text-primary">
                   {deck?.now?.step ?? "Waiting for next phase trigger"}
                 </p>
+                {pipelineState?.activeTask && (
+                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                    <Badge tone={PIPELINE_RISK_LABELS[pipelineState.activeTask.risk_class]?.tone ?? "info"}>
+                      {PIPELINE_RISK_LABELS[pipelineState.activeTask.risk_class]?.label ??
+                        pipelineState.activeTask.risk_class}
+                    </Badge>
+                    <Badge tone="neutral">{pipelineState.activeTask.status}</Badge>
+                  </div>
+                )}
               </div>
 
               <div>
@@ -633,16 +709,21 @@ export default function MissionControlPage() {
             </div>
           </div>
 
-          {/* Slim Guards Strip under hero */}
+          {/* Slim Guards Strip under hero (AGENT_PIPELINE §11.1) */}
           <div className="mt-6 border-t border-border-subtle pt-4">
             <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
               <span className="text-text-muted font-medium">Phase safety guards:</span>
               <div className="flex flex-wrap items-center gap-2">
                 {(deck?.guards ?? [
-                  { name: "Branch protection", status: "pass", detail: "Active on main" },
-                  { name: "Diff guards", status: "pass", detail: "Zero test deletions" },
-                  { name: "Tests verified", status: "pass", detail: "Deliverables checked" },
-                  { name: "Secrets scan", status: "pass", detail: "High-entropy scan passed" },
+                  { name: "Allowed files", status: "pass", detail: "Changes stay within frozen allowed_globs" },
+                  {
+                    name: "Protected tests",
+                    status: pipelineState?.activeTask?.risk_class === "governance" ? "warn" : "pass",
+                    detail: "Protected test authority and assertion check",
+                  },
+                  { name: "Real CI", status: "pass", detail: "Exact-SHA checks with real duration and artifacts" },
+                  { name: "Screenshots", status: "pass", detail: "Verified renderer screenshots and axe checks" },
+                  { name: "Independent review", status: "pass", detail: "Cross-provider reviewer excluded from coders" },
                 ]).map((guard, idx) => (
                   <span key={idx} title={guard.detail}>
                     <Badge
@@ -656,6 +737,14 @@ export default function MissionControlPage() {
                     </Badge>
                   </span>
                 ))}
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  icon="BarChart3"
+                  onClick={() => navigate("/pipeline-ledger")}
+                >
+                  Pipeline ledger
+                </Button>
               </div>
             </div>
           </div>
@@ -716,6 +805,17 @@ export default function MissionControlPage() {
                 {deck?.handoff_count ?? 0}
               </span>
             </div>
+
+            {pipelineState?.summary && (
+              <div className="flex items-center justify-between text-xs text-text-secondary">
+                <span>Spend tonight:</span>
+                <span className="font-mono font-medium text-text-primary ns-tabular">
+                  {pipelineState.summary.freeOnlyMode
+                    ? "$0.00 / $0.00 (free-only mode)"
+                    : `~$${pipelineState.summary.tonightSpendUsdEst.toFixed(2)} / $${pipelineState.summary.tonightCapUsdEst.toFixed(2)} tonight (estimate)`}
+                </span>
+              </div>
+            )}
 
             {deck?.gold_saved_tonight && (
               <div className="flex items-center justify-between text-xs rounded border border-border-subtle bg-surface-raised px-2 py-1.5">
@@ -861,6 +961,64 @@ export default function MissionControlPage() {
           }
         }}
         onCancel={() => setReadinessModalOpen(false)}
+      />
+
+      {/* Pipeline owner approval dialog (AGENT_PIPELINE §11.1) */}
+      <ConfirmDialog
+        open={pipelineApproveOpen}
+        title="Approve pipeline task for merge"
+        description={
+          pipelineState?.activeTask
+            ? `Approve ${pipelineState.activeTask.title} for commit ${String(pipelineState.activeTask.head_sha ?? "").slice(0, 7)}.`
+            : ""
+        }
+        consequence="Night-Shift will record your exact-SHA approval so the merge gate can proceed."
+        confirmLabel="Approve exact commit"
+        confirmVariant="primary"
+        onConfirm={() => {
+          const tid = pipelineState?.activeTask?.id;
+          setPipelineApproveOpen(false);
+          if (!tid) return;
+          void bridge
+            .call("pipeline.approveTask", { taskId: tid, owner: "owner" })
+            .then(() => bridge.call<PipelineState>("pipeline.getState"))
+            .then((next) => {
+              setPipelineState(next);
+              pushToast({
+                title: "Task approved",
+                description: "Recorded exact-SHA owner approval.",
+                tone: "success",
+              });
+            });
+        }}
+        onCancel={() => setPipelineApproveOpen(false)}
+      />
+
+      {/* Pipeline release rollback dialog (AGENT_PIPELINE §11.1) */}
+      <ConfirmDialog
+        open={Boolean(pipelineRollbackTag)}
+        title="Roll back release"
+        description={`Roll back ${pipelineRollbackTag ?? ""} to the previous verified release.`}
+        consequence="The faulty release will be marked superseded and the previous verified artifact will be restored."
+        confirmLabel="Roll back release"
+        confirmVariant="danger"
+        onConfirm={() => {
+          const tag = pipelineRollbackTag;
+          setPipelineRollbackTag(null);
+          if (!tag) return;
+          void bridge
+            .call("pipeline.rollbackRelease", { tag, archiveDir: "", outputDir: "" })
+            .then(() => bridge.call<PipelineState>("pipeline.getState"))
+            .then((next) => {
+              setPipelineState(next);
+              pushToast({
+                title: "Release rolled back",
+                description: `Rolled back ${tag} to the previous good release.`,
+                tone: "warning",
+              });
+            });
+        }}
+        onCancel={() => setPipelineRollbackTag(null)}
       />
     </div>
   );

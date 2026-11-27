@@ -12,6 +12,7 @@ const OTHER_MODULES = [
   { id: "plan-builder", route: "/plan-builder" },
   { id: "runs-history", route: "/runs" },
   { id: "engines-quota", route: "/engines" },
+  { id: "pipeline-ledger", route: "/pipeline-ledger" },
   { id: "settings", route: "/settings" },
 ] as const;
 

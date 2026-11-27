@@ -316,6 +316,147 @@ export interface TokenOptimizerState {
   };
 }
 
+export interface PipelineStageMaturity {
+  stage: string;
+  role: string;
+  maturity: "Implemented" | "Integration-tested" | "Production-proven";
+  description: string;
+}
+
+export interface PipelineEvidenceRecord {
+  id: number;
+  task_id: string;
+  contract_sha256: string;
+  commit_sha: string;
+  kind: string;
+  source: string;
+  build_id: string;
+  duration_seconds: number;
+  artifact_paths_json: string;
+  verified: number;
+  rejection_reason: string;
+  created_at: string;
+}
+
+export interface PipelineTaskAttempt {
+  id: number;
+  stage: string;
+  role: string;
+  engine_id: string;
+  provider: string;
+  model: string;
+  decision_reason: string;
+  outcome: string;
+  wall_seconds: number;
+  started_at: string;
+}
+
+export interface PipelineTaskItem {
+  id: string;
+  phase_id: string;
+  plan_id: string;
+  title: string;
+  branch: string;
+  risk_class: "docs_format" | "ui_cosmetic" | "business_logic" | "high_risk" | "governance";
+  status:
+    | "QUEUED"
+    | "RUNNING"
+    | "VERIFYING"
+    | "REVIEWING"
+    | "APPROVED"
+    | "MERGED"
+    | "RELEASED"
+    | "BLOCKED"
+    | "FAILED";
+  blocked_from_status: string;
+  contract_id: string;
+  contract_sha256: string;
+  pr_number?: number | null;
+  head_sha?: string | null;
+  review_sha?: string | null;
+  owner_approved_sha?: string | null;
+  block_reason: string;
+  block_detail: string;
+  next_step: string;
+  contributingProviders: string[];
+  reviewerProvider?: string;
+  evidence: PipelineEvidenceRecord[];
+  attempts: PipelineTaskAttempt[];
+}
+
+export interface PipelineModelScore {
+  engine_id: string;
+  model: string;
+  role: string;
+  risk_class: string;
+  sample_tasks: number;
+  accepted_tasks: number;
+  total_attempts: number;
+  regression_count: number;
+  avg_retries: number;
+  avg_turnaround_min: number;
+  total_cost_usd_est: number;
+  cost_per_accepted_usd_est: number;
+  benchmark_graduated: number;
+  updated_at: string;
+}
+
+export interface PipelineLedgerEntry {
+  id: number;
+  task_id: string;
+  role: string;
+  engine_id: string;
+  provider: string;
+  model: string;
+  risk_class: string;
+  tokens_in: number;
+  tokens_out: number;
+  est_token_cost_usd: number;
+  ci_minutes: number;
+  artifact_mb: number;
+  wall_seconds: number;
+  outcome: string;
+  is_estimate: number;
+  created_at: string;
+}
+
+export interface PipelineReleaseVerification {
+  tag: string;
+  task_id?: string | null;
+  repo: string;
+  merge_sha: string;
+  previous_good_tag?: string | null;
+  artifact_sha256: string;
+  smoke_command: string;
+  smoke_status: "pending" | "passed" | "failed" | "rolled_back";
+  smoke_detail: string;
+  verified_at?: string | null;
+  rolled_back_at?: string | null;
+}
+
+export interface PipelineSummary {
+  acceptedChanges30d: number;
+  costPerAcceptedUsdEst: number;
+  regressionRate: number;
+  goldSavedCount: number;
+  freeOnlyMode: boolean;
+  monthlySpendUsdEst: number;
+  monthlyCapUsdEst: number;
+  tonightSpendUsdEst: number;
+  tonightCapUsdEst: number;
+  isEstimate: boolean;
+}
+
+export interface PipelineState {
+  summary: PipelineSummary;
+  activeTask: PipelineTaskItem | null;
+  tasks: PipelineTaskItem[];
+  modelScores: PipelineModelScore[];
+  ledger: PipelineLedgerEntry[];
+  stageMaturity: PipelineStageMaturity[];
+  releases: PipelineReleaseVerification[];
+}
+
 export interface Bridge {
   call<T = unknown>(method: string, args?: Record<string, unknown>): Promise<T>;
   subscribe(event: string, cb: BridgeEventCallback): () => void;

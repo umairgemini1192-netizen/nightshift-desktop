@@ -864,6 +864,34 @@ class EngineStateMachine:
                     "status": "PARKED",
                     "detail": mismatch_reason,
                 }
+
+            # Single mandatory MergeGate chokepoint for pipeline tasks (AGENT_PIPELINE §1)
+            pipeline_tasks = [t for t in self.store.list_tasks() if t.get("phase_id") == phase.id]
+            if pipeline_tasks:
+                from nightshift.engine.pipeline_contracts import DiffPathEntry, MergeGate
+
+                ptask = pipeline_tasks[0]
+                pcontract = self.store.get_task_contract(str(ptask["contract_id"])) or {}
+                gate = MergeGate(autonomous_merge_enabled=False)
+                entries = [DiffPathEntry(status="M", path=p) for p in self.vcs.list_changed_files(wt_dir)]
+                auth = gate.authorize_merge(
+                    task=ptask,
+                    contract=pcontract,
+                    head_sha=str(ci_res.checked_sha),
+                    diff_entries=entries,
+                    diff_content=self.vcs.get_diff(wt_dir),
+                    evidence_records=self.store.list_evidence_records(str(ptask["id"])),
+                )
+                if not auth.allowed:
+                    self.store.record_guard_result(phase.id, auth.block_reason or "merge_gate", passed=False, detail=auth.reason)
+                    self._park_phase(project.id, phase, reason=auth.reason, next_step="Review and approve in Mission Control")
+                    return {
+                        "phase_id": phase.id,
+                        "title": phase.title,
+                        "runner": ci_res.last_engine,
+                        "status": "PARKED",
+                        "detail": auth.reason,
+                    }
             self.store.update_phase(phase.id, status="merging")
             self.events.emit(Event(
                 kind="phase.merging",

@@ -15,6 +15,7 @@ describe("Module registry and shell", () => {
       "plan-builder",
       "runs-history",
       "engines-quota",
+      "pipeline-ledger",
       "gallery",
       "settings",
     ]);

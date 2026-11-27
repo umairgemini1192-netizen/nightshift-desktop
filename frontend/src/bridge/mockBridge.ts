@@ -4,6 +4,7 @@ import type {
   Bridge,
   BridgeEventCallback,
   LoginCheckItem,
+  PipelineState,
   ScenarioName,
   TokenOptimizerState,
 } from "./types";
@@ -64,6 +65,7 @@ export class MockBridge implements Bridge {
     lastResultAt: string;
   };
   private tokenOptimizerState: TokenOptimizerState;
+  private pipelineState: PipelineState;
 
   constructor(scenario: ScenarioName = "idle") {
     this.scenario = scenario;
@@ -264,6 +266,251 @@ export class MockBridge implements Bridge {
         hasSecret: false,
         lastResult: "not sent yet",
         lastResultAt: "",
+      };
+    }
+
+    const isEmpty = scenario === "empty";
+    const stageMaturity: PipelineState["stageMaturity"] = [
+      { stage: "PLAN", role: "planner", maturity: "Integration-tested", description: "Frozen contracts and acceptance specs" },
+      { stage: "CODE", role: "coder", maturity: "Integration-tested", description: "Risk-routed coding in isolated worktree" },
+      { stage: "MECHANICAL", role: "mechanical", maturity: "Integration-tested", description: "Deterministic build, tests, screenshots, PR body" },
+      { stage: "TRIAGE", role: "triage", maturity: "Integration-tested", description: "Compact <=10-line CI failure summary" },
+      { stage: "FIX", role: "fixer", maturity: "Integration-tested", description: "Risk-routed targeted fix commits" },
+      { stage: "REVIEW", role: "reviewer", maturity: "Integration-tested", description: "Cross-provider raw-diff review with validated citations" },
+      { stage: "GATES", role: "gatekeeper", maturity: "Integration-tested", description: "Exact-SHA CI, real duration, artifacts, protected tests" },
+      { stage: "MERGE", role: "releaser", maturity: "Integration-tested", description: "MergeGate chokepoint and outbox reconciliation" },
+      { stage: "RELEASE", role: "releaser", maturity: "Integration-tested", description: "Post-merge CI, mandatory smoke test, one-click rollback" },
+    ];
+
+    if (isEmpty) {
+      this.pipelineState = {
+        summary: {
+          acceptedChanges30d: 0,
+          costPerAcceptedUsdEst: 0,
+          regressionRate: 0,
+          goldSavedCount: 0,
+          freeOnlyMode: true,
+          monthlySpendUsdEst: 0,
+          monthlyCapUsdEst: 0,
+          tonightSpendUsdEst: 0,
+          tonightCapUsdEst: 0,
+          isEstimate: true,
+        },
+        activeTask: null,
+        tasks: [],
+        modelScores: [],
+        ledger: [],
+        stageMaturity,
+        releases: [],
+      };
+    } else {
+      const govTask: PipelineState["tasks"][number] = {
+        id: "p8b-t01",
+        phase_id: "p8b",
+        plan_id: "plan-1",
+        title: isFailure ? "Governance PR #42: Protected test authority" : "Role-based pipeline evidence gate",
+        branch: isFailure ? "feat/p8b-governance-tests" : "feat/p8b-evidence-gate",
+        risk_class: isFailure ? "governance" : "business_logic",
+        status: isFailure ? "BLOCKED" : isRunning ? "REVIEWING" : "RELEASED",
+        blocked_from_status: isFailure ? "REVIEWING" : "",
+        contract_id: "p8b-t01-v1",
+        contract_sha256: "8f4c2a91b7d630e5f1a9c4e28b3d7061f5e9a2c8d4b7013f6e8a9c2d5b1f4e70",
+        pr_number: 42,
+        head_sha: "a1b2c3d4e5f60718293a",
+        review_sha: "a1b2c3d4e5f60718293a",
+        owner_approved_sha: null,
+        block_reason: isFailure ? "awaiting_owner_approval" : "",
+        block_detail: isFailure
+          ? "Governance PR #42 changes test files and needs your approval before merge."
+          : "",
+        next_step: isFailure ? "Review & Approve" : "",
+        contributingProviders: ["google"],
+        reviewerProvider: "openai",
+        evidence: [
+          {
+            id: 1,
+            task_id: "p8b-t01",
+            contract_sha256: "8f4c2a91b7d630e5f1a9c4e28b3d7061f5e9a2c8d4b7013f6e8a9c2d5b1f4e70",
+            commit_sha: "a1b2c3d4e5f60718293a",
+            kind: "ci_check",
+            source: "circleci:desktop-backend",
+            build_id: "cc-1042",
+            duration_seconds: 34.2,
+            artifact_paths_json: "[]",
+            verified: 1,
+            rejection_reason: "",
+            created_at: "2026-11-27T04:12:00Z",
+          },
+          {
+            id: 2,
+            task_id: "p8b-t01",
+            contract_sha256: "8f4c2a91b7d630e5f1a9c4e28b3d7061f5e9a2c8d4b7013f6e8a9c2d5b1f4e70",
+            commit_sha: "a1b2c3d4e5f60718293a",
+            kind: "screenshot",
+            source: "playwright:1440x900",
+            build_id: "cc-1043",
+            duration_seconds: 52.8,
+            artifact_paths_json: '["ui-screenshots/mission-control-running-1440x900.png"]',
+            verified: 1,
+            rejection_reason: "",
+            created_at: "2026-11-27T04:13:00Z",
+          },
+        ],
+        attempts: [
+          {
+            id: 1,
+            stage: "CODE",
+            role: "coder",
+            engine_id: "agy",
+            provider: "google",
+            model: "neon",
+            decision_reason: "Chose agy for business_logic at $0.00/accepted (estimate).",
+            outcome: "ok",
+            wall_seconds: 185,
+            started_at: "2026-11-27T04:05:00Z",
+          },
+          {
+            id: 2,
+            stage: "REVIEW",
+            role: "reviewer",
+            engine_id: "codex",
+            provider: "openai",
+            model: "gpt-5",
+            decision_reason: "Independent provider openai (excluded contributing: google).",
+            outcome: isFailure ? "blocked" : "ok",
+            wall_seconds: 48,
+            started_at: "2026-11-27T04:14:00Z",
+          },
+        ],
+      };
+
+      const docsTask: PipelineState["tasks"][number] = {
+        id: "p8b-t02",
+        phase_id: "p8b",
+        plan_id: "plan-1",
+        title: "Update release notes documentation",
+        branch: "feat/p8b-docs",
+        risk_class: "docs_format",
+        status: "RELEASED",
+        blocked_from_status: "",
+        contract_id: "p8b-t02-v1",
+        contract_sha256: "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+        pr_number: 41,
+        head_sha: "f1e2d3c4b5a697887766",
+        review_sha: "f1e2d3c4b5a697887766",
+        owner_approved_sha: "f1e2d3c4b5a697887766",
+        block_reason: "",
+        block_detail: "",
+        next_step: "",
+        contributingProviders: ["alibaba"],
+        reviewerProvider: "openai",
+        evidence: [],
+        attempts: [],
+      };
+
+      this.pipelineState = {
+        summary: {
+          acceptedChanges30d: 14,
+          costPerAcceptedUsdEst: 0.02,
+          regressionRate: 0.0,
+          goldSavedCount: 6,
+          freeOnlyMode: true,
+          monthlySpendUsdEst: 0.0,
+          monthlyCapUsdEst: 0.0,
+          tonightSpendUsdEst: 0.0,
+          tonightCapUsdEst: 0.0,
+          isEstimate: true,
+        },
+        activeTask: govTask,
+        tasks: [govTask, docsTask],
+        modelScores: [
+          {
+            engine_id: "qwen",
+            model: "qwen3-coder",
+            role: "coder",
+            risk_class: "docs_format",
+            sample_tasks: 12,
+            accepted_tasks: 11,
+            total_attempts: 13,
+            regression_count: 0,
+            avg_retries: 0.08,
+            avg_turnaround_min: 3.4,
+            total_cost_usd_est: 0.09,
+            cost_per_accepted_usd_est: 0.008,
+            benchmark_graduated: 1,
+            updated_at: "2026-11-27T04:00:00Z",
+          },
+          {
+            engine_id: "deepseek",
+            model: "deepseek-chat",
+            role: "triage",
+            risk_class: "business_logic",
+            sample_tasks: 6,
+            accepted_tasks: 5,
+            total_attempts: 7,
+            regression_count: 0,
+            avg_retries: 0.17,
+            avg_turnaround_min: 1.2,
+            total_cost_usd_est: 0.06,
+            cost_per_accepted_usd_est: 0.012,
+            benchmark_graduated: 0,
+            updated_at: "2026-11-27T04:00:00Z",
+          },
+          {
+            engine_id: "codex",
+            model: "gpt-5",
+            role: "reviewer",
+            risk_class: "business_logic",
+            sample_tasks: 11,
+            accepted_tasks: 10,
+            total_attempts: 11,
+            regression_count: 0,
+            avg_retries: 0.1,
+            avg_turnaround_min: 2.1,
+            total_cost_usd_est: 0.44,
+            cost_per_accepted_usd_est: 0.044,
+            benchmark_graduated: 1,
+            updated_at: "2026-11-27T04:00:00Z",
+          },
+        ],
+        ledger: [
+          {
+            id: 1,
+            task_id: "p8b-t01",
+            role: "coder",
+            engine_id: "agy",
+            provider: "google",
+            model: "neon",
+            risk_class: isFailure ? "governance" : "business_logic",
+            tokens_in: 18400,
+            tokens_out: 4100,
+            est_token_cost_usd: 0.0,
+            ci_minutes: 3.2,
+            artifact_mb: 14.5,
+            wall_seconds: 185,
+            outcome: "accepted",
+            is_estimate: 1,
+            created_at: "2026-11-27T04:05:00Z",
+          },
+        ],
+        stageMaturity,
+        releases: [
+          {
+            tag: "v1.0.0-preview.45",
+            task_id: "p8b-t01",
+            repo: "owner/nightshift-desktop",
+            merge_sha: "9988776655443322",
+            previous_good_tag: "v1.0.0-preview.44",
+            artifact_sha256: "abc123def456",
+            smoke_command: "NightShift.exe --self-test",
+            smoke_status: isFailure ? "failed" : "passed",
+            smoke_detail: isFailure
+              ? "Post-release self-test exited with code 1. Previous good release v1.0.0-preview.44 is ready for one-click rollback."
+              : "NightShift.exe --self-test exited 0 and reported OK.",
+            verified_at: isFailure ? null : "2026-11-27T04:20:00Z",
+            rolled_back_at: null,
+          },
+        ],
       };
     }
   }
@@ -978,6 +1225,45 @@ export class MockBridge implements Bridge {
 
       case "token_optimizer.evaluateAb":
         return structuredClone(this.tokenOptimizerState) as T;
+
+      case "pipeline.getState":
+        return structuredClone(this.pipelineState) as T;
+
+      case "pipeline.approveTask": {
+        const taskId = String(args?.taskId ?? "");
+        this.pipelineState.tasks = this.pipelineState.tasks.map((t) =>
+          t.id === taskId
+            ? {
+                ...t,
+                status: "APPROVED",
+                owner_approved_sha: t.head_sha ?? "approved",
+                block_reason: "",
+                block_detail: "",
+                next_step: "",
+              }
+            : t,
+        );
+        if (this.pipelineState.activeTask?.id === taskId) {
+          this.pipelineState.activeTask =
+            this.pipelineState.tasks.find((t) => t.id === taskId) ?? this.pipelineState.activeTask;
+        }
+        return structuredClone(this.pipelineState.activeTask) as T;
+      }
+
+      case "pipeline.rollbackRelease": {
+        const tag = String(args?.tag ?? "");
+        this.pipelineState.releases = this.pipelineState.releases.map((r) =>
+          r.tag === tag
+            ? {
+                ...r,
+                smoke_status: "rolled_back",
+                smoke_detail: `Superseded and rolled back to ${r.previous_good_tag ?? "previous release"}.`,
+                rolled_back_at: "2026-11-27T04:30:00Z",
+              }
+            : r,
+        );
+        return { ok: true, faultyTag: tag } as T;
+      }
 
       case "window.minimize":
       case "window.toggleMaximize":

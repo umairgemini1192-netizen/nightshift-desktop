@@ -41,11 +41,84 @@ def resolve_bin(name: str) -> str | None:
     return None
 
 
+# Base environment allowlist for least-privilege runner execution (AGENT_PIPELINE §8.1).
+# Note: on same-user Windows without admin, USERPROFILE/LOCALAPPDATA/APPDATA are needed by
+# local CLIs for auth, so env scrubbing is defense-in-depth, NOT a hard OS sandbox (§8.2).
+BASE_SCRUBBED_ENV_KEYS: tuple[str, ...] = (
+    "SYSTEMROOT",
+    "COMSPEC",
+    "TEMP",
+    "TMP",
+    "PATHEXT",
+    "PATH",
+    "HOME",
+    "USERPROFILE",
+    "LOCALAPPDATA",
+    "APPDATA",
+    "LANG",
+    "LC_ALL",
+)
+
+SENSITIVE_ENV_PREFIXES: tuple[str, ...] = (
+    "AWS_",
+    "AZURE_",
+    "GCP_",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "NPM_TOKEN",
+    "PYPI_TOKEN",
+    "CIRCLE_TOKEN",
+)
+
+MAX_RUNNER_OUTPUT_BYTES: int = 10 * 1024 * 1024  # 10 MB per attempt (AGENT_PIPELINE §8.1)
+
+
+def build_scrubbed_env(
+    extra_env: dict[str, str] | None = None,
+    *,
+    base_env: dict[str, str] | None = None,
+    allowed_keys: tuple[str, ...] = BASE_SCRUBBED_ENV_KEYS,
+) -> dict[str, str]:
+    """Construct a minimal allowlisted environment for a runner subprocess.
+
+    Strips unrelated host secrets (AWS_*, OPENAI_API_KEY, GITHUB_TOKEN, GH_TOKEN, etc.)
+    unless explicitly provided in ``extra_env`` for that single process.
+    """
+    source = os.environ if base_env is None else base_env
+    scrubbed: dict[str, str] = {}
+    allowed_upper = {k.upper() for k in allowed_keys}
+    for key, val in source.items():
+        up = key.upper()
+        if up in allowed_upper:
+            if any(up.startswith(pref) for pref in SENSITIVE_ENV_PREFIXES):
+                continue
+            scrubbed[key] = val
+    scrubbed["DO_NOT_TRACK"] = "1"
+    scrubbed["NO_COLOR"] = "1"
+    if extra_env:
+        scrubbed.update(extra_env)
+    return scrubbed
+
+
+def _truncate_output(text: str, max_bytes: int = MAX_RUNNER_OUTPUT_BYTES) -> str:
+    encoded = text.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="replace") + "\n[TRUNCATED: output cap reached]"
+
+
 def run_subprocess_with_timeout(
     args: list[str],
     cwd: Path | None = None,
     timeout_seconds: int = 3600,
     env: dict[str, str] | None = None,
+    *,
+    scrub_env: bool = False,
+    max_output_bytes: int = MAX_RUNNER_OUTPUT_BYTES,
 ) -> tuple[int, str, str, bool]:
     """Execute command with strict timeout and full process-tree termination.
 
@@ -64,9 +137,12 @@ def run_subprocess_with_timeout(
     else:
         cmd = [exe] + args[1:]
 
-    exec_env = os.environ.copy()
-    if env:
-        exec_env.update(env)
+    if scrub_env:
+        exec_env = build_scrubbed_env(extra_env=env)
+    else:
+        exec_env = os.environ.copy()
+        if env:
+            exec_env.update(env)
 
     try:
         proc = subprocess.Popen(
@@ -86,7 +162,12 @@ def run_subprocess_with_timeout(
 
     try:
         out, err = proc.communicate(timeout=timeout_seconds)
-        return proc.returncode, (out or "").strip(), (err or "").strip(), False
+        return (
+            proc.returncode,
+            _truncate_output((out or "").strip(), max_output_bytes),
+            _truncate_output((err or "").strip(), max_output_bytes),
+            False,
+        )
     except subprocess.TimeoutExpired:
         # Full process-tree kill on timeout (agents spawn node/gradle/git children)
         if sys.platform == "win32":
