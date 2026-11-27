@@ -318,3 +318,62 @@ test("first-run legacy queue.json import flow and screenshot", async ({ page }) 
   );
   expect(blocking).toEqual([]);
 });
+
+test("token optimizer savings card and tool settings screenshots", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // Mission Control token-savings card in dark & light themes across running and failure scenarios
+  for (const scenario of ["running", "failure"] as const) {
+    for (const theme of ["dark", "light"] as const) {
+      await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme });
+      await page.goto(`/?scenario=${scenario}`, { waitUntil: "networkidle" });
+      await page.evaluate((th) => {
+        document.documentElement.dataset.theme = th;
+      }, theme);
+      const card = page.locator("#token-savings-card");
+      await card.waitFor({ state: "visible" });
+      await card.scrollIntoViewIfNeeded();
+      await card.screenshot({
+        path: path.join(SCREENSHOTS_DIR, `token-savings-card-${scenario}-${theme}.png`),
+      });
+      const axeSavings = await new AxeBuilder({ page }).include("#token-savings-card").analyze();
+      const blockingSavings = axeSavings.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(blockingSavings).toEqual([]);
+    }
+  }
+
+  // Settings token-optimizer card across idle, running, and failure scenarios (dark + light)
+  for (const scenario of ["idle", "running", "failure"] as const) {
+    await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
+    await page.goto(`/settings?scenario=${scenario}`, { waitUntil: "networkidle" });
+    await page.evaluate(() => {
+      document.documentElement.dataset.theme = "dark";
+    });
+    const settingsCard = page.locator("#token-optimizer-settings-card");
+    await settingsCard.waitFor({ state: "visible" });
+    await settingsCard.scrollIntoViewIfNeeded();
+    await settingsCard.screenshot({
+      path: path.join(SCREENSHOTS_DIR, `token-optimizer-settings-${scenario}-dark.png`),
+    });
+  }
+
+  await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "light" });
+  await page.goto("/settings?scenario=running", { waitUntil: "networkidle" });
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "light";
+  });
+  const lightSettingsCard = page.locator("#token-optimizer-settings-card");
+  await lightSettingsCard.waitFor({ state: "visible" });
+  await lightSettingsCard.scrollIntoViewIfNeeded();
+  await lightSettingsCard.screenshot({
+    path: path.join(SCREENSHOTS_DIR, "token-optimizer-settings-running-light.png"),
+  });
+
+  const axeSettings = await new AxeBuilder({ page }).include("#token-optimizer-settings-card").analyze();
+  const blockingSettings = axeSettings.violations.filter(
+    (v) => v.impact === "serious" || v.impact === "critical",
+  );
+  expect(blockingSettings).toEqual([]);
+});

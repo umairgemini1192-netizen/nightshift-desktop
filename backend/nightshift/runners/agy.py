@@ -23,6 +23,7 @@ class AgyRunner:
         *,
         model: str | None = None,
         effort: str = "medium",
+        extra_args: list[str] | None = None,
     ) -> list[str]:
         # Headless print mode auto-denies shell tools (git/gh) yet still exits 0,
         # so permissions must be pre-approved like claude/gemini.
@@ -31,6 +32,8 @@ class AgyRunner:
             cmd.extend(["--model", model])
         if effort:
             cmd.extend(["--effort", effort])
+        if extra_args:
+            cmd.extend(extra_args)
         return cmd
 
     async def run(
@@ -41,9 +44,11 @@ class AgyRunner:
         model: str | None = None,
         effort: str = "medium",
         timeout_seconds: int = 3600,
+        env: dict[str, str] | None = None,
+        extra_args: list[str] | None = None,
     ) -> RunnerResult:
-        cmd = self.build_command(prompt, model=model, effort=effort)
-        rc, out, err, timed_out = run_subprocess_with_timeout(cmd, cwd=workdir, timeout_seconds=timeout_seconds)
+        cmd = self.build_command(prompt, model=model, effort=effort, extra_args=extra_args)
+        rc, out, err, timed_out = run_subprocess_with_timeout(cmd, cwd=workdir, timeout_seconds=timeout_seconds, env=env)
 
         is_quota = False
         reset_at = None

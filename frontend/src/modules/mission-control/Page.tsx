@@ -19,6 +19,7 @@ import {
   Tabs,
 } from "../../design";
 import { useAppStore } from "../../app/store";
+import { TokenSavingsCard } from "../token-optimizer/TokenSavingsCard";
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
   git: "Git",
@@ -749,6 +750,11 @@ export default function MissionControlPage() {
             </div>
           </div>
         </GlassCard>
+      )}
+
+      {/* 4b. Token Optimizer Savings Card (BLUEPRINT 5g) */}
+      {deck?.token_savings_tonight && (
+        <TokenSavingsCard savings={deck.token_savings_tonight} />
       )}
 
       {/* 5. Lower Row: Done Tonight (span 5) + StepFeed / Timeline (span 7) */}

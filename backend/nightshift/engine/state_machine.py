@@ -25,7 +25,11 @@ from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient, SubprocessGitGh
 from nightshift.engine.verify import assess_diff_risk, check_diff_guards, redact_secrets, verify_deliverable
 from nightshift.events import Event, EventBus
+from nightshift.optimizer.ab_framework import ABFramework
+from nightshift.optimizer.repomix import RepomixAdapter, ensure_worktree_git_excluded
+from nightshift.optimizer.tool_manager import ToolManager
 from nightshift.quota.ledger import QuotaLedger
+from nightshift.quota.usage import parse_cli_usage
 from nightshift.runners.base import Runner, RunnerResult
 from nightshift.runners.template import TemplateRunner
 from nightshift.store import Store
@@ -517,7 +521,23 @@ class EngineStateMachine:
             ))
 
             prompt_path = wt_dir / ".nightshift_prompt.md"
-            prompt_path.write_text(guardrail_header + phase.prompt, encoding="utf-8")
+            prompt_body = guardrail_header + phase.prompt
+            if (wt_dir / ".git").exists():
+                ensure_worktree_git_excluded(wt_dir)
+            repomix_state = self.store.get_token_tool_state("repomix")
+            if repomix_state and bool(repomix_state.get("enabled", 0)):
+                tm = ToolManager(store=self.store)
+                rm_res = RepomixAdapter(tm).generate_repo_map(wt_dir)
+                if rm_res.ok and rm_res.content:
+                    prompt_body = RepomixAdapter.inject_into_prompt(prompt_body, rm_res.content)
+                elif rm_res.warning:
+                    self.events.emit(Event(
+                        kind="token_optimizer.warning",
+                        plain_text=rm_res.warning,
+                        level="warn",
+                        phase_id=phase.id,
+                    ))
+            prompt_path.write_text(prompt_body, encoding="utf-8")
 
             implement_attempts = 0
             diff_guard_retries = 0
@@ -625,6 +645,39 @@ class EngineStateMachine:
                     timeout_seconds=inv_timeout,
                 )
 
+                # Record A/B samples for enabled token optimizer tools (BLUEPRINT 5g)
+                # Parse token usage from runner output
+                raw_output = res.stdout if res.rc == 0 else res.stderr
+                tokens_in, tokens_out = parse_cli_usage(raw_output)
+                turns = 1
+                retry_turns = 0
+                success = res.rc == 0
+
+                # Record A/B samples for all enabled tools
+                from nightshift.optimizer.tool_manager import ToolManager
+                tm = ToolManager(store=self.store)
+                enabled_tools = []
+                for spec in tm.list_specs():
+                    if spec.catalogue_only:
+                        continue
+                    db_state = self.store.get_token_tool_state(spec.name)
+                    if db_state and bool(db_state.get("enabled", 0)):
+                        enabled_tools.append(spec.name)
+
+                if enabled_tools:
+                    for tool_name in enabled_tools:
+                        self.store.record_token_ab_run(
+                            tool=tool_name,
+                            enabled=True,
+                            phase_kind=phase.ladder if phase.ladder else "default",
+                            engine=active_runner_name,
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            turns=turns,
+                            retry_turns=retry_turns,
+                            success=success,
+                        )
+
                 # Persist redacted raw log as a file (BLUEPRINT 5d)
                 logs_dir = project.output_dir / "logs"
                 logs_dir.mkdir(parents=True, exist_ok=True)
@@ -662,6 +715,17 @@ class EngineStateMachine:
                     self.store.update_step(step_id, rc=0, verified=1, detail=deliv_reason)
                     self.store.record_duration("implement", active_runner_name, time.time() - t0)
                     self.store.update_engine_stats(active_runner_name, effective_size, success=True, minutes=elapsed_min)
+
+                    # Evaluate A/B results for enabled tools (BLUEPRINT 5g)
+                    ab = ABFramework(self.store, self.events)
+                    tm = ToolManager(store=self.store)
+                    for spec in tm.list_specs():
+                        if spec.catalogue_only:
+                            continue
+                        db_state = self.store.get_token_tool_state(spec.name)
+                        if db_state and bool(db_state.get("enabled", 0)):
+                            ab.evaluate_and_apply(spec.name, phase.ladder if phase.ladder else "default")
+
                     self.events.emit(Event(
                         kind="runner.completed",
                         plain_text=f"{active_runner_name} delivered {phase.title}: {deliv_reason}",

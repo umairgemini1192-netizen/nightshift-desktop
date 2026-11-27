@@ -25,7 +25,7 @@ class ModuleRegistry:
         for action, handler in module.api().items():
             self._handlers[f"{module.id}.{action}"] = handler
 
-    _FROZEN_FALLBACK_MODULES = ("phone_status",)
+    _FROZEN_FALLBACK_MODULES = ("phone_status", "token_optimizer")
 
     def discover(self) -> list[str]:
         """Import sibling modules in ``nightshift.modules`` and register any ``Module`` class."""

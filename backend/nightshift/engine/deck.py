@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from nightshift.optimizer.ab_framework import ABFramework
 from nightshift.store import Store
 
 
@@ -84,6 +85,18 @@ def generate_deck_data(
         "estimate_label": f"${gold_saved_dollars} gold saved tonight (estimate)",
     }
 
+    # 4c. Token optimizer savings tonight (estimate) and warnings (BLUEPRINT 5g)
+    token_savings_tonight = ABFramework(store).summarize_tonight()
+    for warn in token_savings_tonight.get("warnings", []):
+        if len(needs_you) >= 3:
+            break
+        needs_you.append({
+            "phase_id": "token_optimizer",
+            "headline": "Token optimizer warning",
+            "detail": str(warn),
+            "action": "Open Settings",
+        })
+
     # 5. One-line plain English headline
     if needs_you:
         headline = f"{len(needs_you)} phase(s) need your attention · {len(done_tonight)} completed tonight"
@@ -115,6 +128,7 @@ def generate_deck_data(
         "next": upcoming[:3],
         "usage_tonight": engine_usage,
         "gold_saved_tonight": gold_saved_tonight,
+        "token_savings_tonight": token_savings_tonight,
         "handoff_count": handoff_count,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -166,6 +180,17 @@ def write_morning_digest(
             lines.append(f"- **{eng}**: {stats['invocations']} run(s), ~{stats['tokens']} tokens")
         if deck.get("handoff_count"):
             lines.append(f"- **Handoffs triggered**: {deck['handoff_count']}")
+        lines.append("")
+
+    if deck and deck.get("token_savings_tonight"):
+        ts = deck["token_savings_tonight"]
+        lines.append("## Token Optimizer Savings (Estimate)")
+        lines.append(f"- **Tonight total**: {ts.get('estimateLabel', '~0 tokens saved tonight (estimate)')}")
+        for item in ts.get("perTool", []):
+            status_note = " (auto-disabled)" if item.get("autoDisabled") else ""
+            lines.append(f"- **{item['tool']}**{status_note}: {item.get('estimateLabel', '~0 tokens saved (estimate)')}")
+        for warn in ts.get("warnings", []):
+            lines.append(f"- **Note**: {warn}")
         lines.append("")
 
     digest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")

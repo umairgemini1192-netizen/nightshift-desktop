@@ -27,6 +27,8 @@ EXPECTED_TABLES = {
     "durations",
     "settings",
     "events",
+    "token_tool_states",
+    "token_ab_runs",
 }
 
 
@@ -35,8 +37,8 @@ def test_store_migrations_create_full_schema_and_are_idempotent(tmp_path: Path) 
     with Store(db_file) as store:
         assert store.current_schema_version() == 0
         applied_first = store.migrate()
-        assert applied_first == [1, 2, 3]
-        assert store.current_schema_version() == 3
+        assert applied_first == [1, 2, 3, 4]
+        assert store.current_schema_version() == 4
         assert EXPECTED_TABLES.issubset(store.list_tables())
 
         # Re-running migrate must be a safe no-op.
@@ -133,7 +135,7 @@ def test_upgrade_existing_project_columns(tmp_path: Path) -> None:
             CREATE TABLE projects (id TEXT PRIMARY KEY, output_folder TEXT NOT NULL DEFAULT '');
             INSERT INTO projects VALUES ('old', 'saved');
         """)
-        assert store.migrate() == [2, 3]
+        assert store.migrate() == [2, 3, 4]
         row = store.connection.execute("SELECT * FROM projects").fetchone()
         assert row["output_dir"] == "saved"
         assert row["release_workflow"] == "Android build"

@@ -5,6 +5,7 @@ import type {
   BridgeEventCallback,
   LoginCheckItem,
   ScenarioName,
+  TokenOptimizerState,
 } from "./types";
 
 export interface StreamEvent {
@@ -62,11 +63,184 @@ export class MockBridge implements Bridge {
     lastResult: string;
     lastResultAt: string;
   };
+  private tokenOptimizerState: TokenOptimizerState;
 
   constructor(scenario: ScenarioName = "idle") {
     this.scenario = scenario;
     this.snapshot = structuredClone(SCENARIO_FIXTURES[scenario] ?? SCENARIO_FIXTURES.idle);
     this.stopArmed = Boolean(this.snapshot.stopArmed);
+    const isFailure = scenario === "failure";
+    const isRunning = scenario === "running";
+    this.tokenOptimizerState = {
+      tools: [
+        {
+          name: "ccusage",
+          displayName: "ccusage",
+          role: "Per-engine, per-model token usage from local logs (--offline --json)",
+          version: "15.2.0",
+          artifact: "ccusage-15.2.0.tgz",
+          sha256: "8a4f2c91b7e630d5f1a9c4e28b3d7061f5e9a2c8d4b7013f6e8a9c2d5b1f4e70",
+          license: "MIT",
+          runners: ["agy", "gemini", "codex", "claude"],
+          catalogueOnly: false,
+          isolationGateRequired: false,
+          isolationPassed: false,
+          isolationMethod: "none",
+          sha256Verified: true,
+          enabled: isRunning || isFailure,
+          autoDisabled: false,
+          status: isRunning || isFailure ? "enabled" : "disabled",
+          warning: isFailure
+            ? "ccusage did not report Antigravity usage; falling back to CLI JSON usage and run counts."
+            : "",
+          tokensSavedTonight: 0,
+          estimateLabel: "~0 tokens saved (estimate)",
+          abAction: "keep_measuring",
+          abReason: "Feeds the quota ledger and A/B measurements.",
+        },
+        {
+          name: "repomix",
+          displayName: "repomix",
+          role: "Compact repo map (--compress) injected into each phase prompt",
+          version: "0.3.9",
+          artifact: "repomix-0.3.9.tgz",
+          sha256: "3c7e1a58d9f420b6e8a1c3f57d2b9048e6c1a7f3b5d9024e8a6c1f3d7b2e5a91",
+          license: "MIT",
+          runners: ["agy", "gemini", "codex", "claude"],
+          catalogueOnly: false,
+          isolationGateRequired: false,
+          isolationPassed: false,
+          isolationMethod: "none",
+          sha256Verified: true,
+          enabled: isRunning || isFailure,
+          autoDisabled: false,
+          status: isRunning || isFailure ? "enabled" : "disabled",
+          warning: "",
+          tokensSavedTonight: isRunning ? 14200 : isFailure ? 9200 : 0,
+          estimateLabel: isRunning
+            ? "~14,200 tokens saved (estimate)"
+            : isFailure
+              ? "~9,200 tokens saved (estimate)"
+              : "~0 tokens saved (estimate)",
+          abAction: isRunning || isFailure ? "keep_enabled" : "keep_measuring",
+          abReason: isRunning
+            ? "repomix cut ~7,100 tokens per backend phase (estimate) with no extra retries."
+            : "Waiting for baseline runs.",
+        },
+        {
+          name: "agy-fast",
+          displayName: "agy-fast",
+          role: "Batched search, outline, edit, and check tools for Antigravity (auto-update off)",
+          version: "fe635e1",
+          artifact: "agy-fast-fe635e1.zip",
+          sha256: "5f9b3d72e1a846c0b2d5f8e1a4c79036d2e8f1a5c9b3047e6a2d8f1c5b9e3a42",
+          license: "MIT",
+          runners: ["agy"],
+          catalogueOnly: false,
+          isolationGateRequired: true,
+          isolationPassed: false,
+          isolationMethod: "none",
+          sha256Verified: true,
+          enabled: false,
+          autoDisabled: false,
+          status: "isolation_blocked",
+          warning:
+            "agy-fast stayed disabled because Antigravity could not load it per run without modifying ~/.gemini/config.",
+          tokensSavedTonight: 0,
+          estimateLabel: "~0 tokens saved (estimate)",
+          abAction: "keep_measuring",
+          abReason: "Isolation probe required before enabling.",
+        },
+        {
+          name: "rtk-oss",
+          displayName: "rtk-oss",
+          role: "Compresses shell output for Gemini CLI, Claude, and Codex (Apache-2.0 OSS build)",
+          version: "1.2.1",
+          artifact: "rtk-oss-x86_64-pc-windows-msvc.zip",
+          sha256: "7d1a5e93c2b864f0e4a7c1d9b3f58206e1a9d4c7b2f8035e6c9a1d4f8b2e7c33",
+          license: "Apache-2.0",
+          runners: ["gemini", "claude", "codex"],
+          catalogueOnly: false,
+          isolationGateRequired: false,
+          isolationPassed: false,
+          isolationMethod: "none",
+          sha256Verified: !isFailure,
+          enabled: isRunning,
+          autoDisabled: isFailure,
+          status: isFailure ? "auto_disabled" : isRunning ? "enabled" : "disabled",
+          warning: isFailure
+            ? "rtk-oss was switched off automatically: retry turns rose from 0.3 to 1.0."
+            : "",
+          tokensSavedTonight: isRunning ? 4200 : 0,
+          estimateLabel: isRunning ? "~4,200 tokens saved (estimate)" : "~0 tokens saved (estimate)",
+          abAction: isFailure ? "auto_disable" : isRunning ? "keep_enabled" : "keep_measuring",
+          abReason: isFailure
+            ? "rtk-oss was switched off automatically: retry turns rose from 0.3 to 1.0."
+            : "Bundled with portable rg.exe on runner PATH only.",
+        },
+        {
+          name: "ripgrep",
+          displayName: "ripgrep (rg.exe)",
+          role: "Portable ripgrep binary prepended to runner PATH for rtk-oss filters",
+          version: "14.1.1",
+          artifact: "ripgrep-14.1.1-x86_64-pc-windows-msvc.zip",
+          sha256: "9b3c7f15e4d286a0f6c9e3b1d5a70428f3c1e6d9b4a2057f8e1c3d6a9b4f2e54",
+          license: "MIT/Unlicense",
+          runners: ["gemini", "claude", "codex"],
+          catalogueOnly: false,
+          isolationGateRequired: false,
+          isolationPassed: false,
+          isolationMethod: "none",
+          sha256Verified: true,
+          enabled: isRunning,
+          autoDisabled: false,
+          status: isRunning ? "enabled" : "disabled",
+          warning: "",
+          tokensSavedTonight: 0,
+          estimateLabel: "~0 tokens saved (estimate)",
+          abAction: "keep_measuring",
+          abReason: "Helper binary for rtk-oss.",
+        },
+        {
+          name: "ast-grep-mcp",
+          displayName: "ast-grep-mcp",
+          role: "Structural code search (catalogue only; enable later if search is a top cost)",
+          version: "0.1.0",
+          artifact: "ast-grep-mcp-0.1.0.tgz",
+          sha256: "1e5a9c37f2b408d6a8e1c5f3b7d92604a5e3c8f1d6b4097a2c5e8f1b4d7a3c65",
+          license: "MIT",
+          runners: ["agy", "gemini", "codex", "claude"],
+          catalogueOnly: true,
+          isolationGateRequired: false,
+          isolationPassed: false,
+          isolationMethod: "none",
+          sha256Verified: false,
+          enabled: false,
+          autoDisabled: false,
+          status: "catalogue_only",
+          warning: "Catalogue entry only (disabled). Enable later if ccusage shows search is a top cost.",
+          tokensSavedTonight: 0,
+          estimateLabel: "~0 tokens saved (estimate)",
+          abAction: "keep_measuring",
+          abReason: "",
+        },
+      ],
+      totalTokensSaved: isRunning ? 18400 : isFailure ? 9200 : 0,
+      estimateLabel: isRunning
+        ? "~18,400 tokens saved tonight (estimate)"
+        : isFailure
+          ? "~9,200 tokens saved tonight (estimate)"
+          : "~0 tokens saved tonight (estimate)",
+      warnings: isFailure
+        ? [
+            "ccusage did not report Antigravity usage; falling back to CLI JSON usage and run counts.",
+            "rtk-oss was switched off automatically: retry turns rose from 0.3 to 1.0.",
+          ]
+        : [],
+      toolsRoot: "C:\\Users\\AppData\\Local\\NightShift\\tools",
+      telemetryOff: true,
+      isEstimate: true,
+    };
     if (scenario === "running") {
       this.phoneStatus = {
         enabled: true,
@@ -761,6 +935,49 @@ export class MockBridge implements Bridge {
           lastResultAt: this.phoneStatus.lastResultAt,
         } as T;
       }
+
+      case "token_optimizer.getState":
+        return structuredClone(this.tokenOptimizerState) as T;
+
+      case "token_optimizer.setToolEnabled": {
+        const toolName = String(args?.tool ?? "");
+        const nextEnabled = Boolean(args?.enabled);
+        this.tokenOptimizerState.tools = this.tokenOptimizerState.tools.map((t) => {
+          if (t.name !== toolName) return t;
+          if (t.catalogueOnly || (t.isolationGateRequired && !t.isolationPassed && nextEnabled)) {
+            return t;
+          }
+          return {
+            ...t,
+            enabled: nextEnabled,
+            autoDisabled: nextEnabled ? false : t.autoDisabled,
+            status: nextEnabled ? "enabled" : "disabled",
+          };
+        });
+        return structuredClone(this.tokenOptimizerState) as T;
+      }
+
+      case "token_optimizer.verifyTools":
+        return structuredClone(this.tokenOptimizerState) as T;
+
+      case "token_optimizer.runIsolationProbe": {
+        const probeResult = {
+          passed: false,
+          method: "none",
+          reason:
+            "agy-fast stayed disabled because Antigravity could not load it per run via --settings or a project-local folder without global config edits.",
+          globalConfigModified: false,
+          candidatesTried: ["settings_flag", "project_local"],
+        };
+        this.tokenOptimizerState = {
+          ...this.tokenOptimizerState,
+          probeResult,
+        };
+        return structuredClone(this.tokenOptimizerState) as T;
+      }
+
+      case "token_optimizer.evaluateAb":
+        return structuredClone(this.tokenOptimizerState) as T;
 
       case "window.minimize":
       case "window.toggleMaximize":
