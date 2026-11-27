@@ -826,3 +826,95 @@ async def test_e2e_crash_mid_approved_merge_timeout_reconciles_without_duplicate
         op = store.get_remote_operation("pr_merge:task-p-merge:401:sha_401")
         assert op is not None and op["status"] == "succeeded"
 
+
+def test_release_reconciliation_with_artifact_glob_rejects_checksum_only_release(tmp_path: Path) -> None:
+    """expected_asset_globs requires at least one non-checksum asset matching the glob."""
+    with Store(tmp_path / "rel_glob.db") as store:
+        store.migrate()
+        orch = TaskOrchestrator(store)
+        _setup_task(store, task_id="t-glob", branch="feat/glob")
+        tok = orch.acquire_lease("t-glob")
+
+        # Complete release matching *.zip + SHA256SUMS.txt -> adopted
+        res_ok = orch.reconcile_release_for_merge_sha(
+            task_id="t-glob",
+            merge_sha="merge_glob_ok",
+            expected_asset_names=[],
+            expected_asset_globs=["*.zip"],
+            lease_token=tok,
+            existing_releases=[
+                {
+                    "tag": "v1.0.0-preview.10",
+                    "body": "<!-- nightshift-merge-sha: merge_glob_ok -->",
+                    "assets": [{"name": "NightShift-custom.zip"}, {"name": "SHA256SUMS.txt"}],
+                }
+            ],
+        )
+        assert res_ok.action == "adopted_release"
+        assert res_ok.data["tag"] == "v1.0.0-preview.10"
+
+        # Checksum-only release (no *.zip artifact) -> blocked as partial_release_repair
+        res_partial = orch.reconcile_release_for_merge_sha(
+            task_id="t-glob",
+            merge_sha="merge_glob_bad",
+            expected_asset_names=[],
+            expected_asset_globs=["*.zip"],
+            lease_token=tok,
+            existing_releases=[
+                {
+                    "tag": "v1.0.0-preview.11",
+                    "body": "<!-- nightshift-merge-sha: merge_glob_bad -->",
+                    "assets": [{"name": "SHA256SUMS.txt"}],
+                }
+            ],
+        )
+        assert res_partial.action == "blocked"
+        assert res_partial.data["block_reason"] == "partial_release_repair"
+        assert "*.zip" in res_partial.data["missing_assets"]
+
+
+@pytest.mark.asyncio
+async def test_phase_execution_renews_near_expiry_lease_without_error(tmp_path: Path) -> None:
+    """When a phase's lease has <30s remaining, renew_lease_if_needed renews it cleanly."""
+    with Store(tmp_path / "lease_renew.db") as store:
+        store.migrate()
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/p-renew", number=501, head_sha="sha_501")
+
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+        engine = EngineStateMachine(
+            store,
+            EventBus(store),
+            quota,
+            vcs=vcs,
+            runners={},
+            login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
+        )
+        orig_acquire = engine.task_orchestrator.acquire_lease
+        renew_calls: list[str] = []
+        orig_renew = engine.task_orchestrator.renew_lease
+
+        def short_acquire(task_id: str, **kwargs: Any) -> str:
+            return orig_acquire(task_id, lease_seconds=10)
+
+        def tracking_renew(task_id: str, lease_token: str, *, lease_seconds: int = 1800) -> str:
+            renew_calls.append(task_id)
+            return orig_renew(task_id, lease_token, lease_seconds=lease_seconds)
+
+        project = ProjectConfig(id="p", name="P", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        with (
+            patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"),
+            patch.object(engine.task_orchestrator, "acquire_lease", side_effect=short_acquire),
+            patch.object(engine.task_orchestrator, "renew_lease", side_effect=tracking_renew),
+        ):
+            rows = await engine.execute_plan(
+                project,
+                [PhaseDefinition(id="p-renew", title="Lease renew phase", branch="feat/p-renew", release_after_merge=False)],
+            )
+
+        assert rows[0]["status"] == "COMPLETED"
+        assert "task-p-renew" in renew_calls
+
+

@@ -20,7 +20,7 @@ from nightshift.engine.ci import CiPipelineManager, CiWatchResult
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
 from nightshift.engine.pipeline_contracts import MergeGate, provider_for_engine
-from nightshift.engine.pipeline_orchestrator import TaskOrchestrator, is_process_alive
+from nightshift.engine.pipeline_orchestrator import TaskOrchestrator, _parse_iso, is_process_alive
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
 from nightshift.engine.release import ReleaseManager
 from nightshift.engine.scheduler import Scheduler
@@ -596,25 +596,6 @@ class EngineStateMachine:
         finally:
             self.task_orchestrator.release_lease(task_id, lease_token)
 
-    def _extract_expected_assets_from_glob(self, glob_pattern: str) -> list[str]:
-        """Extract common artifact names from glob pattern for release verification (P1)."""
-        # Common artifact names for each glob pattern
-        glob_artifact_map: dict[str, list[str]] = {
-            "*.apk": ["app-release.apk", "app-debug.apk", "app-universal.apk", "app-release-unsigned.apk"],
-            "*.aab": ["app-release.aab", "app-bundle.aab", "app-release.aab"],
-            "*.jar": ["app.jar", "library.jar", "core.jar"],
-            "*.zip": ["app.zip", "release.zip", "package.zip"],
-            "*.tar.gz": ["app.tar.gz", "release.tar.gz", "package.tar.gz"],
-            "*.exe": ["app.exe", "installer.exe", "setup.exe"],
-            "*.dmg": ["app.dmg", "installer.dmg", "setup.dmg"],
-        }
-        # Extract base pattern (e.g., "*.apk" -> "apk")
-        base_pattern = glob_pattern.lstrip("*.").lower()
-        if base_pattern in glob_artifact_map:
-            return glob_artifact_map[base_pattern]
-        # Fallback: return common names for generic pattern
-        return ["artifact", "release", "package"]
-
     async def _execute_phase_leased(
         self,
         *,
@@ -646,17 +627,16 @@ class EngineStateMachine:
         # Lease renewal helper (P1: renew throughout phase execution)
         async def renew_lease_if_needed() -> None:
             """Renew lease if it's nearing expiry (30s before expiry)."""
-            from datetime import datetime, timezone
-            exp_dt = _parse_iso(task_row.get("lease_expires_at"))
-            if exp_dt:
+            current_task = self.store.get_task(task_id)
+            if not current_task:
+                return
+            exp_dt = _parse_iso(current_task.get("lease_expires_at"))
+            if exp_dt is not None:
                 remaining = (exp_dt - datetime.now(timezone.utc)).total_seconds()
                 if remaining < 30:
-                    new_expires = _utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1800))
-                    self.task_orchestrator.renew_lease(task_id, lease_token, lease_seconds=1800)
-                    logger.debug(f"Renewed task {task_id} lease to {new_expires}")
+                    new_expires = self.task_orchestrator.renew_lease(task_id, lease_token, lease_seconds=1800)
+                    logger.debug("Renewed task %s lease to %s", task_id, new_expires)
 
-        # Get initial task row for lease tracking
-        task_row = self.store.get_task(task_id)
         if project.ui_contract:
             guardrail_header += f"{project.ui_contract}\n\n"
 
@@ -1429,12 +1409,13 @@ class EngineStateMachine:
                 if not effective_lease:
                     acquired_temp_lease = self.task_orchestrator.acquire_lease(t_id)
                     effective_lease = acquired_temp_lease
-                # P1: Verify required artifacts exist before adopting release (not just SHA256SUMS.txt)
-                expected_assets = self._extract_expected_assets_from_glob(project.artifact_glob)
+                # P1: Verify at least one artifact matching project.artifact_glob exists alongside SHA256SUMS.txt
+                expected_globs = [project.artifact_glob] if project.artifact_glob else []
                 rel_reconcile = self.task_orchestrator.reconcile_release_for_merge_sha(
                     task_id=t_id,
                     merge_sha=str(merge_sha),
-                    expected_asset_names=expected_assets,
+                    expected_asset_names=[],
+                    expected_asset_globs=expected_globs,
                     lease_token=effective_lease,
                     release_list_lookup=lambda: self.vcs.list_releases(project.repo),
                 )

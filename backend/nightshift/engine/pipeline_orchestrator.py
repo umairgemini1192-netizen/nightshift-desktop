@@ -7,6 +7,7 @@ Implements Governance Amendment D and docs/AGENT_PIPELINE.md section 4
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import os
 import subprocess
@@ -947,6 +948,7 @@ class TaskOrchestrator:
         existing_releases: list[dict[str, Any]] | None = None,
         release_list_lookup: Callable[[], list[dict[str, Any]]] | None = None,
         expected_checksums: dict[str, str] | None = None,
+        expected_asset_globs: list[str] | None = None,
     ) -> ReconcileResult:
         """Reconcile release creation & asset upload keyed by ``merge_sha``; fail closed on partials."""
         create_op_key = f"release_create:{task_id}:{merge_sha}"
@@ -1010,6 +1012,12 @@ class TaskOrchestrator:
         present_assets = {str(a.get("name") if isinstance(a, dict) else a) for a in (rel.get("assets") or [])}
         required = set(expected_asset_names) | {"SHA256SUMS.txt"}
         missing = sorted(required - present_assets)
+        for pattern in expected_asset_globs or ():
+            if pattern and not any(
+                name != "SHA256SUMS.txt" and fnmatch.fnmatch(name, pattern)
+                for name in present_assets
+            ):
+                missing.append(pattern)
 
         checksum_mismatches: list[str] = []
         if not missing and expected_checksums:
