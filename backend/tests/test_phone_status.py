@@ -361,6 +361,7 @@ def test_urgent_engine_events_trigger_phone_status_immediately(tmp_path) -> None
     from unittest.mock import patch
 
     from nightshift.engine.logins import LoginHealthChecker
+    from nightshift.engine.pipeline_contracts import MergeGate
     from nightshift.engine.planner import PhaseDefinition
     from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig
     from nightshift.engine.vcs import FakeGitGh
@@ -386,7 +387,10 @@ def test_urgent_engine_events_trigger_phone_status_immediately(tmp_path) -> None
         quota_ledger=quota,
         command_runner=lambda _cmd, _to: (0, "Logged in to github.com\nOK", "", False),
     )
-    engine = EngineStateMachine(store, events, quota, vcs=vcs, runners=runners, login_checker=logins)
+    engine = EngineStateMachine(
+        store, events, quota, vcs=vcs, runners=runners, login_checker=logins,
+        merge_gate=MergeGate(autonomous_merge_enabled=True),
+    )
 
     sent_events: list[tuple[str, dict[str, Any]]] = []
     creds = MemoryCredentialStore()

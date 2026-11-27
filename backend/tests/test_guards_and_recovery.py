@@ -12,6 +12,7 @@ import pytest
 from nightshift.engine.ci import CiPipelineManager
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.pipeline_contracts import MergeGate
 from nightshift.engine.planner import PhaseDefinition
 from nightshift.engine.release import ReleaseManager, compute_sha256
 from nightshift.engine.scheduler import Scheduler
@@ -80,11 +81,18 @@ async def test_diff_guard_self_heal_sends_findings_back_to_implementer(tmp_path:
                 assert "no_skipped_tests" in prompt_text
                 vcs.diffs["feat/p1"] = "--- a/tests/t.py\n+++ b/tests/t.py\n+def test_x(): assert True\n"
                 vcs.changed_files["feat/p1"] = ["tests/t.py"]
+                # tests/t.py is governance-classified; record owner approval for this test head
+                task_row = store.get_task_by_branch("feat/p1")
+                if task_row is not None:
+                    store.record_task_owner_approval(task_row["id"], "owner", vcs.prs["feat/p1"]["headRefOid"])
 
         reviewer = FakeRunner.success("codex")
         runners = {"agy": FakeRunner(name="agy", on_call=on_call), "codex": reviewer}
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
-        engine = EngineStateMachine(store, events, quota, vcs=vcs, runners=runners, login_checker=logins)
+        engine = EngineStateMachine(
+            store, events, quota, vcs=vcs, runners=runners, login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True),
+        )
 
         project = ProjectConfig(id="p_heal", name="Heal", repo="o/r", local_path=tmp_path / "repo", output_dir=tmp_path / "out")
         project.local_path.mkdir()
@@ -235,7 +243,10 @@ async def test_parking_continues_independent_and_stacks_dependent_phases(tmp_pat
 
         runners = {"agy": FakeRunner(name="agy", on_call=on_call)}
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
-        engine = EngineStateMachine(store, events, quota, vcs=vcs, runners=runners, login_checker=logins)
+        engine = EngineStateMachine(
+            store, events, quota, vcs=vcs, runners=runners, login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
+        )
         engine.scheduler.max_implement_attempts = 1
 
         project = ProjectConfig(id="p_stack", name="Stack", repo="o/r", local_path=tmp_path / "repo", output_dir=tmp_path / "out")
@@ -362,6 +373,7 @@ async def test_network_loss_backoff_without_burning_attempts_and_branch_protecti
         engine = EngineStateMachine(
             store, events, quota, vcs=vcs, runners={"agy": FakeRunner(name="agy", on_call=on_call)},
             login_checker=logins, network_backoff_seconds=0.01,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
         )
 
         project = ProjectConfig(id="p_net", name="Net", repo="o/r", local_path=tmp_path / "repo", output_dir=tmp_path / "out")

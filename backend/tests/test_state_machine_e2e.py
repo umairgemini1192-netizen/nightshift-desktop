@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.pipeline_contracts import MergeGate
 from nightshift.engine.planner import PhaseDefinition
 from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig, SingleInstanceLock
 from nightshift.engine.vcs import FakeGitGh
@@ -89,6 +90,7 @@ async def test_full_multi_phase_execution_and_digest(tmp_path: Path) -> None:
             vcs=vcs,
             runners=runners,
             login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
         )
 
         with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt_root"):
@@ -158,6 +160,7 @@ async def test_stop_after_current_phase(tmp_path: Path) -> None:
             vcs=vcs,
             runners=runners,
             login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
         )
 
         with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt_root"):
@@ -217,6 +220,7 @@ async def test_crash_recovery_resumes_cleanly(tmp_path: Path) -> None:
             vcs=vcs,
             runners={"agy": runner, "codex": reviewer},
             login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True),
         )
 
         phases = [
@@ -281,7 +285,10 @@ async def test_handoff_uses_selected_fallback_on_next_attempt(tmp_path: Path) ->
         first = FakeRunner.no_op("agy")
         second = FakeRunner(name="gemini", on_call=lambda *args: vcs.add_pr("feat/p1", number=501))
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=lambda cmd, to: (0, "OK", "", False))
-        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={"agy": first, "gemini": second}, login_checker=logins)
+        engine = EngineStateMachine(
+            store, EventBus(store), quota, vcs=vcs, runners={"agy": first, "gemini": second}, login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
+        )
         project = ProjectConfig(id="handoff", name="Handoff", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
         with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"):
             rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")])
@@ -325,7 +332,10 @@ async def test_reverted_merge_resumes_implementation(tmp_path: Path) -> None:
         vcs.merged_prs["nightshift/revert-merge-sha"] = {"number": 503}
         runner = FakeRunner(name="agy", on_call=lambda *args: vcs.add_pr("feat/p1", number=504))
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=lambda cmd, to: (0, "OK", "", False))
-        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={"agy": runner}, login_checker=logins)
+        engine = EngineStateMachine(
+            store, EventBus(store), quota, vcs=vcs, runners={"agy": runner}, login_checker=logins,
+            merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
+        )
         project = ProjectConfig(id="resume", name="Resume", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
         with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"):
             rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")])

@@ -48,7 +48,9 @@ class AgyRunner:
         extra_args: list[str] | None = None,
     ) -> RunnerResult:
         cmd = self.build_command(prompt, model=model, effort=effort, extra_args=extra_args)
-        rc, out, err, timed_out = run_subprocess_with_timeout(cmd, cwd=workdir, timeout_seconds=timeout_seconds, env=env)
+        rc, out, err, timed_out = run_subprocess_with_timeout(
+            cmd, cwd=workdir, timeout_seconds=timeout_seconds, env=env, scrub_env=True
+        )
 
         is_quota = False
         reset_at = None

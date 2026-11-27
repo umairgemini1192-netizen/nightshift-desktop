@@ -23,6 +23,10 @@ class PhaseDefinition:
     release_after_merge: bool = False
     force_rerun: bool = False
     position: int = 0
+    allowed_globs: list[str] = field(default_factory=list)
+    forbidden_globs: list[str] | None = None
+    risk_class: str = "business_logic"
+    owner_approval_required: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PhaseDefinition:

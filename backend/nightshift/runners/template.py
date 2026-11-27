@@ -63,7 +63,7 @@ class TemplateRunner:
     ) -> RunnerResult:
         cmd = self.build_command(prompt, workdir, model=model, effort=effort)
         rc, out, err, timed_out = run_subprocess_with_timeout(
-            cmd, cwd=workdir, timeout_seconds=timeout_seconds, env=self._env
+            cmd, cwd=workdir, timeout_seconds=timeout_seconds, env=self._env, scrub_env=True
         )
 
         is_quota = False
