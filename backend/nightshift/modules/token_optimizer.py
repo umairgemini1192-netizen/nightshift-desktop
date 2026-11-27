@@ -83,6 +83,12 @@ class TokenOptimizerService:
                 enabled = False
             elif enabled:
                 status = "enabled"
+                # Verify tool installation (P1 fix: ensure tools are installed before marking enabled)
+                if spec.name != "agy-fast":
+                    verify_res = self._manager.verify_installed(spec.name)
+                    if not verify_res.ok:
+                        warning = verify_res.warning or "Tool verification failed after enable"
+                        status = "hash_mismatch"
             else:
                 status = "disabled"
 

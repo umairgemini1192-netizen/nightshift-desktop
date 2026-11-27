@@ -644,6 +644,36 @@ class EngineStateMachine:
                     timeout_seconds=inv_timeout,
                 )
 
+                # Record A/B samples for enabled token optimizer tools (BLUEPRINT 5g)
+                tokens_in = int(res.usage_estimate.get("tokens_in", 0))
+                tokens_out = int(res.usage_estimate.get("tokens_out", 0))
+                turns = int(res.usage_estimate.get("turns", 1))
+                retry_turns = int(res.usage_estimate.get("retry_turns", 0))
+                success = res.rc == 0
+
+                # Record A/B samples for all enabled tools
+                enabled_tools = []
+                for spec in self.scheduler.router.tool_manager.list_specs():
+                    if spec.catalogue_only:
+                        continue
+                    db_state = self.store.get_token_tool_state(spec.name)
+                    if db_state and bool(db_state.get("enabled", 0)):
+                        enabled_tools.append(spec.name)
+
+                if enabled_tools:
+                    for tool_name in enabled_tools:
+                        self.store.record_token_ab_run(
+                            tool=tool_name,
+                            enabled=True,
+                            phase_kind=phase.ladder if phase.ladder else "default",
+                            engine=active_runner_name,
+                            tokens_in=tokens_in,
+                            tokens_out=tokens_out,
+                            turns=turns,
+                            retry_turns=retry_turns,
+                            success=success,
+                        )
+
                 # Persist redacted raw log as a file (BLUEPRINT 5d)
                 logs_dir = project.output_dir / "logs"
                 logs_dir.mkdir(parents=True, exist_ok=True)
@@ -681,6 +711,16 @@ class EngineStateMachine:
                     self.store.update_step(step_id, rc=0, verified=1, detail=deliv_reason)
                     self.store.record_duration("implement", active_runner_name, time.time() - t0)
                     self.store.update_engine_stats(active_runner_name, effective_size, success=True, minutes=elapsed_min)
+
+                    # Evaluate A/B results for enabled tools (BLUEPRINT 5g)
+                    ab = ABFramework(self.store, self.events)
+                    for spec in self.scheduler.router.tool_manager.list_specs():
+                        if spec.catalogue_only:
+                            continue
+                        db_state = self.store.get_token_tool_state(spec.name)
+                        if db_state and bool(db_state.get("enabled", 0)):
+                            ab.evaluate_and_apply(spec.name, phase.ladder if phase.ladder else "default")
+
                     self.events.emit(Event(
                         kind="runner.completed",
                         plain_text=f"{active_runner_name} delivered {phase.title}: {deliv_reason}",
