@@ -484,7 +484,6 @@ class EngineStateMachine:
             task_id=task_id,
             phase_id=phase.id,
             plan_id=plan_id,
-            project_id=project.id,
             title=phase.title,
             branch=phase.branch,
             risk_class=phase.risk_class,
