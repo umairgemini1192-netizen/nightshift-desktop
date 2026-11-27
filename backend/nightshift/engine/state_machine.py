@@ -97,9 +97,41 @@ class ProjectConfig:
             cp = list(raw_cp)
 
         raw_req_jobs = data.get("required_ci_jobs")
-        req_jobs = list(raw_req_jobs) if raw_req_jobs is not None else list(DEFAULT_NIGHTSHIFT_REQUIRED_JOBS)
-        raw_req_arts = data.get("required_artifacts_by_job") or {}
-        req_arts = dict(raw_req_arts) if isinstance(raw_req_arts, dict) else {}
+        if raw_req_jobs is None:
+            raw_req_jobs = data.get("required_ci_jobs_json")
+        if raw_req_jobs is None or raw_req_jobs == "":
+            req_jobs = list(DEFAULT_NIGHTSHIFT_REQUIRED_JOBS)
+        elif isinstance(raw_req_jobs, str):
+            try:
+                parsed_jobs = json.loads(raw_req_jobs)
+                req_jobs = [str(j) for j in parsed_jobs] if isinstance(parsed_jobs, list) else list(DEFAULT_NIGHTSHIFT_REQUIRED_JOBS)
+            except Exception:
+                req_jobs = list(DEFAULT_NIGHTSHIFT_REQUIRED_JOBS)
+        else:
+            req_jobs = [str(j) for j in raw_req_jobs]
+
+        raw_req_arts = data.get("required_artifacts_by_job")
+        if raw_req_arts is None:
+            raw_req_arts = data.get("required_artifacts_by_job_json")
+        if isinstance(raw_req_arts, str):
+            try:
+                parsed_arts = json.loads(raw_req_arts)
+                req_arts = (
+                    {str(k): [str(v) for v in vals] for k, vals in parsed_arts.items() if isinstance(vals, list)}
+                    if isinstance(parsed_arts, dict)
+                    else {}
+                )
+            except Exception:
+                req_arts = {}
+        elif isinstance(raw_req_arts, dict):
+            req_arts = {str(k): [str(v) for v in vals] for k, vals in raw_req_arts.items() if isinstance(vals, list)}
+        else:
+            req_arts = {}
+
+        raw_min_gate = data.get("min_gate_duration_seconds")
+        min_gate = float(raw_min_gate) if raw_min_gate is not None else DEFAULT_MIN_GATE_DURATION_S
+        raw_min_build = data.get("min_build_duration_seconds")
+        min_build = float(raw_min_build) if raw_min_build is not None else DEFAULT_MIN_BUILD_DURATION_S
 
         out = data.get("output_dir") or data.get("output_folder") or "dist"
         return cls(
@@ -117,9 +149,9 @@ class ProjectConfig:
             critical_paths=cp,
             required_ci_jobs=req_jobs,
             required_artifacts_by_job=req_arts,
-            min_gate_duration_seconds=float(data.get("min_gate_duration_seconds", DEFAULT_MIN_GATE_DURATION_S)),
-            min_build_duration_seconds=float(data.get("min_build_duration_seconds", DEFAULT_MIN_BUILD_DURATION_S)),
-            screenshot_manifest_path=str(data.get("screenshot_manifest_path", "")),
+            min_gate_duration_seconds=min_gate,
+            min_build_duration_seconds=min_build,
+            screenshot_manifest_path=str(data.get("screenshot_manifest_path") or ""),
         )
 
 
@@ -311,6 +343,11 @@ class EngineStateMachine:
                     tag_prefix=project.tag_prefix,
                     output_dir=str(project.output_dir),
                     critical_paths_json=json.dumps(project.critical_paths),
+                    required_ci_jobs_json=json.dumps(project.required_ci_jobs),
+                    required_artifacts_by_job_json=json.dumps(project.required_artifacts_by_job),
+                    min_gate_duration_seconds=project.min_gate_duration_seconds,
+                    min_build_duration_seconds=project.min_build_duration_seconds,
+                    screenshot_manifest_path=project.screenshot_manifest_path,
                 )
 
             self.scheduler.max_implement_attempts = int(self.store.get_setting("guard.maxAttempts", str(self.scheduler.max_implement_attempts)))
@@ -344,36 +381,6 @@ class EngineStateMachine:
                 level="info",
                 payload={"project_id": project.id},
             ))
-
-            # Persist evidence configuration for desktop-started runs (P1)
-            evidence_metadata = {
-                "screenshot_manifest_path": project.screenshot_manifest_path,
-                "ui_contract": project.ui_contract,
-                "build_rules": project.build_rules,
-                "release_workflow": project.release_workflow,
-                "artifact_glob": project.artifact_glob,
-                "artifact_prefix": project.artifact_prefix,
-                "tag_prefix": project.tag_prefix,
-                "output_dir": str(project.output_dir),
-                "critical_paths": project.critical_paths,
-                "required_ci_jobs": project.required_ci_jobs,
-                "required_artifacts_by_job": project.required_artifacts_by_job,
-                "min_gate_duration_seconds": project.min_gate_duration_seconds,
-                "min_build_duration_seconds": project.min_build_duration_seconds,
-            }
-            self.store.record_evidence(
-                task_id=plan_id,
-                contract_sha256="",  # Empty for run-start evidence
-                commit_sha="",
-                kind="project_config",
-                source="run_start",
-                build_id="",
-                duration_seconds=0.0,
-                artifact_paths=None,
-                metadata=evidence_metadata,
-                verified=True,
-                rejection_reason="",
-            )
 
             # Crash recovery on startup: WIP-checkpoint & release leases for orphaned RUNNING tasks (AGENT_PIPELINE §4)
             def _crash_checkpoint(orphan_task: dict[str, Any]) -> None:

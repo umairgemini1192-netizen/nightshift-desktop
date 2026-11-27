@@ -879,3 +879,370 @@ def test_persist_ci_evidence_records_rejected_audit_row_when_no_jobs(tmp_path: P
         assert len(rows) == 1
         assert rows[0]["verified"] == 0
         assert rows[0]["rejection_reason"] == "missing_required_job"
+
+
+# ---------------------------------------------------------------------------
+# 5. SubprocessGitGh CircleCI / GitHub Actions adapter & project persistence
+# ---------------------------------------------------------------------------
+
+
+def test_subprocess_git_gh_circleci_status_resolves_build_num_duration_and_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    wf_id = "daf4a8fa-1bb8-4aab-a88d-3f56bb91f7d0"
+    fe_uuid = "4cd387cd-f053-4ef0-bb63-2d3160104ae4"
+    pkg_uuid = "94bb1474-ba72-4c46-b510-95c8b44a814c"
+    slug = "circleci/org123/proj456"
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (0, json.dumps({"total_count": 0, "check_runs": []}), "", False)
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "sha": "sha_circle_1",
+                        "state": "success",
+                        "statuses": [
+                            {
+                                "id": 60079844076,
+                                "context": "ci/circleci: desktop-frontend",
+                                "state": "success",
+                                "created_at": "2026-11-27T21:42:36Z",
+                                "updated_at": "2026-11-27T21:42:36Z",
+                                "target_url": f"https://app.circleci.com/workflow/{wf_id}/job/{fe_uuid}",
+                            },
+                            {
+                                "id": 60079965022,
+                                "context": "ci/circleci: desktop-package",
+                                "state": "success",
+                                "created_at": "2026-11-27T21:45:24Z",
+                                "updated_at": "2026-11-27T21:45:24Z",
+                                "target_url": f"https://app.circleci.com/workflow/{wf_id}/job/{pkg_uuid}",
+                            },
+                        ],
+                    }
+                ),
+                "",
+                False,
+            )
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    http_calls: list[str] = []
+
+    def fake_http_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any] | None:
+        http_calls.append(url)
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}/job":
+            return {
+                "items": [
+                    {
+                        "id": fe_uuid,
+                        "job_number": 142,
+                        "name": "desktop-frontend",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T21:34:43.507Z",
+                        "stopped_at": "2026-11-27T21:42:36.241Z",
+                    },
+                    {
+                        "id": pkg_uuid,
+                        "job_number": 145,
+                        "name": "desktop-package",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T21:42:40.440Z",
+                        "stopped_at": "2026-11-27T21:45:23.693Z",
+                    },
+                ],
+                "next_page_token": None,
+            }
+        if url == f"https://circleci.com/api/v2/project/{slug}/142/artifacts":
+            return {
+                "items": [
+                    {
+                        "path": "ui-screenshots/screenshot-manifest.json",
+                        "url": "https://output.circle-artifacts.com/output/job/fe/artifacts/0/ui-screenshots/screenshot-manifest.json",
+                    },
+                    {
+                        "path": "ui-screenshots/mission-control-idle-1440x900.png",
+                        "url": "https://output.circle-artifacts.com/output/job/fe/artifacts/0/ui-screenshots/mission-control-idle-1440x900.png",
+                    },
+                ],
+                "next_page_token": None,
+            }
+        if url == f"https://circleci.com/api/v2/project/{slug}/145/artifacts":
+            return {
+                "items": [
+                    {
+                        "path": "nightshift-windows/NightShift-windows.zip",
+                        "url": "https://output.circle-artifacts.com/output/job/pkg/artifacts/0/nightshift-windows/NightShift-windows.zip",
+                    }
+                ],
+                "next_page_token": None,
+            }
+        return None
+
+    def fake_artifact_size(url: str, headers: dict[str, str], timeout: int) -> int:
+        if url.endswith(".zip"):
+            return 23_603_522
+        return 4096
+
+    vcs = SubprocessGitGh(http_json_get=fake_http_json, http_artifact_size=fake_artifact_size)
+    jobs = vcs.get_commit_ci_checks("owner/nightshift-desktop", "sha_circle_1", branch="feat/p8d")
+
+    assert len(jobs) == 2
+    # Workflow endpoint is queried once and cached for all jobs in that workflow.
+    assert http_calls.count(f"https://circleci.com/api/v2/workflow/{wf_id}/job") == 1
+
+    fe_job = next(j for j in jobs if j.name == "desktop-frontend")
+    pkg_job = next(j for j in jobs if j.name == "desktop-package")
+
+    # Build IDs match CircleCI CIRCLE_BUILD_NUM (not GitHub status IDs), and durations come from CircleCI.
+    assert fe_job.build_id == "142"
+    assert fe_job.duration_seconds > 470.0
+    assert pkg_job.build_id == "145"
+    assert pkg_job.duration_seconds > 160.0
+
+    # Artifacts are populated with non-empty byte sizes bound to the CircleCI build number.
+    ci_ev = validate_ci_evidence(
+        expected_commit_sha="sha_circle_1",
+        required_jobs=["desktop-frontend", "desktop-package"],
+        observed_jobs=jobs,
+        required_artifacts_by_job={
+            "desktop-frontend": ["ui-screenshots/screenshot-manifest.json"],
+            "desktop-package": ["nightshift-windows/NightShift-windows.zip"],
+        },
+    )
+    assert ci_ev.verified is True
+
+    # Screenshot manifest written with CIRCLE_BUILD_NUM="142" matches fe_job.build_id!
+    manifest_path = _make_valid_manifest(
+        tmp_path / "ui-screenshots",
+        commit_sha="sha_circle_1",
+        build_id="142",
+    )
+    shot_ev = validate_screenshot_manifest(
+        manifest_path,
+        expected_commit_sha="sha_circle_1",
+        expected_build_id=fe_job.build_id,
+    )
+    assert shot_ev.verified is True
+
+
+def test_subprocess_git_gh_github_actions_check_run_and_unknown_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "check_runs": [
+                            {
+                                "id": 8801,
+                                "name": "android-build",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_gha_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:30Z",
+                                "details_url": "https://github.com/owner/drivelift/actions/runs/9911/job/8801",
+                            }
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and cmd[2].startswith("repos/owner/drivelift/actions/runs/9911/artifacts"):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "name": "app-debug.apk",
+                                "size_in_bytes": 18_000_000,
+                                "expired": False,
+                                "archive_download_url": "https://api.github.com/repos/owner/drivelift/actions/artifacts/1/zip",
+                            },
+                            {
+                                "name": "expired.apk",
+                                "size_in_bytes": 1000,
+                                "expired": True,
+                                "archive_download_url": "https://api.github.com/repos/owner/drivelift/actions/artifacts/2/zip",
+                            },
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "sha": "sha_gha_1",
+                        "statuses": [
+                            {
+                                "id": 555,
+                                "context": "unknown-ci",
+                                "state": "success",
+                                "created_at": "2026-11-27T10:00:00Z",
+                                "updated_at": "2026-11-27T10:05:00Z",
+                                "target_url": "https://example.invalid/build/555",
+                            }
+                        ],
+                    }
+                ),
+                "",
+                False,
+            )
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    vcs = SubprocessGitGh(http_json_get=lambda *_: None, http_artifact_size=lambda *_: 0)
+    jobs = vcs.get_commit_ci_checks("owner/drivelift", "sha_gha_1", branch="feat/android")
+
+    gha_job = next(j for j in jobs if j.name == "android-build")
+    assert gha_job.duration_seconds == 150.0
+    assert gha_job.build_id == "8801"
+    assert len(gha_job.artifacts) == 1
+    assert isinstance(gha_job.artifacts[0], CiArtifact)
+    assert gha_job.artifacts[0].path == "app-debug.apk"
+    assert gha_job.artifacts[0].size_bytes == 18_000_000
+
+    res_gha = validate_ci_evidence(
+        expected_commit_sha="sha_gha_1",
+        required_jobs=["android-build"],
+        observed_jobs=[gha_job],
+        required_artifacts_by_job={"android-build": ["app-debug.apk"]},
+    )
+    assert res_gha.verified is True
+
+    # Unknown external status never fabricates duration from GitHub status created_at/updated_at.
+    unknown_job = next(j for j in jobs if j.name == "unknown-ci")
+    assert unknown_job.duration_seconds == 0.0
+    res_unknown = validate_ci_evidence(
+        expected_commit_sha="sha_gha_1",
+        required_jobs=["unknown-ci"],
+        observed_jobs=[unknown_job],
+    )
+    assert res_unknown.verified is False
+    assert res_unknown.rejection_reason == "suspicious_zero_duration_check"
+
+
+def test_desktop_bridge_persists_project_evidence_config_for_android_and_desktop(tmp_path: Path) -> None:
+    import threading
+    from nightshift.bridge import BridgeAPI
+    from nightshift.modules.registry import ModuleRegistry
+
+    with Store(tmp_path / "bridge_evidence.db") as store:
+        store.migrate()
+        events = EventBus(store=store)
+        started_configs: list[ProjectConfig] = []
+        started_event = threading.Event()
+
+        class _CaptureEngine:
+            is_running = False
+
+            async def execute_plan(
+                self,
+                project: ProjectConfig,
+                phases: list[PhaseDefinition],
+                *,
+                plan_id: str = "plan_default",
+            ) -> list[dict[str, Any]]:
+                started_configs.append(project)
+                started_event.set()
+                return []
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_CaptureEngine())
+
+        # Save an Android project with its own CI job names, artifact rules, and screenshot manifest.
+        save_resp = bridge.call(
+            "settings.saveProject",
+            {
+                "id": "drivelift-android",
+                "name": "DriveLift Android",
+                "repo": "owner/drivelift-android",
+                "local_path": str(tmp_path / "drivelift"),
+                "artifact_glob": "*.apk",
+                "required_ci_jobs": ["android-lint", "android-build"],
+                "required_artifacts_by_job": {"android-build": ["app-debug.apk"]},
+                "min_gate_duration_seconds": 3.0,
+                "min_build_duration_seconds": 25.0,
+                "screenshot_manifest_path": str(tmp_path / "android-shots" / "screenshot-manifest.json"),
+            },
+        )
+        assert save_resp["ok"] is True
+
+        # Updating basic project fields without evidence keys preserves the persisted evidence config.
+        upd_resp = bridge.call(
+            "settings.saveProject",
+            {
+                "id": "drivelift-android",
+                "name": "DriveLift Android v2",
+                "repo": "owner/drivelift-android",
+                "local_path": str(tmp_path / "drivelift"),
+                "artifact_glob": "*.apk",
+            },
+        )
+        assert upd_resp["ok"] is True
+
+        loaded_row = store.get_project("drivelift-android")
+        assert loaded_row is not None
+        loaded_cfg = ProjectConfig.from_dict(loaded_row)
+        assert loaded_cfg.required_ci_jobs == ["android-lint", "android-build"]
+        assert loaded_cfg.required_artifacts_by_job == {"android-build": ["app-debug.apk"]}
+        assert loaded_cfg.min_gate_duration_seconds == 3.0
+        assert loaded_cfg.min_build_duration_seconds == 25.0
+        assert loaded_cfg.screenshot_manifest_path == str(tmp_path / "android-shots" / "screenshot-manifest.json")
+
+        # Desktop-started run via engine.start receives the exact persisted evidence config.
+        store.create_plan("plan-android", "drivelift-android", "Android Plan")
+        store.upsert_phase("ph-1", "plan-android", "Fix UI", "feat/android-ui")
+        start_resp = bridge.call("engine.start", {"projectId": "drivelift-android", "planId": "plan-android"})
+        assert start_resp["ok"] is True
+        assert started_event.wait(timeout=5.0)
+        assert len(started_configs) == 1
+        assert started_configs[0].required_ci_jobs == ["android-lint", "android-build"]
+        assert started_configs[0].required_artifacts_by_job == {"android-build": ["app-debug.apk"]}
+        assert started_configs[0].screenshot_manifest_path == str(tmp_path / "android-shots" / "screenshot-manifest.json")
+
+        # Queue import also persists custom evidence requirements.
+        imp_resp = bridge.call(
+            "plan.importQueue",
+            {
+                "queue": {
+                    "repo": "owner/custom-queue",
+                    "local_repo": str(tmp_path / "custom"),
+                    "required_ci_jobs": ["unit-tests", "package-win"],
+                    "required_artifacts_by_job": {"package-win": ["dist/*.zip"]},
+                    "min_gate_duration_seconds": 4.0,
+                    "min_build_duration_seconds": 20.0,
+                    "screenshot_manifest_path": "shots/screenshot-manifest.json",
+                    "phases": [{"id": "q1", "title": "Q1", "branch": "feat/q1"}],
+                }
+            },
+        )
+        assert imp_resp["ok"] is True
+        q_row = store.get_project("owner/custom-queue")
+        assert q_row is not None
+        q_cfg = ProjectConfig.from_dict(q_row)
+        assert q_cfg.required_ci_jobs == ["unit-tests", "package-win"]
+        assert q_cfg.required_artifacts_by_job == {"package-win": ["dist/*.zip"]}
+        assert q_cfg.min_gate_duration_seconds == 4.0
+        assert q_cfg.min_build_duration_seconds == 20.0
+        assert q_cfg.screenshot_manifest_path == "shots/screenshot-manifest.json"

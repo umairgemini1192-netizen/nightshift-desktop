@@ -64,6 +64,11 @@ def _migration_001_initial_schema(conn: sqlite3.Connection) -> None:
             output_folder TEXT NOT NULL DEFAULT '',
             output_dir TEXT NOT NULL DEFAULT '',
             critical_paths_json TEXT NOT NULL DEFAULT '[]',
+            required_ci_jobs_json TEXT DEFAULT NULL,
+            required_artifacts_by_job_json TEXT NOT NULL DEFAULT '{}',
+            min_gate_duration_seconds REAL NOT NULL DEFAULT 5.0,
+            min_build_duration_seconds REAL NOT NULL DEFAULT 15.0,
+            screenshot_manifest_path TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
@@ -539,12 +544,27 @@ def _migration_005_agent_pipeline(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_006_project_evidence_columns(conn: sqlite3.Connection) -> None:
+    """Persist per-project CI and screenshot evidence integrity settings (Phase 8d)."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+    for name, definition in (
+        ("required_ci_jobs_json", "TEXT DEFAULT NULL"),
+        ("required_artifacts_by_job_json", "TEXT NOT NULL DEFAULT '{}'"),
+        ("min_gate_duration_seconds", "REAL NOT NULL DEFAULT 5.0"),
+        ("min_build_duration_seconds", "REAL NOT NULL DEFAULT 15.0"),
+        ("screenshot_manifest_path", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
     (3, "003_nullable_router_step", _migration_003_nullable_router_step),
     (4, "004_token_optimizer_tables", _migration_004_token_optimizer_tables),
     (5, "005_agent_pipeline", _migration_005_agent_pipeline),
+    (6, "006_project_evidence_columns", _migration_006_project_evidence_columns),
 ]
 
 
@@ -646,6 +666,11 @@ class Store:
         output_folder: str = "",
         output_dir: str = "",
         critical_paths_json: str = "[]",
+        required_ci_jobs_json: str | None = None,
+        required_artifacts_by_job_json: str = "{}",
+        min_gate_duration_seconds: float = 5.0,
+        min_build_duration_seconds: float = 15.0,
+        screenshot_manifest_path: str = "",
     ) -> dict[str, Any]:
         now = _utc_now()
         effective_output = output_dir or output_folder
@@ -655,8 +680,11 @@ class Store:
                 INSERT INTO projects (
                     id, name, repo, local_path, build_rules, ui_contract,
                     release_workflow, artifact_glob, artifact_prefix, tag_prefix,
-                    output_folder, output_dir, critical_paths_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    output_folder, output_dir, critical_paths_json,
+                    required_ci_jobs_json, required_artifacts_by_job_json,
+                    min_gate_duration_seconds, min_build_duration_seconds,
+                    screenshot_manifest_path, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -672,6 +700,11 @@ class Store:
                     effective_output,
                     effective_output,
                     critical_paths_json,
+                    required_ci_jobs_json,
+                    required_artifacts_by_job_json,
+                    float(min_gate_duration_seconds),
+                    float(min_build_duration_seconds),
+                    screenshot_manifest_path,
                     now,
                     now,
                 ),

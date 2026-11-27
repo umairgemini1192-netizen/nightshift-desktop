@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -13,7 +18,160 @@ from nightshift.runners.base import run_subprocess_with_timeout
 
 if TYPE_CHECKING:
     from nightshift.engine.pipeline_contracts import DiffPathEntry
-    from nightshift.engine.pipeline_evidence import CiJobCheck
+    from nightshift.engine.pipeline_evidence import CiArtifact, CiJobCheck
+
+_CIRCLECI_WORKFLOW_JOB_RE = re.compile(
+    r"circleci\.com/workflow/([0-9a-fA-F-]+)/job/([0-9a-fA-F-]+)",
+    re.IGNORECASE,
+)
+_CIRCLECI_PIPELINE_JOB_RE = re.compile(
+    r"circleci\.com/pipelines/([^/]+/[^/]+/[^/]+)/\d+/workflows/([0-9a-fA-F-]+)/jobs/(\d+)",
+    re.IGNORECASE,
+)
+_CIRCLECI_LEGACY_JOB_RE = re.compile(
+    r"circleci\.com/(?:jobs/)?(gh|github|bb|bitbucket)/([^/]+)/([^/]+)/(\d+)",
+    re.IGNORECASE,
+)
+_GH_ACTIONS_RUN_RE = re.compile(
+    r"/actions/runs/(\d+)(?:/jobs?/(\d+))?",
+    re.IGNORECASE,
+)
+_CONTENT_RANGE_TOTAL_RE = re.compile(
+    r"bytes\s+(?:\d+-\d+|\*)/(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _is_circleci_host(url: str) -> bool:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return (
+        host == "circleci.com"
+        or host.endswith(".circleci.com")
+        or host == "circle-artifacts.com"
+        or host.endswith(".circle-artifacts.com")
+    )
+
+
+class _SafeCircleRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strip CircleCI auth tokens when following redirects to external hosts (e.g. S3)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and not _is_circleci_host(newurl):
+            for header_key in list(redirected.headers.keys()):
+                if header_key.lower() == "circle-token":
+                    redirected.remove_header(header_key)
+            for header_key in list(redirected.unredirected_hdrs.keys()):
+                if header_key.lower() == "circle-token":
+                    del redirected.unredirected_hdrs[header_key]
+        return redirected
+
+
+_SAFE_CIRCLE_OPENER = urllib.request.build_opener(_SafeCircleRedirectHandler())
+
+
+def _default_http_json_get(
+    url: str,
+    headers: dict[str, str],
+    timeout: int = 30,
+) -> dict[str, Any] | None:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with _SAFE_CIRCLE_OPENER.open(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _default_http_artifact_size(
+    url: str,
+    headers: dict[str, str],
+    timeout: int = 30,
+) -> int:
+    """Return authoritative byte size for a downloadable artifact without downloading the full file."""
+    probe_headers = dict(headers)
+    if not _is_circleci_host(url):
+        probe_headers = {k: v for k, v in probe_headers.items() if k.lower() != "circle-token"}
+    probe_headers["Range"] = "bytes=0-0"
+    req = urllib.request.Request(url, headers=probe_headers, method="GET")
+    try:
+        with _SAFE_CIRCLE_OPENER.open(req, timeout=timeout) as resp:
+            content_range = resp.headers.get("Content-Range") or ""
+            m = _CONTENT_RANGE_TOTAL_RE.search(content_range)
+            if m:
+                return int(m.group(1))
+            content_length = resp.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    return max(0, int(content_length))
+                except ValueError:
+                    pass
+            sample = resp.read(1)
+            return len(sample)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 416:
+            content_range = exc.headers.get("Content-Range") or "" if exc.headers else ""
+            m = _CONTENT_RANGE_TOTAL_RE.search(content_range)
+            if m:
+                return int(m.group(1))
+            return 0
+        return 0
+    except Exception:
+        return 0
+
+
+def _parse_iso_dt(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _normalize_circleci_slug(raw_slug: str) -> str:
+    parts = [p for p in raw_slug.strip("/").split("/") if p]
+    if len(parts) >= 3:
+        vcs = parts[0].lower()
+        if vcs == "github":
+            parts[0] = "gh"
+        elif vcs == "bitbucket":
+            parts[0] = "bb"
+    return "/".join(parts)
+
+
+def _parse_circleci_target(url: str, repo: str) -> dict[str, str] | None:
+    if not url:
+        return None
+    m_wf = _CIRCLECI_WORKFLOW_JOB_RE.search(url)
+    if m_wf:
+        return {
+            "workflow_id": m_wf.group(1),
+            "job_uuid": m_wf.group(2),
+            "project_slug": f"gh/{repo}" if repo else "",
+            "job_number": "",
+        }
+    m_pipe = _CIRCLECI_PIPELINE_JOB_RE.search(url)
+    if m_pipe:
+        return {
+            "workflow_id": m_pipe.group(2),
+            "job_uuid": "",
+            "project_slug": _normalize_circleci_slug(m_pipe.group(1)),
+            "job_number": m_pipe.group(3),
+        }
+    m_leg = _CIRCLECI_LEGACY_JOB_RE.search(url)
+    if m_leg:
+        vcs_raw, owner, repo_name, job_num = m_leg.groups()
+        vcs_prefix = "gh" if vcs_raw.lower() in ("gh", "github") else "bb"
+        return {
+            "workflow_id": "",
+            "job_uuid": "",
+            "project_slug": f"{vcs_prefix}/{owner}/{repo_name}",
+            "job_number": job_num,
+        }
+    return None
 
 
 class GitGhClient(Protocol):
@@ -134,6 +292,205 @@ class GitGhClient(Protocol):
 
 class SubprocessGitGh:
     """Production implementation calling real `git` and `gh` CLIs."""
+
+    def __init__(
+        self,
+        *,
+        http_json_get: Callable[[str, dict[str, str], int], dict[str, Any] | None] | None = None,
+        http_artifact_size: Callable[[str, dict[str, str], int], int] | None = None,
+        circle_token: str | None = None,
+    ) -> None:
+        self._http_json_get = http_json_get or _default_http_json_get
+        self._http_artifact_size = http_artifact_size or _default_http_artifact_size
+        self._circle_token = circle_token
+
+    def _circleci_headers(self) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": "NightShift-Desktop/0.1",
+        }
+        token = self._circle_token if self._circle_token is not None else os.environ.get("CIRCLE_TOKEN", "")
+        if token:
+            headers["Circle-Token"] = token
+        return headers
+
+    def _resolve_circleci_job(
+        self,
+        *,
+        target_url: str,
+        repo: str,
+        job_name: str,
+        workflow_cache: dict[str, list[dict[str, Any]]],
+        artifacts_cache: dict[tuple[str, str], list[CiArtifact]],
+    ) -> tuple[str, float, list[CiArtifact], str] | None:
+        """Resolve authoritative CircleCI build number, duration, artifacts, and status."""
+        from nightshift.engine.pipeline_evidence import CiArtifact
+
+        parsed = _parse_circleci_target(target_url, repo)
+        if not parsed:
+            return None
+
+        headers = self._circleci_headers()
+        workflow_id = parsed["workflow_id"]
+        job_uuid = parsed["job_uuid"]
+        project_slug = parsed["project_slug"]
+        job_number = parsed["job_number"]
+        duration = 0.0
+        ci_status = ""
+
+        if workflow_id:
+            if workflow_id not in workflow_cache:
+                wf_items: list[dict[str, Any]] = []
+                page_token = ""
+                for _ in range(10):
+                    wf_url = f"https://circleci.com/api/v2/workflow/{workflow_id}/job"
+                    if page_token:
+                        wf_url += f"?page-token={urllib.parse.quote(page_token, safe='')}"
+                    payload = self._http_json_get(wf_url, headers, 30)
+                    if not payload:
+                        break
+                    wf_items.extend(
+                        item for item in (payload.get("items") or []) if isinstance(item, dict)
+                    )
+                    page_token = str(payload.get("next_page_token") or "")
+                    if not page_token:
+                        break
+                workflow_cache[workflow_id] = wf_items
+
+            matched_item: dict[str, Any] | None = None
+            for item in workflow_cache[workflow_id]:
+                if job_uuid and str(item.get("id") or "") == job_uuid:
+                    matched_item = item
+                    break
+            if matched_item is None and job_number:
+                for item in workflow_cache[workflow_id]:
+                    if str(item.get("job_number") or "") == job_number:
+                        matched_item = item
+                        break
+            if matched_item is None and job_name:
+                for item in workflow_cache[workflow_id]:
+                    if str(item.get("name") or "") == job_name:
+                        matched_item = item
+                        break
+
+            if matched_item is not None:
+                if matched_item.get("job_number") is not None:
+                    job_number = str(matched_item["job_number"])
+                if matched_item.get("project_slug"):
+                    project_slug = str(matched_item["project_slug"])
+                ci_status = str(matched_item.get("status") or "").strip().lower()
+                started = _parse_iso_dt(matched_item.get("started_at"))
+                stopped = _parse_iso_dt(matched_item.get("stopped_at"))
+                if started and stopped:
+                    duration = max(0.0, (stopped - started).total_seconds())
+
+        if job_number and project_slug and duration <= 0.0:
+            job_url = f"https://circleci.com/api/v2/project/{project_slug}/job/{job_number}"
+            job_payload = self._http_json_get(job_url, headers, 30)
+            if job_payload:
+                if not ci_status and job_payload.get("status"):
+                    ci_status = str(job_payload["status"]).strip().lower()
+                started = _parse_iso_dt(job_payload.get("started_at"))
+                stopped = _parse_iso_dt(job_payload.get("stopped_at"))
+                if started and stopped:
+                    duration = max(0.0, (stopped - started).total_seconds())
+                elif isinstance(job_payload.get("duration"), (int, float)) and job_payload["duration"] > 0:
+                    duration = float(job_payload["duration"]) / 1000.0
+
+        artifacts: list[CiArtifact] = []
+        if job_number and project_slug:
+            cache_key = (project_slug, job_number)
+            if cache_key not in artifacts_cache:
+                collected: list[CiArtifact] = []
+                page_token = ""
+                for _ in range(10):
+                    art_url = f"https://circleci.com/api/v2/project/{project_slug}/{job_number}/artifacts"
+                    if page_token:
+                        art_url += f"?page-token={urllib.parse.quote(page_token, safe='')}"
+                    art_payload = self._http_json_get(art_url, headers, 30)
+                    if not art_payload:
+                        break
+                    for item in art_payload.get("items") or []:
+                        if not isinstance(item, dict):
+                            continue
+                        art_path = str(item.get("path") or "").strip()
+                        dl_url = str(item.get("url") or "").strip()
+                        if not art_path:
+                            continue
+                        raw_size = (
+                            item.get("size_bytes")
+                            if item.get("size_bytes") is not None
+                            else item.get("size")
+                        )
+                        if raw_size is not None:
+                            try:
+                                size_bytes = max(0, int(raw_size))
+                            except (TypeError, ValueError):
+                                size_bytes = 0
+                        elif dl_url:
+                            size_bytes = self._http_artifact_size(dl_url, headers, 30)
+                        else:
+                            size_bytes = 0
+                        collected.append(
+                            CiArtifact(
+                                path=art_path,
+                                size_bytes=size_bytes,
+                                build_id=job_number,
+                                url=dl_url,
+                            )
+                        )
+                    page_token = str(art_payload.get("next_page_token") or "")
+                    if not page_token:
+                        break
+                artifacts_cache[cache_key] = collected
+            artifacts = list(artifacts_cache[cache_key])
+
+        return (job_number, duration, artifacts, ci_status)
+
+    def _fetch_gh_actions_artifacts(
+        self,
+        repo: str,
+        run_id: str,
+        build_id: str,
+        gh_artifacts_cache: dict[str, list[dict[str, Any]]],
+    ) -> list[CiArtifact]:
+        """Fetch non-expired GitHub Actions workflow run artifacts via gh api."""
+        from nightshift.engine.pipeline_evidence import CiArtifact
+
+        if not run_id:
+            return []
+        if run_id not in gh_artifacts_cache:
+            rc_art, out_art, _, _ = run_subprocess_with_timeout(
+                ["gh", "api", f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"],
+                timeout_seconds=30,
+            )
+            raw_list: list[dict[str, Any]] = []
+            if rc_art == 0 and out_art:
+                try:
+                    art_payload = json.loads(out_art)
+                    raw_list = [
+                        item for item in (art_payload.get("artifacts") or []) if isinstance(item, dict)
+                    ]
+                except Exception:
+                    raw_list = []
+            gh_artifacts_cache[run_id] = raw_list
+
+        artifacts: list[CiArtifact] = []
+        for art in gh_artifacts_cache[run_id]:
+            if art.get("expired"):
+                continue
+            art_name = str(art.get("name") or "").strip()
+            if not art_name:
+                continue
+            artifacts.append(
+                CiArtifact(
+                    path=art_name,
+                    size_bytes=max(0, int(art.get("size_in_bytes") or 0)),
+                    build_id=build_id,
+                    url=str(art.get("archive_download_url") or ""),
+                )
+            )
+        return artifacts
 
     def fetch_origin(self, local_repo: Path) -> tuple[int, str, str]:
         rc, out, err, _ = run_subprocess_with_timeout(["git", "fetch", "origin"], cwd=local_repo, timeout_seconds=120)
@@ -326,24 +683,32 @@ class SubprocessGitGh:
         commit_sha: str,
         branch: str = "",
     ) -> list[CiJobCheck]:
-        """Query authoritative CI check-runs/statuses for ``commit_sha`` via GitHub API."""
-        from datetime import datetime, timezone
-        from nightshift.engine.pipeline_evidence import CiJobCheck, DEFAULT_GATE_JOB_NAMES
+        """Query authoritative CI check-runs/statuses, durations, and artifacts for ``commit_sha``."""
+        from nightshift.engine.pipeline_evidence import CiArtifact, CiJobCheck, DEFAULT_GATE_JOB_NAMES
 
         if not commit_sha:
             return []
 
-        def _parse_iso_dt(raw: str | None) -> datetime | None:
-            if not raw:
-                return None
-            try:
-                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                return None
+        def _map_circleci_status(ci_status: str, fallback: str) -> str:
+            if not ci_status:
+                return fallback
+            if ci_status == "success":
+                return "success"
+            if ci_status in ("not_run", "skipped"):
+                return "skipped"
+            if ci_status in ("running", "queued", "on_hold", "blocked"):
+                return "running"
+            if ci_status == "canceled":
+                return "canceled"
+            return "failed"
+
+        workflow_cache: dict[str, list[dict[str, Any]]] = {}
+        circle_artifacts_cache: dict[tuple[str, str], list[CiArtifact]] = {}
+        gh_artifacts_cache: dict[str, list[dict[str, Any]]] = {}
 
         results: list[CiJobCheck] = []
         rc, out, _, _ = run_subprocess_with_timeout(
-            ["gh", "api", f"repos/{repo}/commits/{commit_sha}/check-runs"],
+            ["gh", "api", f"repos/{repo}/commits/{commit_sha}/check-runs?per_page=100"],
             timeout_seconds=60,
         )
         if rc == 0 and out:
@@ -360,31 +725,43 @@ class SubprocessGitGh:
                         eff_status = conclusion or "failed"
                     else:
                         eff_status = status_raw or "running"
-                    duration = float(run.get("duration_seconds") or 0.0)
+                    started = _parse_iso_dt(run.get("started_at"))
+                    completed = _parse_iso_dt(run.get("completed_at"))
+                    duration = (
+                        max(0.0, (completed - started).total_seconds())
+                        if started and completed
+                        else 0.0
+                    )
                     head_oid = str(run.get("head_sha") or commit_sha)
                     build_id = str(run.get("id") or run.get("external_id") or "")
-                    artifacts = []
-                    if build_id:
-                        # Query GitHub API for artifacts associated with this check run
-                        rc_art, out_art, _, _ = run_subprocess_with_timeout(
-                            ["gh", "api", f"repos/{repo}/check-runs/{build_id}/artifacts"],
-                            timeout_seconds=30,
-                        )
-                        if rc_art == 0 and out_art:
-                            try:
-                                art_payload = json.loads(out_art)
-                                for art in art_payload.get("artifacts") or []:
-                                    art_path = str(art.get("archive_download_url", "")).split("/")[-1]
-                                    artifacts.append(
-                                        CiArtifact(
-                                            path=art_path,
-                                            size_bytes=int(art.get("size_in_bytes") or 0),
-                                            build_id=build_id,
-                                            url=str(art.get("archive_download_url", "")),
-                                        )
-                                    )
-                            except Exception:
-                                pass
+                    details_url = str(run.get("details_url") or run.get("html_url") or "")
+                    artifacts: list[CiArtifact] = []
+
+                    circle_info = self._resolve_circleci_job(
+                        target_url=details_url,
+                        repo=repo,
+                        job_name=norm_name,
+                        workflow_cache=workflow_cache,
+                        artifacts_cache=circle_artifacts_cache,
+                    )
+                    if circle_info is not None:
+                        c_build_id, c_duration, c_artifacts, c_status = circle_info
+                        if c_build_id:
+                            build_id = c_build_id
+                        if c_duration > 0.0:
+                            duration = c_duration
+                        artifacts = c_artifacts
+                        eff_status = _map_circleci_status(c_status, eff_status)
+                    else:
+                        m_gha = _GH_ACTIONS_RUN_RE.search(details_url)
+                        if m_gha:
+                            artifacts = self._fetch_gh_actions_artifacts(
+                                repo,
+                                m_gha.group(1),
+                                build_id,
+                                gh_artifacts_cache,
+                            )
+
                     results.append(
                         CiJobCheck(
                             name=norm_name,
@@ -403,7 +780,7 @@ class SubprocessGitGh:
 
         # Also inspect commit statuses (CircleCI commonly reports ci/circleci: <job>)
         rc_s, out_s, _, _ = run_subprocess_with_timeout(
-            ["gh", "api", f"repos/{repo}/commits/{commit_sha}/status"],
+            ["gh", "api", f"repos/{repo}/commits/{commit_sha}/status?per_page=100"],
             timeout_seconds=60,
         )
         if rc_s == 0 and out_s:
@@ -419,36 +796,54 @@ class SubprocessGitGh:
                         continue
                     state = str(st.get("state") or "").lower()
                     eff_status = "success" if state == "success" else ("running" if state == "pending" else "failed")
-                    created = _parse_iso_dt(st.get("created_at"))
-                    updated = _parse_iso_dt(st.get("updated_at"))
-                    duration = (
-                        max(0.0, (updated - created).total_seconds())
-                        if created and updated
-                        else 0.0
-                    )
+                    target_url = str(st.get("target_url") or "")
+                    # Never derive execution duration from GitHub status created_at/updated_at timestamps:
+                    # they record the GitHub status event, not CI execution time.
+                    duration = 0.0
                     build_id = str(st.get("id") or "")
                     artifacts = []
-                    if build_id:
-                        # Query GitHub API for artifacts associated with this check run
-                        rc_art, out_art, _, _ = run_subprocess_with_timeout(
-                            ["gh", "api", f"repos/{repo}/check-runs/{build_id}/artifacts"],
-                            timeout_seconds=30,
-                        )
-                        if rc_art == 0 and out_art:
-                            try:
-                                art_payload = json.loads(out_art)
-                                for art in art_payload.get("artifacts") or []:
-                                    art_path = str(art.get("archive_download_url", "")).split("/")[-1]
-                                    artifacts.append(
-                                        CiArtifact(
-                                            path=art_path,
-                                            size_bytes=int(art.get("size_in_bytes") or 0),
-                                            build_id=build_id,
-                                            url=str(art.get("archive_download_url", "")),
-                                        )
-                                    )
-                            except Exception:
-                                pass
+
+                    circle_info = self._resolve_circleci_job(
+                        target_url=target_url,
+                        repo=repo,
+                        job_name=norm_name,
+                        workflow_cache=workflow_cache,
+                        artifacts_cache=circle_artifacts_cache,
+                    )
+                    if circle_info is not None:
+                        c_build_id, c_duration, c_artifacts, c_status = circle_info
+                        if c_build_id:
+                            build_id = c_build_id
+                        duration = c_duration
+                        artifacts = c_artifacts
+                        eff_status = _map_circleci_status(c_status, eff_status)
+                    else:
+                        m_gha = _GH_ACTIONS_RUN_RE.search(target_url)
+                        if m_gha:
+                            run_id, gha_job_id = m_gha.group(1), m_gha.group(2)
+                            if gha_job_id:
+                                rc_j, out_j, _, _ = run_subprocess_with_timeout(
+                                    ["gh", "api", f"repos/{repo}/actions/jobs/{gha_job_id}"],
+                                    timeout_seconds=30,
+                                )
+                                if rc_j == 0 and out_j:
+                                    try:
+                                        j_payload = json.loads(out_j)
+                                        started = _parse_iso_dt(j_payload.get("started_at"))
+                                        completed = _parse_iso_dt(j_payload.get("completed_at"))
+                                        if started and completed:
+                                            duration = max(0.0, (completed - started).total_seconds())
+                                        if j_payload.get("id"):
+                                            build_id = str(j_payload["id"])
+                                    except Exception:
+                                        pass
+                            artifacts = self._fetch_gh_actions_artifacts(
+                                repo,
+                                run_id,
+                                build_id,
+                                gh_artifacts_cache,
+                            )
+
                     results.append(
                         CiJobCheck(
                             name=norm_name,
