@@ -20,6 +20,7 @@ from nightshift.engine.ci import CiPipelineManager, CiWatchResult
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
 from nightshift.engine.pipeline_contracts import MergeGate, provider_for_engine
+from nightshift.engine.pipeline_orchestrator import LeaseHeartbeat, TaskOrchestrator, is_process_alive
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
 from nightshift.engine.release import ReleaseManager
 from nightshift.engine.scheduler import Scheduler
@@ -161,6 +162,8 @@ class EngineStateMachine:
         login_checker: LoginHealthChecker | None = None,
         network_backoff_seconds: float = 30.0,
         merge_gate: MergeGate | None = None,
+        lease_seconds: int = 1800,
+        lease_heartbeat_interval: float | None = None,
     ) -> None:
         self.store = store
         self.events = event_bus
@@ -169,9 +172,12 @@ class EngineStateMachine:
         self.runners = runners or {}
         self.logins = login_checker or LoginHealthChecker(store=store, quota_ledger=quota_ledger)
         self._network_backoff_seconds = network_backoff_seconds
+        self._lease_seconds = lease_seconds
+        self._lease_heartbeat_interval = lease_heartbeat_interval
         # Single mandatory merge-gate chokepoint (AGENT_PIPELINE §1).
         # Autonomous merge stays OFF by default until Phases 8b-8e reach Integration-tested.
         self.merge_gate = merge_gate or MergeGate(autonomous_merge_enabled=False)
+        self.task_orchestrator = TaskOrchestrator(store=store)
 
         self.scheduler = Scheduler(
             store=store,
@@ -314,6 +320,33 @@ class EngineStateMachine:
                 level="info",
                 payload={"project_id": project.id},
             ))
+
+            # Crash recovery on startup: WIP-checkpoint & release leases for orphaned RUNNING tasks (AGENT_PIPELINE §4)
+            def _crash_checkpoint(orphan_task: dict[str, Any]) -> None:
+                orphan_phase = str(orphan_task.get("phase_id") or "")
+                orphan_branch = str(orphan_task.get("branch") or "")
+                orphan_wt = WORKTREE_ROOT / orphan_phase.replace("/", "_").replace("\\", "_")
+                if orphan_branch and orphan_wt.exists():
+                    try:
+                        self.vcs.create_checkpoint_commit_and_push(
+                            orphan_wt,
+                            orphan_branch,
+                            "nightshift: crash-checkpoint",
+                        )
+                    except Exception as exc:
+                        logger.warning("Crash-checkpoint failed for orphaned task %s: %s", orphan_task.get("id"), exc)
+
+            recovered_tasks = self.task_orchestrator.recover_orphaned_running_tasks(
+                is_pid_alive=is_process_alive,
+                checkpoint_fn=_crash_checkpoint,
+            )
+            for recovered_id in recovered_tasks:
+                self.events.emit(Event(
+                    kind="task.recovered",
+                    plain_text=f"Recovered orphaned task {recovered_id} after previous worker exit.",
+                    level="warn",
+                    payload={"project_id": project.id, "task_id": recovered_id},
+                ))
 
             completed_ids: set[str] = set()
             parked_ids: set[str] = set()
@@ -469,7 +502,7 @@ class EngineStateMachine:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Ensure a durable pipeline task and frozen requirement contract exist for ``phase``."""
         existing = self.store.get_task_by_branch(phase.branch)
-        if existing is not None and existing.get("project_id") == project.id and existing.get("phase_id") == phase.id:
+        if existing is not None and existing.get("plan_id") == plan_id and existing.get("phase_id") == phase.id:
             contract = self.store.get_task_contract(str(existing["contract_id"]))
             if contract is not None:
                 return existing, contract
@@ -490,6 +523,31 @@ class EngineStateMachine:
             allowed_globs=list(phase.allowed_globs),
             forbidden_globs=list(phase.forbidden_globs) if phase.forbidden_globs is not None else None,
             owner_approval_required=phase.owner_approval_required,
+        )
+
+    def _safe_task_transition(
+        self,
+        task_id: str,
+        to_status: str,
+        *,
+        idempotency_key: str,
+        reason: str,
+        actor: str = "engine",
+        updates: dict[str, Any] | None = None,
+        lease_token: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Advance ``task_id`` through ``TaskOrchestrator`` when the transition is legal from its current state."""
+        cur = self.store.get_task(task_id)
+        if cur is None or cur["status"] == to_status:
+            return cur
+        return self.task_orchestrator.transition(
+            task_id,
+            to_status,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            actor=actor,
+            updates=updates,
+            lease_token=lease_token,
         )
 
     async def _execute_phase(
@@ -525,6 +583,47 @@ class EngineStateMachine:
 
         # Ensure a durable pipeline task + frozen requirement contract exists before coding/merging (AGENT_PIPELINE §3.1)
         pipeline_task, pipeline_contract = self._ensure_pipeline_task(project, phase, plan_id)
+        task_id = str(pipeline_task["id"])
+        lease_token = self.task_orchestrator.acquire_lease(task_id, lease_seconds=self._lease_seconds)
+        try:
+            with LeaseHeartbeat(
+                self.task_orchestrator,
+                task_id,
+                lease_token,
+                lease_seconds=self._lease_seconds,
+                interval_seconds=self._lease_heartbeat_interval,
+            ):
+                return await self._execute_phase_leased(
+                    project=project,
+                    phase=phase,
+                    plan_id=plan_id,
+                    base_branch=base_branch,
+                    dependencies_merged=dependencies_merged,
+                    wt_dir=wt_dir,
+                    pipeline_task=pipeline_task,
+                    pipeline_contract=pipeline_contract,
+                    lease_token=lease_token,
+                )
+        finally:
+            self.task_orchestrator.release_lease(task_id, lease_token)
+
+    async def _execute_phase_leased(
+        self,
+        *,
+        project: ProjectConfig,
+        phase: PhaseDefinition,
+        plan_id: str,
+        base_branch: str,
+        dependencies_merged: bool,
+        wt_dir: Path,
+        pipeline_task: dict[str, Any],
+        pipeline_contract: dict[str, Any],
+        lease_token: str,
+    ) -> dict[str, Any]:
+        """Execute a single phase while holding a fenced task lease."""
+        task_id = str(pipeline_task["id"])
+        active_runner_name = "unknown"
+        t0 = time.time()
         contract_allowed_globs = json.loads(str(pipeline_contract.get("allowed_globs_json") or "[]"))
         contract_forbidden_globs = json.loads(str(pipeline_contract.get("forbidden_globs_json") or "[]"))
 
@@ -535,17 +634,72 @@ class EngineStateMachine:
             f"- Commit cleanly, push `{phase.branch}`, and open a PR targeting `main` (if PR exists, push to it).\n"
             "- NEVER merge to `main` or cut releases yourself; the orchestrator merges after CI passes.\n\n"
         )
+
         if project.ui_contract:
             guardrail_header += f"{project.ui_contract}\n\n"
 
-        # Step 2: Check if PR already exists (resume at CI watch)
-        existing_pr = self.vcs.find_open_pr(project.repo, phase.branch)
+        # Step 2: Reconcile PR state via durable outbox before implementation (AGENT_PIPELINE §4)
+        def _active_prs_for_branch() -> list[dict[str, Any]]:
+            prs = self.vcs.list_prs_for_branch(project.repo, phase.branch)
+            filtered: list[dict[str, Any]] = []
+            for pr in prs:
+                if str(pr.get("state", "")).upper() == "MERGED":
+                    m_sha = str((pr.get("mergeCommit") or {}).get("oid") or "")
+                    if m_sha and self.vcs.find_merged_pr(project.repo, f"nightshift/revert-{m_sha}"):
+                        continue
+                filtered.append(pr)
+            return filtered
+
+        pr_reconcile = self.task_orchestrator.reconcile_pr_create(
+            task_id=task_id,
+            branch=phase.branch,
+            lease_token=lease_token,
+            pr_list_lookup=_active_prs_for_branch,
+        )
         pr_number: int | None = None
         pr_url: str | None = None
+
+        if pr_reconcile.action == "blocked":
+            block_reason = str(pr_reconcile.data.get("block_reason") or "pr_reconcile_blocked")
+            self._safe_task_transition(
+                task_id,
+                "BLOCKED",
+                idempotency_key=f"pr-reconcile-blocked:{task_id}:{block_reason}:{int(t0)}",
+                reason=pr_reconcile.detail,
+                updates={"block_reason": block_reason, "block_detail": pr_reconcile.detail},
+                lease_token=lease_token,
+            )
+            self._park_phase(project.id, phase, reason=pr_reconcile.detail, next_step="Inspect existing PR state on GitHub")
+            return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": pr_reconcile.detail}
+
+        if pr_reconcile.action == "adopted_merged_pr":
+            merged_pr = dict(pr_reconcile.data)
+            return self._finish_merged_delivery(project, phase, merged_pr, "none", lease_token=lease_token)
+
+        existing_pr = pr_reconcile.data if pr_reconcile.action == "adopted_open_pr" else self.vcs.find_open_pr(project.repo, phase.branch)
 
         if existing_pr:
             pr_number = int(existing_pr["number"])
             pr_url = str(existing_pr["url"])
+            cur_task = self.store.get_task(task_id)
+            if cur_task and cur_task["status"] == "QUEUED":
+                self._safe_task_transition(
+                    task_id,
+                    "RUNNING",
+                    idempotency_key=f"adopt-open-pr-run:{task_id}:{pr_number}",
+                    reason=f"Adopting open PR #{pr_number}",
+                    lease_token=lease_token,
+                )
+            cur_task = self.store.get_task(task_id)
+            if cur_task and cur_task["status"] == "RUNNING":
+                self._safe_task_transition(
+                    task_id,
+                    "VERIFYING",
+                    idempotency_key=f"adopt-open-pr-verify:{task_id}:{pr_number}",
+                    reason=f"Resumed open PR #{pr_number} at CI watch",
+                    updates={"pr_number": pr_number, "head_sha": existing_pr.get("headRefOid")},
+                    lease_token=lease_token,
+                )
             self.store.update_phase(phase.id, status="watching_ci", pr_number=pr_number)
             self.events.emit(Event(
                 kind="phase.resumed",
@@ -554,6 +708,15 @@ class EngineStateMachine:
             ))
         else:
             # Implementation ladder loop with mid-phase handoff & fast switch-back
+            cur_task = self.store.get_task(task_id)
+            if cur_task and cur_task["status"] == "QUEUED":
+                self._safe_task_transition(
+                    task_id,
+                    "RUNNING",
+                    idempotency_key=f"start-running:{task_id}:{int(t0)}",
+                    reason=f"Lease acquired and worktree ready for {phase.title}",
+                    lease_token=lease_token,
+                )
             self.store.update_phase(phase.id, status="implementing")
             self.events.emit(Event(
                 kind="phase.implementing",
@@ -843,6 +1006,16 @@ class EngineStateMachine:
             pr_number = int(pr_info["number"])
             pr_url = str(pr_info["url"])
             self.store.update_phase(phase.id, pr_number=pr_number)
+            cur_task = self.store.get_task(task_id)
+            if cur_task and cur_task["status"] == "RUNNING":
+                self._safe_task_transition(
+                    task_id,
+                    "VERIFYING",
+                    idempotency_key=f"delivered-pr:{task_id}:{pr_number}:{pr_info.get('headRefOid') or ''}",
+                    reason=f"Verified deliverable PR #{pr_number}",
+                    updates={"pr_number": pr_number, "head_sha": pr_info.get("headRefOid")},
+                    lease_token=lease_token,
+                )
 
         # Check resumed PRs before CI and check the final head again after fixes.
         def park_on_diff_guard() -> dict[str, Any] | None:
@@ -907,7 +1080,18 @@ class EngineStateMachine:
             task_updates: dict[str, Any] = {"head_sha": ci_res.checked_sha, "pr_number": pr_number}
             if ci_res.reviewer_provider:
                 task_updates["review_sha"] = ci_res.checked_sha
-            self.store.update_task_fields(str(pipeline_task["id"]), **task_updates)
+            cur_task = self.store.get_task(task_id)
+            if cur_task and cur_task["status"] == "VERIFYING":
+                self._safe_task_transition(
+                    task_id,
+                    "REVIEWING",
+                    idempotency_key=f"ci-verified:{task_id}:{ci_res.checked_sha}",
+                    reason=f"CI and diff guards passed on {ci_res.checked_sha[:7]}",
+                    updates=task_updates,
+                    lease_token=lease_token,
+                )
+            else:
+                self.store.update_task_fields(task_id, **task_updates)
 
         guard_failure = park_on_diff_guard()
         if guard_failure:
@@ -965,19 +1149,37 @@ class EngineStateMachine:
                     passed=False,
                     detail=auth.reason,
                 )
-                self.store.update_task_fields(
-                    str(fresh_task["id"]),
-                    status="BLOCKED",
-                    blocked_from_status="REVIEWING",
-                    head_sha=ci_res.checked_sha,
-                    block_reason=auth.block_reason,
-                    block_detail=auth.reason,
-                )
                 next_action = (
                     "Owner review and approval required before merge"
                     if auth.block_reason == "awaiting_owner_approval"
                     else "Resolve MergeGate finding and re-verify"
                 )
+                cur_task = self.store.get_task(task_id)
+                if cur_task and cur_task["status"] != "BLOCKED":
+                    self._safe_task_transition(
+                        task_id,
+                        "BLOCKED",
+                        idempotency_key=f"merge-gate-blocked:{task_id}:{ci_res.checked_sha}:{auth.block_reason}",
+                        reason=auth.reason,
+                        updates={
+                            "blocked_from_status": "REVIEWING",
+                            "head_sha": ci_res.checked_sha,
+                            "block_reason": auth.block_reason,
+                            "block_detail": auth.reason,
+                            "next_step": next_action,
+                        },
+                        lease_token=lease_token,
+                    )
+                else:
+                    self.store.update_task_fields(
+                        task_id,
+                        status="BLOCKED",
+                        blocked_from_status="REVIEWING",
+                        head_sha=ci_res.checked_sha,
+                        block_reason=auth.block_reason,
+                        block_detail=auth.reason,
+                        next_step=next_action,
+                    )
                 self._park_phase(project.id, phase, reason=auth.reason, next_step=next_action)
                 return {
                     "phase_id": phase.id,
@@ -988,24 +1190,133 @@ class EngineStateMachine:
                 }
 
             self.store.record_guard_result(phase.id, "merge_gate", passed=True, detail=auth.reason)
-            self.store.update_phase(phase.id, status="merging")
-            self.events.emit(Event(
-                kind="phase.merging",
-                plain_text=f"Merging PR #{pr_number} cleanly into main.",
-                phase_id=phase.id,
-                payload={"project_id": project.id},
-            ))
-            merge_ok, merge_msg = self.vcs.merge_pr(project.repo, pr_number, project.local_path)
-            if not merge_ok:
-                self._park_phase(project.id, phase, reason=f"Merge failed: {merge_msg}", next_step="Resolve merge conflict or checks")
-                return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": f"Merge failed: {merge_msg}"}
+            cur_task = self.store.get_task(task_id)
+            if cur_task and cur_task["status"] == "REVIEWING":
+                self._safe_task_transition(
+                    task_id,
+                    "APPROVED",
+                    idempotency_key=f"merge-approved:{task_id}:{ci_res.checked_sha}",
+                    reason=auth.reason,
+                    updates={"approved_sha": ci_res.checked_sha},
+                    lease_token=lease_token,
+                )
 
-            self.store.update_task_fields(
-                str(fresh_task["id"]),
-                status="MERGED",
+            # Durable merge outbox reconciliation (AGENT_PIPELINE §4)
+            merge_reconcile = self.task_orchestrator.reconcile_merge_outcome(
+                task_id=task_id,
+                pr_number=pr_number,
                 approved_sha=ci_res.checked_sha,
-                merged_at=datetime.now(timezone.utc).isoformat(),
+                lease_token=lease_token,
+                pr_state_lookup=lambda: self.vcs.get_pr_state(project.repo, pr_number),
+                expected_base_sha=fresh_task.get("expected_base_sha"),
+                current_base_sha=self.vcs.remote_branch_sha(project.local_path, "main"),
             )
+            if merge_reconcile.action == "base_moved":
+                self._safe_task_transition(
+                    task_id,
+                    "VERIFYING",
+                    idempotency_key=f"base-moved:{task_id}:{ci_res.checked_sha}:{merge_reconcile.data.get('current_base_sha', '')}",
+                    reason=merge_reconcile.detail,
+                    lease_token=lease_token,
+                )
+                self._park_phase(project.id, phase, reason=merge_reconcile.detail, next_step="Update branch from main and re-verify")
+                return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": merge_reconcile.detail}
+
+            if merge_reconcile.action == "blocked":
+                block_reason = str(merge_reconcile.data.get("block_reason") or "ambiguous_remote_operation")
+                self._safe_task_transition(
+                    task_id,
+                    "BLOCKED",
+                    idempotency_key=f"merge-reconcile-blocked:{task_id}:{ci_res.checked_sha}:{block_reason}",
+                    reason=merge_reconcile.detail,
+                    updates={"block_reason": block_reason, "block_detail": merge_reconcile.detail},
+                    lease_token=lease_token,
+                )
+                self._park_phase(project.id, phase, reason=merge_reconcile.detail, next_step="Reconcile PR merge state manually")
+                return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": merge_reconcile.detail}
+
+            self.store.update_phase(phase.id, status="merging")
+            merge_sha_adopted = str(merge_reconcile.data.get("merge_sha") or "")
+            if merge_reconcile.action != "adopted_merged_pr":
+                op_key = str(merge_reconcile.data.get("op_key") or f"pr_merge:{task_id}:{pr_number}:{ci_res.checked_sha}")
+                self.events.emit(Event(
+                    kind="phase.merging",
+                    plain_text=f"Merging PR #{pr_number} cleanly into main.",
+                    phase_id=phase.id,
+                    payload={"project_id": project.id},
+                ))
+                try:
+                    merge_ok, merge_msg = self.vcs.merge_pr(
+                        project.repo,
+                        pr_number,
+                        project.local_path,
+                        match_head_commit=ci_res.checked_sha,
+                    )
+                except Exception as merge_exc:
+                    merge_ok, merge_msg = False, str(merge_exc)
+
+                if not merge_ok:
+                    # Reconcile after error/timeout before declaring failure (fail closed if ambiguous)
+                    post_reconcile = self.task_orchestrator.reconcile_merge_outcome(
+                        task_id=task_id,
+                        pr_number=pr_number,
+                        approved_sha=ci_res.checked_sha,
+                        lease_token=lease_token,
+                        pr_state_lookup=lambda: self.vcs.get_pr_state(project.repo, pr_number),
+                    )
+                    if post_reconcile.action == "adopted_merged_pr":
+                        merge_sha_adopted = str(post_reconcile.data.get("merge_sha") or "")
+                    else:
+                        if post_reconcile.action != "blocked":
+                            self.task_orchestrator.complete_remote_operation(
+                                op_key,
+                                status="failed",
+                                result={"error": merge_msg},
+                                lease_token=lease_token,
+                            )
+                        self._safe_task_transition(
+                            task_id,
+                            "BLOCKED",
+                            idempotency_key=f"merge-failed:{task_id}:{ci_res.checked_sha}",
+                            reason=f"Merge failed: {merge_msg}",
+                            updates={"block_reason": str(post_reconcile.data.get("block_reason") or "merge_failed"), "block_detail": merge_msg},
+                            lease_token=lease_token,
+                        )
+                        self._park_phase(project.id, phase, reason=f"Merge failed: {merge_msg}", next_step="Resolve merge conflict or checks")
+                        return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": f"Merge failed: {merge_msg}"}
+                else:
+                    merged_info = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
+                    merge_sha_adopted = str((merged_info.get("mergeCommit") or {}).get("oid") or "")
+                    self.task_orchestrator.complete_remote_operation(
+                        op_key,
+                        status="succeeded",
+                        result={"merge_sha": merge_sha_adopted},
+                        lease_token=lease_token,
+                    )
+
+            merged_at_now = datetime.now(timezone.utc).isoformat()
+            cur_task = self.store.get_task(task_id)
+            if cur_task and cur_task["status"] == "APPROVED":
+                self._safe_task_transition(
+                    task_id,
+                    "MERGED",
+                    idempotency_key=f"merged:{task_id}:{pr_number}:{merge_sha_adopted or ci_res.checked_sha}",
+                    reason=f"Merged PR #{pr_number}",
+                    updates={
+                        "approved_sha": ci_res.checked_sha,
+                        "merge_sha": merge_sha_adopted or None,
+                        "merged_at": merged_at_now,
+                    },
+                    lease_token=lease_token,
+                )
+            else:
+                self.store.update_task_fields(
+                    task_id,
+                    status="MERGED",
+                    approved_sha=ci_res.checked_sha,
+                    merge_sha=merge_sha_adopted or None,
+                    merged_at=merged_at_now,
+                )
             self.store.update_phase(phase.id, status="merged")
             self.events.emit(Event(
                 kind="phase.merged",
@@ -1017,7 +1328,7 @@ class EngineStateMachine:
             detail = f"Merged PR #{pr_number}"
 
             merged_pr = self.vcs.find_merged_pr(project.repo, phase.branch) or {}
-            result = self._finish_merged_delivery(project, phase, merged_pr, ci_res.last_engine)
+            result = self._finish_merged_delivery(project, phase, merged_pr, ci_res.last_engine, lease_token=lease_token)
             if result["status"] != "COMPLETED":
                 return result
             detail = result["detail"]
@@ -1042,14 +1353,41 @@ class EngineStateMachine:
         }
 
     def _finish_merged_delivery(
-        self, project: ProjectConfig, phase: PhaseDefinition, merged_pr: dict[str, Any], runner: str
+        self,
+        project: ProjectConfig,
+        phase: PhaseDefinition,
+        merged_pr: dict[str, Any],
+        runner: str,
+        *,
+        lease_token: str | None = None,
     ) -> dict[str, Any]:
-        """Resume post-merge delivery without repeating implementation or merge."""
+        """Resume post-merge delivery without repeating implementation, merge, or release."""
         self.store.update_phase(phase.id, status="verifying_build", pr_number=merged_pr.get("number"))
         merge_sha = (merged_pr.get("mergeCommit") or {}).get("oid")
+        task = self.store.get_task_by_branch(phase.branch) or self.store.get_task(f"task-{phase.id}")
+        acquired_temp_lease: str | None = None
+        temp_heartbeat: LeaseHeartbeat | None = None
+        rel_work_tmp: Path | None = None
         try:
             if not merge_sha:
                 raise RuntimeError("Could not determine the merged commit SHA")
+
+            effective_lease = lease_token
+            if task is not None and not effective_lease:
+                t_id = str(task["id"])
+                acquired_temp_lease = self.task_orchestrator.acquire_lease(
+                    t_id,
+                    lease_seconds=self._lease_seconds,
+                )
+                effective_lease = acquired_temp_lease
+                temp_heartbeat = LeaseHeartbeat(
+                    self.task_orchestrator,
+                    t_id,
+                    acquired_temp_lease,
+                    lease_seconds=self._lease_seconds,
+                    interval_seconds=self._lease_heartbeat_interval,
+                ).start()
+
             ok, msg, run_id = self.vcs.watch_workflow_run(project.repo, branch="main", workflow=project.release_workflow, timeout_seconds=3600, commit_sha=merge_sha)
             if ok is False:
                 reverted, revert_msg = self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
@@ -1070,11 +1408,88 @@ class EngineStateMachine:
                 ))
                 return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')}; main build passed"}
             self.store.update_phase(phase.id, status="releasing")
-            tag, files = self.release_mgr.publish_verified_release(
-                repo=project.repo, merge_sha=merge_sha, output_dir=project.output_dir,
-                title_note=phase.title, workflow_name=project.release_workflow,
-                artifact_glob=project.artifact_glob, tag_prefix=project.tag_prefix, run_id=run_id,
-            )
+
+            # Durable release reconciliation via remote_operations outbox (AGENT_PIPELINE §4)
+            rel_op_key: str | None = None
+            asset_op_key: str | None = None
+            prepared_artifacts: list[Path] | None = None
+            if task is not None:
+                t_id = str(task["id"])
+                assert effective_lease is not None
+                # Derive exact required artifact names and SHA-256 checksums from the verified workflow output
+                # before reconciling or adopting any existing GitHub release.
+                rel_work_tmp = project.output_dir / "temp_download"
+                prepared_artifacts, expected_checksums = self.release_mgr.prepare_verified_artifacts(
+                    project.repo,
+                    run_id,
+                    rel_work_tmp,
+                    artifact_glob=project.artifact_glob,
+                )
+                expected_globs = [project.artifact_glob] if project.artifact_glob else []
+                rel_reconcile = self.task_orchestrator.reconcile_release_for_merge_sha(
+                    task_id=t_id,
+                    merge_sha=str(merge_sha),
+                    expected_asset_names=list(expected_checksums.keys()),
+                    expected_checksums=expected_checksums,
+                    expected_asset_globs=expected_globs,
+                    lease_token=effective_lease,
+                    release_list_lookup=lambda: self.vcs.list_releases(project.repo),
+                )
+                if rel_reconcile.action == "adopted_release":
+                    adopted_tag = str(rel_reconcile.data.get("tag") or "")
+                    self.store.update_task_fields(t_id, release_tag=adopted_tag)
+                    self.store.unpark_phase(phase.id)
+                    self.store.update_phase(phase.id, status="completed")
+                    self.events.emit(Event(
+                        kind="release.adopted",
+                        plain_text=f"Adopted existing verified release {adopted_tag} for {str(merge_sha)[:7]}.",
+                        phase_id=phase.id,
+                        payload={"project_id": project.id},
+                    ))
+                    return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')} -> Adopted release {adopted_tag}"}
+                if rel_reconcile.action == "blocked":
+                    block_reason = str(rel_reconcile.data.get("block_reason") or "partial_release_repair")
+                    self._safe_task_transition(
+                        t_id,
+                        "BLOCKED",
+                        idempotency_key=f"release-blocked:{t_id}:{merge_sha}:{block_reason}",
+                        reason=rel_reconcile.detail,
+                        updates={"block_reason": block_reason, "block_detail": rel_reconcile.detail},
+                        lease_token=effective_lease,
+                    )
+                    self._park_phase(project.id, phase, reason=rel_reconcile.detail, next_step="Repair partial release with a fresh incremented tag")
+                    return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": rel_reconcile.detail}
+                rel_op_key = str(rel_reconcile.data.get("op_key") or "")
+                asset_op_key = str(rel_reconcile.data.get("asset_op_key") or "")
+
+            publish_kwargs: dict[str, Any] = {
+                "repo": project.repo,
+                "merge_sha": merge_sha,
+                "output_dir": project.output_dir,
+                "title_note": phase.title,
+                "workflow_name": project.release_workflow,
+                "artifact_glob": project.artifact_glob,
+                "tag_prefix": project.tag_prefix,
+                "run_id": run_id,
+            }
+            if prepared_artifacts is not None:
+                publish_kwargs["prepared_artifacts"] = prepared_artifacts
+                publish_kwargs["temp_dir"] = rel_work_tmp
+            tag, files = self.release_mgr.publish_verified_release(**publish_kwargs)
+            if task is not None and rel_op_key and asset_op_key:
+                self.task_orchestrator.complete_remote_operation(
+                    rel_op_key,
+                    status="succeeded",
+                    result={"tag": tag},
+                    lease_token=effective_lease,
+                )
+                self.task_orchestrator.complete_remote_operation(
+                    asset_op_key,
+                    status="succeeded",
+                    result={"tag": tag, "files": [f.name for f in files]},
+                    lease_token=effective_lease,
+                )
+                self.store.update_task_fields(str(task["id"]), release_tag=tag)
             self.store.unpark_phase(phase.id)
             self.store.update_phase(phase.id, status="completed")
             self.events.emit(Event(
@@ -1088,3 +1503,10 @@ class EngineStateMachine:
             logger.error("Post-merge release failed: %s", rel_err)
             self._park_phase(project.id, phase, reason=str(rel_err), next_step="Inspect the main build or release and resume")
             return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": f"Post-merge failure: {rel_err}"}
+        finally:
+            if rel_work_tmp is not None and rel_work_tmp.exists():
+                shutil.rmtree(rel_work_tmp, ignore_errors=True)
+            if temp_heartbeat is not None:
+                temp_heartbeat.stop()
+            if task is not None and acquired_temp_lease:
+                self.task_orchestrator.release_lease(str(task["id"]), acquired_temp_lease)
