@@ -7,9 +7,12 @@ import re
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from nightshift.runners.base import run_subprocess_with_timeout
+
+if TYPE_CHECKING:
+    from nightshift.engine.pipeline_contracts import DiffPathEntry
 
 
 class GitGhClient(Protocol):
@@ -71,6 +74,15 @@ class GitGhClient(Protocol):
     def get_diff(self, worktree_dir: Path, base: str = "origin/main") -> str: ...
 
     def list_changed_files(self, worktree_dir: Path, base: str = "origin/main") -> list[str]: ...
+
+    def list_changed_entries(self, worktree_dir: Path, base: str = "origin/main") -> list[DiffPathEntry]: ...
+
+    def get_test_file_snapshots(
+        self,
+        worktree_dir: Path,
+        entries: list[DiffPathEntry],
+        base: str = "origin/main",
+    ) -> dict[str, tuple[str | None, str | None]]: ...
 
     def watch_workflow_run(
         self,
@@ -377,11 +389,56 @@ class SubprocessGitGh:
 
     def list_changed_files(self, worktree_dir: Path, base: str = "origin/main") -> list[str]:
         rc, out, _, _ = run_subprocess_with_timeout(
-            ["git", "diff", "--name-only", base],
+            ["git", "diff", "--name-only", "-z", base],
             cwd=worktree_dir,
             timeout_seconds=60,
+            strip_output=False,
         )
-        return [l.strip() for l in out.splitlines() if l.strip()] if rc == 0 else []
+        return [p for p in out.split("\0") if p] if rc == 0 else []
+
+    def list_changed_entries(self, worktree_dir: Path, base: str = "origin/main") -> list[DiffPathEntry]:
+        """Extract rename/copy/delete-aware diff entries using ``git diff --name-status -M -C -z``."""
+        from nightshift.engine.pipeline_contracts import parse_name_status_diff
+
+        rc, out, _, _ = run_subprocess_with_timeout(
+            ["git", "diff", "--name-status", "-M", "-C", "-z", base],
+            cwd=worktree_dir,
+            timeout_seconds=60,
+            strip_output=False,
+        )
+        return parse_name_status_diff(out, nul_delimited=True) if rc == 0 else []
+
+    def get_test_file_snapshots(
+        self,
+        worktree_dir: Path,
+        entries: list[DiffPathEntry],
+        base: str = "origin/main",
+    ) -> dict[str, tuple[str | None, str | None]]:
+        """Capture ``(before_source, after_source)`` for modified/deleted/renamed test files."""
+        from nightshift.engine.pipeline_contracts import is_test_file_path
+
+        snapshots: dict[str, tuple[str | None, str | None]] = {}
+        for entry in entries:
+            candidate_paths = entry.all_paths()
+            if not any(is_test_file_path(p) for p in candidate_paths):
+                continue
+            before_ref_path = entry.old_path or entry.path
+            before_src: str | None = None
+            if entry.status != "A":
+                rc, out, _, _ = run_subprocess_with_timeout(
+                    ["git", "show", f"{base}:{before_ref_path}"],
+                    cwd=worktree_dir,
+                    timeout_seconds=30,
+                )
+                if rc == 0:
+                    before_src = out
+            after_src: str | None = None
+            if entry.status != "D":
+                target_file = worktree_dir / entry.path
+                if target_file.exists() and target_file.is_file():
+                    after_src = target_file.read_text(encoding="utf-8", errors="replace")
+            snapshots[before_ref_path if entry.status == "D" else entry.path] = (before_src, after_src)
+        return snapshots
 
     def watch_workflow_run(
         self,
@@ -494,6 +551,8 @@ class FakeGitGh:
         self.branch_protection: dict[str, bool] = {"main": True}
         self.diffs: dict[str, str] = {}
         self.changed_files: dict[str, list[str]] = {}
+        self.diff_entries: dict[str, list[Any]] = {}
+        self.test_file_snapshots: dict[str, dict[str, tuple[str | None, str | None]]] = {}
         self.workflow_runs: dict[str, bool] = {"Android build": True, "Desktop build": True}
         self.artifacts_to_create: list[str] = ["NightShift-test.zip"]
         self.merge_conflict: bool = False
@@ -634,6 +693,30 @@ class FakeGitGh:
             if str(wt) == str(worktree_dir):
                 return self.changed_files.get(branch, ["src/main.ts"])
         return self.changed_files.get("default", [])
+
+    def list_changed_entries(self, worktree_dir: Path, base: str = "origin/main") -> list[DiffPathEntry]:
+        from nightshift.engine.pipeline_contracts import DiffPathEntry
+
+        for branch, wt in self.worktrees.items():
+            if str(wt) == str(worktree_dir):
+                if branch in self.diff_entries:
+                    return list(self.diff_entries[branch])
+                files = self.changed_files.get(branch, ["src/main.ts"])
+                return [DiffPathEntry(status="M", path=f) for f in files]
+        if "default" in self.diff_entries:
+            return list(self.diff_entries["default"])
+        return [DiffPathEntry(status="M", path=f) for f in self.changed_files.get("default", [])]
+
+    def get_test_file_snapshots(
+        self,
+        worktree_dir: Path,
+        entries: list[DiffPathEntry],
+        base: str = "origin/main",
+    ) -> dict[str, tuple[str | None, str | None]]:
+        for branch, wt in self.worktrees.items():
+            if str(wt) == str(worktree_dir):
+                return dict(self.test_file_snapshots.get(branch, {}))
+        return dict(self.test_file_snapshots.get("default", {}))
 
     def watch_workflow_run(
         self,

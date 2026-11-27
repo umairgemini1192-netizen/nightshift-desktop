@@ -104,8 +104,14 @@ def check_diff_guards(
     *,
     allow_ci_workflow_edits: bool = False,
     max_binary_size_bytes: int = 5 * 1024 * 1024,
+    diff_entries: list[Any] | None = None,
+    allowed_globs: list[str] | None = None,
+    forbidden_globs: list[str] | None = None,
+    extra_protected_paths: list[str] | None = None,
+    test_file_snapshots: dict[str, tuple[str | None, str | None]] | None = None,
+    case_fold: bool | None = None,
 ) -> list[GuardFinding]:
-    """Run all BLUEPRINT section 5d hard diff guards.
+    """Run all BLUEPRINT section 5d & AGENT_PIPELINE Phase 8b hard diff guards.
 
     Returns a list of GuardFinding objects. If empty, all guards passed.
     """
@@ -126,7 +132,7 @@ def check_diff_guards(
     if not allow_ci_workflow_edits:
         for f in changed_files:
             norm = f.replace("\\", "/")
-            if norm.startswith(".github/workflows/") or norm.startswith("scripts/check_"):
+            if norm.startswith(".github/workflows/") or norm.startswith(".circleci/") or norm.startswith("scripts/check_"):
                 findings.append(
                     GuardFinding(
                         guard="no_weakened_ci",
@@ -217,6 +223,31 @@ def check_diff_guards(
                     )
             except Exception:
                 pass
+
+    # 7. Phase 8b contract path guards (allowed_globs, forbidden_globs, rename-aware governance split)
+    if diff_entries is not None or allowed_globs is not None or forbidden_globs is not None:
+        from nightshift.engine.pipeline_contracts import DiffPathEntry, check_contract_path_guards
+
+        entries = (
+            list(diff_entries)
+            if diff_entries is not None
+            else [DiffPathEntry(status="M", path=f) for f in changed_files]
+        )
+        path_findings, _ = check_contract_path_guards(
+            entries,
+            allowed_globs=list(allowed_globs or []),
+            forbidden_globs=forbidden_globs,
+            extra_protected_paths=extra_protected_paths,
+            diff_content=diff_content,
+            case_fold=case_fold,
+        )
+        findings.extend(path_findings)
+
+    # 8. Phase 8b blocking assertion-relaxation detector (AST Python + regex JS/TS)
+    if test_file_snapshots:
+        from nightshift.engine.pipeline_contracts import detect_assertion_relaxation_for_files
+
+        findings.extend(detect_assertion_relaxation_for_files(test_file_snapshots, case_fold=case_fold))
 
     return findings
 

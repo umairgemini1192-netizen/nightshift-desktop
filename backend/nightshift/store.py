@@ -333,11 +333,218 @@ def _migration_004_token_optimizer_tables(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_005_agent_pipeline(conn: sqlite3.Connection) -> None:
+    """Create agent pipeline tables and contract immutability triggers (AGENT_PIPELINE §5)."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            id TEXT PRIMARY KEY,
+            phase_id TEXT NOT NULL,
+            plan_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            branch TEXT NOT NULL UNIQUE,
+            risk_class TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'QUEUED',
+            blocked_from_status TEXT NOT NULL DEFAULT '',
+            contract_id TEXT NOT NULL,
+            contract_sha256 TEXT NOT NULL,
+            active_attempt_id INTEGER,
+            pr_number INTEGER,
+            head_sha TEXT,
+            expected_base_sha TEXT,
+            ci_run_id TEXT,
+            review_sha TEXT,
+            approved_sha TEXT,
+            merge_sha TEXT,
+            merged_at TEXT,
+            release_tag TEXT,
+            smoke_verified_at TEXT,
+            contributing_providers_json TEXT NOT NULL DEFAULT '[]',
+            owner_override_engine TEXT,
+            owner_approved_by TEXT,
+            owner_approved_sha TEXT,
+            owner_approved_at TEXT,
+            assertion_waiver_sha TEXT,
+            assertion_waiver_reason TEXT NOT NULL DEFAULT '',
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            ci_fix_rounds INTEGER NOT NULL DEFAULT 0,
+            review_fix_rounds INTEGER NOT NULL DEFAULT 0,
+            block_reason TEXT NOT NULL DEFAULT '',
+            block_detail TEXT NOT NULL DEFAULT '',
+            next_step TEXT NOT NULL DEFAULT '',
+            failure_reason TEXT NOT NULL DEFAULT '',
+            worker_pid INTEGER,
+            lease_token TEXT,
+            lease_expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT,
+            FOREIGN KEY (phase_id) REFERENCES phases(id) ON DELETE CASCADE,
+            FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS task_contracts (
+            id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            risk_class TEXT NOT NULL,
+            risk_factors_json TEXT NOT NULL,
+            acceptance_criteria_json TEXT NOT NULL,
+            allowed_globs_json TEXT NOT NULL,
+            forbidden_globs_json TEXT NOT NULL,
+            budget_json TEXT NOT NULL,
+            owner_approval_required INTEGER NOT NULL DEFAULT 0,
+            canonical_json TEXT NOT NULL,
+            contract_sha256 TEXT NOT NULL,
+            frozen_at TEXT NOT NULL,
+            UNIQUE (task_id, version),
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TRIGGER IF NOT EXISTS trg_task_contracts_no_update
+        BEFORE UPDATE ON task_contracts
+        BEGIN
+            SELECT RAISE(ABORT, 'task_contracts rows are immutable; insert a new version instead');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_task_contracts_no_delete
+        BEFORE DELETE ON task_contracts
+        BEGIN
+            SELECT RAISE(ABORT, 'task_contracts rows are append-only and cannot be deleted');
+        END;
+
+        CREATE TABLE IF NOT EXISTS task_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            stage TEXT NOT NULL,
+            role TEXT NOT NULL,
+            engine_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            input_ref TEXT NOT NULL,
+            output_ref TEXT NOT NULL,
+            decision_reason TEXT NOT NULL DEFAULT '',
+            head_sha_before TEXT,
+            head_sha_after TEXT,
+            rc INTEGER,
+            outcome TEXT NOT NULL,
+            wall_seconds REAL NOT NULL DEFAULT 0.0,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS task_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            reason TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS remote_operations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            op_kind TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            lease_token TEXT NOT NULL,
+            target_ref TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS pipeline_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            attempt_id INTEGER,
+            role TEXT NOT NULL,
+            engine_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            risk_class TEXT NOT NULL,
+            tokens_in INTEGER NOT NULL DEFAULT 0,
+            tokens_out INTEGER NOT NULL DEFAULT 0,
+            est_token_cost_usd REAL NOT NULL DEFAULT 0.0,
+            ci_minutes REAL NOT NULL DEFAULT 0.0,
+            artifact_mb REAL NOT NULL DEFAULT 0.0,
+            wall_seconds REAL NOT NULL DEFAULT 0.0,
+            outcome TEXT NOT NULL,
+            is_estimate INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (attempt_id) REFERENCES task_attempts(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS model_scores (
+            engine_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            role TEXT NOT NULL,
+            risk_class TEXT NOT NULL,
+            sample_tasks INTEGER NOT NULL DEFAULT 0,
+            accepted_tasks INTEGER NOT NULL DEFAULT 0,
+            total_attempts INTEGER NOT NULL DEFAULT 0,
+            regression_count INTEGER NOT NULL DEFAULT 0,
+            avg_retries REAL NOT NULL DEFAULT 0.0,
+            avg_turnaround_min REAL NOT NULL DEFAULT 0.0,
+            total_cost_usd_est REAL NOT NULL DEFAULT 0.0,
+            cost_per_accepted_usd_est REAL NOT NULL DEFAULT 0.0,
+            benchmark_graduated INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (engine_id, model, role, risk_class)
+        );
+
+        CREATE TABLE IF NOT EXISTS evidence_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            contract_sha256 TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            source TEXT NOT NULL,
+            build_id TEXT NOT NULL DEFAULT '',
+            duration_seconds REAL NOT NULL DEFAULT 0.0,
+            artifact_paths_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            verified INTEGER NOT NULL DEFAULT 0,
+            rejection_reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS release_verifications (
+            tag TEXT PRIMARY KEY,
+            task_id TEXT,
+            repo TEXT NOT NULL,
+            merge_sha TEXT NOT NULL,
+            previous_good_tag TEXT,
+            artifact_sha256 TEXT NOT NULL,
+            smoke_command TEXT NOT NULL,
+            smoke_status TEXT NOT NULL,
+            smoke_detail TEXT NOT NULL DEFAULT '',
+            verified_at TEXT,
+            rolled_back_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_phase_id ON tasks(phase_id);
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_task_contracts_task_id ON task_contracts(task_id, version);
+        CREATE INDEX IF NOT EXISTS idx_evidence_records_task_sha ON evidence_records(task_id, commit_sha);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
     (3, "003_nullable_router_step", _migration_003_nullable_router_step),
     (4, "004_token_optimizer_tables", _migration_004_token_optimizer_tables),
+    (5, "005_agent_pipeline", _migration_005_agent_pipeline),
 ]
 
 
@@ -1237,4 +1444,429 @@ class Store:
             params,
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Phase 8b: Tasks, frozen requirement contracts, and evidence helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_contract_canonical(
+        *,
+        task_id: str,
+        version: int,
+        phase_id: str,
+        title: str,
+        risk_class: str,
+        risk_factors: dict[str, Any],
+        acceptance_criteria: list[dict[str, Any]],
+        allowed_globs: list[str],
+        forbidden_globs: list[str],
+        budget: dict[str, Any],
+        owner_approval_required: bool,
+        frozen_at: str,
+    ) -> tuple[str, str]:
+        """Return ``(canonical_json, contract_sha256)`` with digest excluded from canonical JSON."""
+        payload = {
+            "task_id": task_id,
+            "version": int(version),
+            "phase_id": phase_id,
+            "title": title,
+            "risk_class": risk_class,
+            "risk_factors": dict(risk_factors),
+            "acceptance_criteria": list(acceptance_criteria),
+            "allowed_globs": list(allowed_globs),
+            "forbidden_globs": list(forbidden_globs),
+            "budget": dict(budget),
+            "owner_approval_required": bool(owner_approval_required),
+            "frozen_at": frozen_at,
+        }
+        canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return canonical, digest
+
+    def create_task_with_contract(
+        self,
+        *,
+        task_id: str,
+        phase_id: str,
+        plan_id: str,
+        title: str,
+        branch: str,
+        risk_class: str = "business_logic",
+        risk_factors: dict[str, Any] | None = None,
+        acceptance_criteria: list[dict[str, Any]] | None = None,
+        allowed_globs: list[str] | None = None,
+        forbidden_globs: list[str] | None = None,
+        budget: dict[str, Any] | None = None,
+        owner_approval_required: bool = False,
+        expected_base_sha: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Atomically create a pipeline task and its frozen v1 requirement contract."""
+        now = _utc_now()
+        contract_id = f"{task_id}-v1"
+        rf = dict(risk_factors or {"impact": 2, "data_sensitivity": 1, "reversibility": 4, "test_coverage": 3, "uncertainty": 2})
+        ac = list(acceptance_criteria or [])
+        ag = list(allowed_globs or [])
+        fg = list(forbidden_globs) if forbidden_globs is not None else [
+            ".circleci/**",
+            ".github/**",
+            "scripts/check_*",
+            "design/tokens.json",
+            "docs/DESIGN_SYSTEM.md",
+        ]
+        bd = dict(budget or {
+            "max_tokens": 120000,
+            "max_usd_est": 0.0,
+            "max_attempts": 4,
+            "max_ci_fix_rounds": 4,
+            "max_wall_minutes": 90,
+        })
+        owner_req = bool(owner_approval_required or risk_class in ("governance", "high_risk"))
+        canonical, digest = self._build_contract_canonical(
+            task_id=task_id,
+            version=1,
+            phase_id=phase_id,
+            title=title,
+            risk_class=risk_class,
+            risk_factors=rf,
+            acceptance_criteria=ac,
+            allowed_globs=ag,
+            forbidden_globs=fg,
+            budget=bd,
+            owner_approval_required=owner_req,
+            frozen_at=now,
+        )
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO tasks (
+                    id, phase_id, plan_id, title, branch, risk_class, status,
+                    contract_id, contract_sha256, expected_base_sha,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    phase_id,
+                    plan_id,
+                    title,
+                    branch,
+                    risk_class,
+                    contract_id,
+                    digest,
+                    expected_base_sha,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO task_contracts (
+                    id, task_id, version, risk_class, risk_factors_json,
+                    acceptance_criteria_json, allowed_globs_json, forbidden_globs_json,
+                    budget_json, owner_approval_required, canonical_json,
+                    contract_sha256, frozen_at
+                ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    contract_id,
+                    task_id,
+                    risk_class,
+                    json.dumps(rf, sort_keys=True),
+                    json.dumps(ac),
+                    json.dumps(ag),
+                    json.dumps(fg),
+                    json.dumps(bd, sort_keys=True),
+                    1 if owner_req else 0,
+                    canonical,
+                    digest,
+                    now,
+                ),
+            )
+        task = self.get_task(task_id)
+        contract = self.get_task_contract(contract_id)
+        assert task is not None and contract is not None
+        return task, contract
+
+    def get_task(self, task_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_task_by_branch(self, branch: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM tasks WHERE branch = ?", (branch,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_tasks_for_phase(self, phase_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM tasks WHERE phase_id = ? ORDER BY created_at ASC",
+            (phase_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_task_contract(self, contract_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute("SELECT * FROM task_contracts WHERE id = ?", (contract_id,)).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_latest_task_contract(self, task_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM task_contracts WHERE task_id = ? ORDER BY version DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def revise_task_contract(
+        self,
+        *,
+        task_id: str,
+        risk_class: str | None = None,
+        risk_factors: dict[str, Any] | None = None,
+        acceptance_criteria: list[dict[str, Any]] | None = None,
+        allowed_globs: list[str] | None = None,
+        forbidden_globs: list[str] | None = None,
+        budget: dict[str, Any] | None = None,
+        owner_approval_required: bool | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Append ``version + 1`` to ``task_contracts`` and invalidate prior evidence, review, and approvals.
+
+        Implements AGENT_PIPELINE §3.1 contract revision immutability and invalidation rules.
+        """
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"Unknown task_id: {task_id}")
+        latest = self.get_latest_task_contract(task_id)
+        if latest is None:
+            raise KeyError(f"No existing contract for task_id: {task_id}")
+
+        next_version = int(latest["version"]) + 1
+        now = _utc_now()
+        contract_id = f"{task_id}-v{next_version}"
+        next_risk = risk_class if risk_class is not None else str(latest["risk_class"])
+        next_rf = dict(risk_factors) if risk_factors is not None else json.loads(str(latest["risk_factors_json"]))
+        next_ac = list(acceptance_criteria) if acceptance_criteria is not None else json.loads(str(latest["acceptance_criteria_json"]))
+        next_ag = list(allowed_globs) if allowed_globs is not None else json.loads(str(latest["allowed_globs_json"]))
+        next_fg = list(forbidden_globs) if forbidden_globs is not None else json.loads(str(latest["forbidden_globs_json"]))
+        next_bd = dict(budget) if budget is not None else json.loads(str(latest["budget_json"]))
+        next_owner_req = (
+            bool(owner_approval_required)
+            if owner_approval_required is not None
+            else bool(latest["owner_approval_required"])
+        ) or (next_risk in ("governance", "high_risk"))
+
+        canonical, digest = self._build_contract_canonical(
+            task_id=task_id,
+            version=next_version,
+            phase_id=str(task["phase_id"]),
+            title=str(task["title"]),
+            risk_class=next_risk,
+            risk_factors=next_rf,
+            acceptance_criteria=next_ac,
+            allowed_globs=next_ag,
+            forbidden_globs=next_fg,
+            budget=next_bd,
+            owner_approval_required=next_owner_req,
+            frozen_at=now,
+        )
+
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO task_contracts (
+                    id, task_id, version, risk_class, risk_factors_json,
+                    acceptance_criteria_json, allowed_globs_json, forbidden_globs_json,
+                    budget_json, owner_approval_required, canonical_json,
+                    contract_sha256, frozen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    contract_id,
+                    task_id,
+                    next_version,
+                    next_risk,
+                    json.dumps(next_rf, sort_keys=True),
+                    json.dumps(next_ac),
+                    json.dumps(next_ag),
+                    json.dumps(next_fg),
+                    json.dumps(next_bd, sort_keys=True),
+                    1 if next_owner_req else 0,
+                    canonical,
+                    digest,
+                    now,
+                ),
+            )
+            # Invalidate all prior evidence records for this task
+            self._conn.execute(
+                """
+                UPDATE evidence_records
+                SET verified = 0, rejection_reason = 'contract_revised'
+                WHERE task_id = ?
+                """,
+                (task_id,),
+            )
+            # Point task to the new contract version and clear prior review/approval/waiver state
+            self._conn.execute(
+                """
+                UPDATE tasks
+                SET contract_id = ?,
+                    contract_sha256 = ?,
+                    risk_class = ?,
+                    review_sha = NULL,
+                    approved_sha = NULL,
+                    owner_approved_by = NULL,
+                    owner_approved_sha = NULL,
+                    owner_approved_at = NULL,
+                    assertion_waiver_sha = NULL,
+                    assertion_waiver_reason = '',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (contract_id, digest, next_risk, now, task_id),
+            )
+        updated_task = self.get_task(task_id)
+        new_contract = self.get_task_contract(contract_id)
+        assert updated_task is not None and new_contract is not None
+        return updated_task, new_contract
+
+    def record_task_contributing_provider(self, task_id: str, provider: str) -> dict[str, Any]:
+        """Idempotently add a contributing provider to ``tasks.contributing_providers_json``."""
+        norm = (provider or "").strip().lower()
+        task = self.get_task(task_id)
+        if task is None:
+            raise KeyError(f"Unknown task_id: {task_id}")
+        if not norm:
+            return task
+        current = json.loads(str(task.get("contributing_providers_json") or "[]"))
+        if norm not in current:
+            current.append(norm)
+            with self._conn:
+                self._conn.execute(
+                    "UPDATE tasks SET contributing_providers_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(current), _utc_now(), task_id),
+                )
+        updated = self.get_task(task_id)
+        assert updated is not None
+        return updated
+
+    def record_task_owner_approval(self, task_id: str, approved_by: str, head_sha: str) -> dict[str, Any]:
+        """Record explicit owner approval bound to an exact ``head_sha``."""
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE tasks
+                SET owner_approved_by = ?,
+                    owner_approved_sha = ?,
+                    owner_approved_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (approved_by, head_sha, now, now, task_id),
+            )
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise KeyError(f"Unknown task_id: {task_id}")
+        return updated
+
+    def record_task_assertion_waiver(self, task_id: str, head_sha: str, reason: str) -> dict[str, Any]:
+        """Record an explicit owner waiver for legitimate test refactors in a governance PR."""
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE tasks
+                SET assertion_waiver_sha = ?,
+                    assertion_waiver_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (head_sha, reason.strip(), now, task_id),
+            )
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise KeyError(f"Unknown task_id: {task_id}")
+        return updated
+
+    def update_task_fields(self, task_id: str, **fields: Any) -> dict[str, Any]:
+        """Update allowed mutable columns on a task row."""
+        allowed_cols = {
+            "status",
+            "blocked_from_status",
+            "risk_class",
+            "pr_number",
+            "head_sha",
+            "expected_base_sha",
+            "review_sha",
+            "approved_sha",
+            "merge_sha",
+            "merged_at",
+            "block_reason",
+            "block_detail",
+            "next_step",
+            "failure_reason",
+            "finished_at",
+        }
+        updates: list[str] = ["updated_at = ?"]
+        values: list[Any] = [_utc_now()]
+        for key, val in fields.items():
+            if key not in allowed_cols:
+                raise ValueError(f"Disallowed task column update: {key}")
+            updates.append(f"{key} = ?")
+            values.append(val)
+        values.append(task_id)
+        with self._conn:
+            self._conn.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE id = ?", values)
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise KeyError(f"Unknown task_id: {task_id}")
+        return updated
+
+    def record_evidence(
+        self,
+        *,
+        task_id: str,
+        contract_sha256: str,
+        commit_sha: str,
+        kind: str,
+        source: str,
+        build_id: str = "",
+        duration_seconds: float = 0.0,
+        artifact_paths: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        verified: bool = True,
+        rejection_reason: str = "",
+    ) -> int:
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO evidence_records (
+                    task_id, contract_sha256, commit_sha, kind, source, build_id,
+                    duration_seconds, artifact_paths_json, metadata_json,
+                    verified, rejection_reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    contract_sha256,
+                    commit_sha,
+                    kind,
+                    source,
+                    build_id,
+                    float(duration_seconds),
+                    json.dumps(list(artifact_paths or [])),
+                    json.dumps(dict(metadata or {})),
+                    1 if verified else 0,
+                    rejection_reason,
+                    now,
+                ),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_evidence_for_task(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM evidence_records WHERE task_id = ? ORDER BY id ASC",
+            (task_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 

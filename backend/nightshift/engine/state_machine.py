@@ -19,6 +19,7 @@ from typing import Any, Callable
 from nightshift.engine.ci import CiPipelineManager, CiWatchResult
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.pipeline_contracts import MergeGate, provider_for_engine
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
 from nightshift.engine.release import ReleaseManager
 from nightshift.engine.scheduler import Scheduler
@@ -159,6 +160,7 @@ class EngineStateMachine:
         runners: dict[str, Runner] | None = None,
         login_checker: LoginHealthChecker | None = None,
         network_backoff_seconds: float = 30.0,
+        merge_gate: MergeGate | None = None,
     ) -> None:
         self.store = store
         self.events = event_bus
@@ -167,6 +169,9 @@ class EngineStateMachine:
         self.runners = runners or {}
         self.logins = login_checker or LoginHealthChecker(store=store, quota_ledger=quota_ledger)
         self._network_backoff_seconds = network_backoff_seconds
+        # Single mandatory merge-gate chokepoint (AGENT_PIPELINE §1).
+        # Autonomous merge stays OFF by default until Phases 8b-8e reach Integration-tested.
+        self.merge_gate = merge_gate or MergeGate(autonomous_merge_enabled=False)
 
         self.scheduler = Scheduler(
             store=store,
@@ -456,6 +461,37 @@ class EngineStateMachine:
             payload={"project_id": project_id},
         ))
 
+    def _ensure_pipeline_task(
+        self,
+        project: ProjectConfig,
+        phase: PhaseDefinition,
+        plan_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Ensure a durable pipeline task and frozen requirement contract exist for ``phase``."""
+        existing = self.store.get_task_by_branch(phase.branch)
+        if existing is not None and existing.get("project_id") == project.id and existing.get("phase_id") == phase.id:
+            contract = self.store.get_task_contract(str(existing["contract_id"]))
+            if contract is not None:
+                return existing, contract
+        task_id = f"task-{phase.id}"
+        if self.store.get_task(task_id) is not None:
+            existing = self.store.get_task(task_id)
+            assert existing is not None
+            contract = self.store.get_task_contract(str(existing["contract_id"]))
+            if contract is not None:
+                return existing, contract
+        return self.store.create_task_with_contract(
+            task_id=task_id,
+            phase_id=phase.id,
+            plan_id=plan_id,
+            title=phase.title,
+            branch=phase.branch,
+            risk_class=phase.risk_class,
+            allowed_globs=list(phase.allowed_globs),
+            forbidden_globs=list(phase.forbidden_globs) if phase.forbidden_globs is not None else None,
+            owner_approval_required=phase.owner_approval_required,
+        )
+
     async def _execute_phase(
         self,
         project: ProjectConfig,
@@ -486,6 +522,11 @@ class EngineStateMachine:
         except Exception as e:
             self._park_phase(project.id, phase, reason=f"Worktree creation failed: {e}", next_step="Inspect repo / disk")
             return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": str(e)}
+
+        # Ensure a durable pipeline task + frozen requirement contract exists before coding/merging (AGENT_PIPELINE §3.1)
+        pipeline_task, pipeline_contract = self._ensure_pipeline_task(project, phase, plan_id)
+        contract_allowed_globs = json.loads(str(pipeline_contract.get("allowed_globs_json") or "[]"))
+        contract_forbidden_globs = json.loads(str(pipeline_contract.get("forbidden_globs_json") or "[]"))
 
         guardrail_header = (
             "CONTINUOUS ORCHESTRATOR GUARDRAILS:\n"
@@ -616,6 +657,10 @@ class EngineStateMachine:
                 # Record step in SQLite before execution
                 step_id = self.store.record_step(phase.id, "implement", active_runner_name)
                 self.scheduler.record_invocation()
+                self.store.record_task_contributing_provider(
+                    str(pipeline_task["id"]),
+                    provider_for_engine(active_runner_name),
+                )
 
                 self.events.emit(Event(
                     kind="runner.invoked",
@@ -694,10 +739,20 @@ class EngineStateMachine:
                     local_repo=project.local_path,
                 )
 
-                # Run diff guards and re-estimate job size from actual diff (BLUEPRINT 5h)
+                # Run diff guards and re-estimate job size from actual diff (BLUEPRINT 5h, AGENT_PIPELINE §3)
                 diff_text = self.vcs.get_diff(wt_dir)
                 changed_files = self.vcs.list_changed_files(wt_dir)
-                findings = check_diff_guards(wt_dir, changed_files, diff_text)
+                diff_entries = self.vcs.list_changed_entries(wt_dir)
+                test_snapshots = self.vcs.get_test_file_snapshots(wt_dir, diff_entries)
+                findings = check_diff_guards(
+                    wt_dir,
+                    changed_files,
+                    diff_text,
+                    diff_entries=diff_entries,
+                    allowed_globs=contract_allowed_globs,
+                    forbidden_globs=contract_forbidden_globs,
+                    test_file_snapshots=test_snapshots,
+                )
                 effective_size = (
                     self.scheduler.router.estimate_job_size(phase.prompt, changed_files, diff_text)
                     if diff_text
@@ -791,7 +846,19 @@ class EngineStateMachine:
 
         # Check resumed PRs before CI and check the final head again after fixes.
         def park_on_diff_guard() -> dict[str, Any] | None:
-            findings = check_diff_guards(wt_dir, self.vcs.list_changed_files(wt_dir), self.vcs.get_diff(wt_dir))
+            cur_diff = self.vcs.get_diff(wt_dir)
+            cur_files = self.vcs.list_changed_files(wt_dir)
+            cur_entries = self.vcs.list_changed_entries(wt_dir)
+            cur_snapshots = self.vcs.get_test_file_snapshots(wt_dir, cur_entries)
+            findings = check_diff_guards(
+                wt_dir,
+                cur_files,
+                cur_diff,
+                diff_entries=cur_entries,
+                allowed_globs=contract_allowed_globs,
+                forbidden_globs=contract_forbidden_globs,
+                test_file_snapshots=cur_snapshots,
+            )
             if not findings:
                 return None
             for finding in findings:
@@ -827,9 +894,20 @@ class EngineStateMachine:
             on_status_change=on_ci_status,
         )
 
+        for fixer_engine in ci_res.contributing_engines:
+            self.store.record_task_contributing_provider(
+                str(pipeline_task["id"]),
+                provider_for_engine(fixer_engine),
+            )
+
         if not ci_res.passed:
             self._park_phase(project.id, phase, reason=ci_res.detail, next_step="Fix remaining CI failure")
             return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": ci_res.detail}
+        if ci_res.checked_sha:
+            task_updates: dict[str, Any] = {"head_sha": ci_res.checked_sha, "pr_number": pr_number}
+            if ci_res.reviewer_provider:
+                task_updates["review_sha"] = ci_res.checked_sha
+            self.store.update_task_fields(str(pipeline_task["id"]), **task_updates)
 
         guard_failure = park_on_diff_guard()
         if guard_failure:
@@ -839,7 +917,7 @@ class EngineStateMachine:
         if ci_res.flaky:
             detail += " [flaky test resolved]"
 
-        # Step 4: Merge PR if auto_merge is enabled (verify exact head SHA match)
+        # Step 4: Merge PR if auto_merge is enabled (verify exact head SHA match + single MergeGate chokepoint)
         if phase.auto_merge and not dependencies_merged:
             reason = "Waiting for dependencies to merge before merging this PR"
             self._park_phase(project.id, phase, reason=reason, next_step="Merge dependencies and resume")
@@ -864,6 +942,52 @@ class EngineStateMachine:
                     "status": "PARKED",
                     "detail": mismatch_reason,
                 }
+
+            # Mandatory single MergeGate chokepoint (AGENT_PIPELINE §1, §3)
+            fresh_task = self.store.get_task(str(pipeline_task["id"])) or pipeline_task
+            fresh_contract = self.store.get_task_contract(str(fresh_task["contract_id"])) or pipeline_contract
+            final_diff = self.vcs.get_diff(wt_dir)
+            final_entries = self.vcs.list_changed_entries(wt_dir)
+            final_snapshots = self.vcs.get_test_file_snapshots(wt_dir, final_entries)
+            auth = self.merge_gate.authorize_merge(
+                task=fresh_task,
+                contract=fresh_contract,
+                head_sha=ci_res.checked_sha,
+                diff_entries=final_entries,
+                diff_content=final_diff,
+                test_file_snapshots=final_snapshots,
+                reviewer_provider=ci_res.reviewer_provider or None,
+            )
+            if not auth.allowed:
+                self.store.record_guard_result(
+                    phase.id,
+                    f"merge_gate:{auth.block_reason or 'blocked'}",
+                    passed=False,
+                    detail=auth.reason,
+                )
+                self.store.update_task_fields(
+                    str(fresh_task["id"]),
+                    status="BLOCKED",
+                    blocked_from_status="REVIEWING",
+                    head_sha=ci_res.checked_sha,
+                    block_reason=auth.block_reason,
+                    block_detail=auth.reason,
+                )
+                next_action = (
+                    "Owner review and approval required before merge"
+                    if auth.block_reason == "awaiting_owner_approval"
+                    else "Resolve MergeGate finding and re-verify"
+                )
+                self._park_phase(project.id, phase, reason=auth.reason, next_step=next_action)
+                return {
+                    "phase_id": phase.id,
+                    "title": phase.title,
+                    "runner": ci_res.last_engine,
+                    "status": "PARKED",
+                    "detail": auth.reason,
+                }
+
+            self.store.record_guard_result(phase.id, "merge_gate", passed=True, detail=auth.reason)
             self.store.update_phase(phase.id, status="merging")
             self.events.emit(Event(
                 kind="phase.merging",
@@ -876,6 +1000,12 @@ class EngineStateMachine:
                 self._park_phase(project.id, phase, reason=f"Merge failed: {merge_msg}", next_step="Resolve merge conflict or checks")
                 return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": f"Merge failed: {merge_msg}"}
 
+            self.store.update_task_fields(
+                str(fresh_task["id"]),
+                status="MERGED",
+                approved_sha=ci_res.checked_sha,
+                merged_at=datetime.now(timezone.utc).isoformat(),
+            )
             self.store.update_phase(phase.id, status="merged")
             self.events.emit(Event(
                 kind="phase.merged",

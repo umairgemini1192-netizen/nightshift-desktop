@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from nightshift.engine.pipeline_contracts import provider_for_engine
 from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient
 from nightshift.engine.verify import RiskAssessment
@@ -30,6 +31,9 @@ class CiWatchResult:
     last_engine: str = ""
     review_findings: list[ReviewFinding] = field(default_factory=list)
     checked_sha: str | None = None
+    reviewer_engine: str = ""
+    reviewer_provider: str = ""
+    contributing_engines: list[str] = field(default_factory=list)
 
 
 def parse_review_findings(text: str) -> list[ReviewFinding]:
@@ -98,6 +102,7 @@ class CiPipelineManager:
         active_engine = initial_engine
         engine_failure_count = 0
         flaky_detected = False
+        contributing_engines: list[str] = []
 
         for round_num in range(max_retries + 1):
             if on_status_change:
@@ -121,6 +126,8 @@ class CiPipelineManager:
             if passed:
                 # CI is green! Now run Risk-based review loop (BLUEPRINT 5d)
                 review_findings: list[ReviewFinding] = []
+                verified_reviewer_engine = ""
+                verified_reviewer_provider = ""
                 rev_engine_name, reviewer = self.select_reviewer(active_engine)
                 if reviewer and rev_engine_name:
                     if on_status_change:
@@ -142,6 +149,7 @@ class CiPipelineManager:
                             passed=False, rounds_used=round_num,
                             detail="Unresolved P1 review findings: " + "; ".join(f.message for f in p1_findings),
                             last_engine=active_engine, review_findings=review_findings,
+                            contributing_engines=list(contributing_engines),
                         )
                     if p1_findings and round_num < max_retries:
                         if on_status_change:
@@ -155,24 +163,30 @@ class CiPipelineManager:
                         prompt_path.write_text(fix_review_prompt, encoding="utf-8")
 
                         if not self.scheduler.has_run_budget_remaining():
-                            return CiWatchResult(passed=False, rounds_used=round_num, detail="Runaway protection: max AI invocations per run reached during review fix.", last_engine=active_engine, review_findings=review_findings)
+                            return CiWatchResult(passed=False, rounds_used=round_num, detail="Runaway protection: max AI invocations per run reached during review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
                         choice = self.scheduler.select_engine(phase_id=phase_id, step_kind="fix_ci", current_engine=active_engine)
                         if not choice:
-                            return CiWatchResult(passed=False, rounds_used=round_num, detail="No engine available for review fix.", last_engine=active_engine, review_findings=review_findings)
+                            return CiWatchResult(passed=False, rounds_used=round_num, detail="No engine available for review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
                         active_engine = choice.engine
                         runner_obj = self.runners.get(active_engine) or self.runners.get(active_engine.split("-")[0])
                         if not runner_obj:
-                            return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected review fixer {active_engine} is unavailable.", last_engine=active_engine, review_findings=review_findings)
+                            return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected review fixer {active_engine} is unavailable.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
                         self.scheduler.record_invocation()
                         self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
                         timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
+                        if active_engine not in contributing_engines:
+                            contributing_engines.append(active_engine)
                         await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
                         # Re-verify CI after review fix
                         continue
 
+                    if rev_res.rc == 0 and not rev_res.timed_out and not p1_findings:
+                        verified_reviewer_engine = rev_engine_name
+                        verified_reviewer_provider = provider_for_engine(rev_engine_name)
+
                 pr_snap = self.vcs.find_open_pr(repo, branch)
                 if not checked_sha or not pr_snap or str(pr_snap.get("headRefOid") or "") != checked_sha:
-                    return CiWatchResult(passed=False, detail="PR head changed or could not be verified during CI and review.", last_engine=active_engine)
+                    return CiWatchResult(passed=False, detail="PR head changed or could not be verified during CI and review.", last_engine=active_engine, contributing_engines=list(contributing_engines))
                 return CiWatchResult(
                     passed=True,
                     flaky=flaky_detected,
@@ -181,6 +195,9 @@ class CiPipelineManager:
                     last_engine=active_engine,
                     review_findings=review_findings,
                     checked_sha=checked_sha,
+                    reviewer_engine=verified_reviewer_engine,
+                    reviewer_provider=verified_reviewer_provider,
+                    contributing_engines=list(contributing_engines),
                 )
 
             # CI failed: check if retries exhausted
@@ -263,6 +280,8 @@ class CiPipelineManager:
 
             sha_before = self.vcs.remote_branch_sha(local_repo, branch)
             self.scheduler.record_invocation()
+            if active_engine not in contributing_engines:
+                contributing_engines.append(active_engine)
             fix_timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 2400)
             await runner.run(
                 f"Read and fix the CI failure in .nightshift_prompt.md, commit, and push to {branch}.",
