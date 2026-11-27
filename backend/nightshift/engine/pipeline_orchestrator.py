@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, TypeVar
 
 from nightshift.engine.pipeline_contracts import verify_contract_integrity
+from nightshift.engine.pipeline_evidence import validate_evidence_record_trust
 from nightshift.store import Store
 
 logger = logging.getLogger(__name__)
@@ -633,6 +634,8 @@ class TaskOrchestrator:
                 e.get("kind") == "ci_check"
                 and e.get("contract_sha256") == task["contract_sha256"]
                 and bool(e.get("verified"))
+                and float(e.get("duration_seconds") or 0.0) > 0.0
+                and validate_evidence_record_trust(e)[0]
                 for e in evidence
             )
             approval_satisfied = (not owner_required) or (effective_approved_sha == expected_head)

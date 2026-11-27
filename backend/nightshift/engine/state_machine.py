@@ -20,6 +20,15 @@ from nightshift.engine.ci import CiPipelineManager, CiWatchResult
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
 from nightshift.engine.pipeline_contracts import MergeGate, provider_for_engine
+from nightshift.engine.pipeline_evidence import (
+    DEFAULT_MIN_BUILD_DURATION_S,
+    DEFAULT_MIN_GATE_DURATION_S,
+    DEFAULT_NIGHTSHIFT_REQUIRED_JOBS,
+    persist_ci_evidence,
+    persist_screenshot_evidence,
+    validate_ci_evidence,
+    validate_screenshot_manifest,
+)
 from nightshift.engine.pipeline_orchestrator import LeaseHeartbeat, TaskOrchestrator, is_process_alive
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
 from nightshift.engine.release import ReleaseManager
@@ -70,6 +79,11 @@ class ProjectConfig:
     tag_prefix: str = "v1.0.0-preview."
     output_dir: Path = field(default_factory=lambda: Path("dist"))
     critical_paths: list[str] = field(default_factory=list)
+    required_ci_jobs: list[str] = field(default_factory=lambda: list(DEFAULT_NIGHTSHIFT_REQUIRED_JOBS))
+    required_artifacts_by_job: dict[str, list[str]] = field(default_factory=dict)
+    min_gate_duration_seconds: float = DEFAULT_MIN_GATE_DURATION_S
+    min_build_duration_seconds: float = DEFAULT_MIN_BUILD_DURATION_S
+    screenshot_manifest_path: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProjectConfig:
@@ -81,6 +95,11 @@ class ProjectConfig:
                 cp = []
         else:
             cp = list(raw_cp)
+
+        raw_req_jobs = data.get("required_ci_jobs")
+        req_jobs = list(raw_req_jobs) if raw_req_jobs is not None else list(DEFAULT_NIGHTSHIFT_REQUIRED_JOBS)
+        raw_req_arts = data.get("required_artifacts_by_job") or {}
+        req_arts = dict(raw_req_arts) if isinstance(raw_req_arts, dict) else {}
 
         out = data.get("output_dir") or data.get("output_folder") or "dist"
         return cls(
@@ -96,6 +115,11 @@ class ProjectConfig:
             tag_prefix=str(data.get("tag_prefix", "v1.0.0-preview.")),
             output_dir=Path(out),
             critical_paths=cp,
+            required_ci_jobs=req_jobs,
+            required_artifacts_by_job=req_arts,
+            min_gate_duration_seconds=float(data.get("min_gate_duration_seconds", DEFAULT_MIN_GATE_DURATION_S)),
+            min_build_duration_seconds=float(data.get("min_build_duration_seconds", DEFAULT_MIN_BUILD_DURATION_S)),
+            screenshot_manifest_path=str(data.get("screenshot_manifest_path", "")),
         )
 
 
@@ -1076,8 +1100,129 @@ class EngineStateMachine:
         if not ci_res.passed:
             self._park_phase(project.id, phase, reason=ci_res.detail, next_step="Fix remaining CI failure")
             return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": ci_res.detail}
+
+        # Step 3b: Authoritative CI & screenshot evidence integrity check (Amendment F / Phase 8d)
+        expected_base_sha = ci_res.expected_base_sha or self.vcs.remote_branch_sha(project.local_path, "main")
+        current_base_sha = self.vcs.remote_branch_sha(project.local_path, "main")
         if ci_res.checked_sha:
-            task_updates: dict[str, Any] = {"head_sha": ci_res.checked_sha, "pr_number": pr_number}
+            observed_jobs = (
+                list(ci_res.ci_jobs)
+                if ci_res.ci_jobs
+                else self.vcs.get_commit_ci_checks(project.repo, ci_res.checked_sha, branch=phase.branch)
+            )
+            ci_ev = validate_ci_evidence(
+                expected_commit_sha=ci_res.checked_sha,
+                required_jobs=project.required_ci_jobs,
+                observed_jobs=observed_jobs,
+                required_artifacts_by_job=project.required_artifacts_by_job,
+                expected_base_sha=expected_base_sha,
+                current_base_sha=current_base_sha,
+                min_gate_duration_s=project.min_gate_duration_seconds,
+                min_build_duration_s=project.min_build_duration_seconds,
+            )
+            persist_ci_evidence(
+                self.store,
+                task_id=task_id,
+                contract_sha256=str(pipeline_contract["contract_sha256"]),
+                commit_sha=ci_res.checked_sha,
+                kind="ci_check",
+                observed_jobs=observed_jobs,
+                validation=ci_ev,
+            )
+            if not ci_ev.verified:
+                ev_reason = f"CI evidence rejected ({ci_ev.rejection_reason}): {'; '.join(ci_ev.details)}"
+                self.store.record_guard_result(phase.id, f"evidence:{ci_ev.rejection_reason}", passed=False, detail=ev_reason)
+                self._safe_task_transition(
+                    task_id,
+                    "BLOCKED",
+                    idempotency_key=f"ci-evidence-rejected:{task_id}:{ci_res.checked_sha}:{ci_ev.rejection_reason}",
+                    reason=ev_reason,
+                    updates={
+                        "blocked_from_status": "VERIFYING",
+                        "head_sha": ci_res.checked_sha,
+                        "expected_base_sha": expected_base_sha,
+                        "block_reason": ci_ev.rejection_reason,
+                        "block_detail": ev_reason,
+                        "next_step": "Re-run real CI checks on the exact head SHA with required artifacts",
+                    },
+                    lease_token=lease_token,
+                )
+                self._park_phase(
+                    project.id,
+                    phase,
+                    reason=ev_reason,
+                    next_step="Re-run real CI checks on the exact head SHA with required artifacts",
+                )
+                return {
+                    "phase_id": phase.id,
+                    "title": phase.title,
+                    "runner": ci_res.last_engine,
+                    "status": "PARKED",
+                    "detail": ev_reason,
+                }
+
+            if project.screenshot_manifest_path:
+                manifest_p = Path(project.screenshot_manifest_path)
+                frontend_job = next(
+                    (
+                        j
+                        for j in observed_jobs
+                        if j.name == "desktop-frontend" and j.commit_sha == ci_res.checked_sha and j.build_id
+                    ),
+                    None,
+                )
+                expected_shot_build = frontend_job.build_id if frontend_job is not None else None
+                shot_ev = validate_screenshot_manifest(
+                    manifest_p,
+                    expected_commit_sha=ci_res.checked_sha,
+                    expected_build_id=expected_shot_build,
+                )
+                persist_screenshot_evidence(
+                    self.store,
+                    task_id=task_id,
+                    contract_sha256=str(pipeline_contract["contract_sha256"]),
+                    commit_sha=ci_res.checked_sha,
+                    manifest_path=manifest_p,
+                    validation=shot_ev,
+                    build_id=expected_shot_build or "",
+                )
+                if not shot_ev.verified:
+                    shot_reason = f"Screenshot manifest rejected ({shot_ev.rejection_reason}): {'; '.join(shot_ev.details)}"
+                    self.store.record_guard_result(phase.id, f"screenshot:{shot_ev.rejection_reason}", passed=False, detail=shot_reason)
+                    self._safe_task_transition(
+                        task_id,
+                        "BLOCKED",
+                        idempotency_key=f"screenshot-rejected:{task_id}:{ci_res.checked_sha}:{shot_ev.rejection_reason}",
+                        reason=shot_reason,
+                        updates={
+                            "blocked_from_status": "VERIFYING",
+                            "head_sha": ci_res.checked_sha,
+                            "expected_base_sha": expected_base_sha,
+                            "block_reason": shot_ev.rejection_reason,
+                            "block_detail": shot_reason,
+                            "next_step": "Regenerate verified screenshots and screenshot-manifest.json on CI",
+                        },
+                        lease_token=lease_token,
+                    )
+                    self._park_phase(
+                        project.id,
+                        phase,
+                        reason=shot_reason,
+                        next_step="Regenerate verified screenshots and screenshot-manifest.json on CI",
+                    )
+                    return {
+                        "phase_id": phase.id,
+                        "title": phase.title,
+                        "runner": ci_res.last_engine,
+                        "status": "PARKED",
+                        "detail": shot_reason,
+                    }
+
+            task_updates: dict[str, Any] = {
+                "head_sha": ci_res.checked_sha,
+                "pr_number": pr_number,
+                "expected_base_sha": expected_base_sha,
+            }
             if ci_res.reviewer_provider:
                 task_updates["review_sha"] = ci_res.checked_sha
             cur_task = self.store.get_task(task_id)
@@ -1137,9 +1282,14 @@ class EngineStateMachine:
                 task=fresh_task,
                 contract=fresh_contract,
                 head_sha=ci_res.checked_sha,
+                expected_base_sha=fresh_task.get("expected_base_sha") or expected_base_sha,
+                current_base_sha=self.vcs.remote_branch_sha(project.local_path, "main"),
                 diff_entries=final_entries,
                 diff_content=final_diff,
                 test_file_snapshots=final_snapshots,
+                evidence_records=self.store.list_evidence_records(task_id, commit_sha=ci_res.checked_sha),
+                required_ci_jobs=project.required_ci_jobs,
+                require_screenshot_evidence=bool(project.screenshot_manifest_path),
                 reviewer_provider=ci_res.reviewer_provider or None,
             )
             if not auth.allowed:
@@ -1396,6 +1546,68 @@ class EngineStateMachine:
                 raise RuntimeError(f"Main build failed: {msg}")
             if ok is not True or run_id is None:
                 raise RuntimeError(f"Could not verify main build: {msg}")
+
+            # Post-merge exact merge_sha CI evidence verification (Amendment F / Phase 8d)
+            post_jobs = self.vcs.get_commit_ci_checks(project.repo, str(merge_sha), branch="main")
+            post_ev = validate_ci_evidence(
+                expected_commit_sha=str(merge_sha),
+                required_jobs=project.required_ci_jobs,
+                observed_jobs=post_jobs,
+                required_artifacts_by_job=project.required_artifacts_by_job,
+                expected_branch="main",
+                min_gate_duration_s=project.min_gate_duration_seconds,
+                min_build_duration_s=project.min_build_duration_seconds,
+            )
+            if task is not None:
+                persist_ci_evidence(
+                    self.store,
+                    task_id=str(task["id"]),
+                    contract_sha256=str(task["contract_sha256"]),
+                    commit_sha=str(merge_sha),
+                    kind="post_merge_ci",
+                    observed_jobs=post_jobs,
+                    validation=post_ev,
+                )
+            if not post_ev.verified:
+                post_reason = (
+                    f"Post-merge CI evidence rejected on {str(merge_sha)[:7]} "
+                    f"({post_ev.rejection_reason}): {'; '.join(post_ev.details)}"
+                )
+                self.store.record_guard_result(
+                    phase.id,
+                    f"post_merge_evidence:{post_ev.rejection_reason}",
+                    passed=False,
+                    detail=post_reason,
+                )
+                if task is not None and effective_lease:
+                    self._safe_task_transition(
+                        str(task["id"]),
+                        "BLOCKED",
+                        idempotency_key=f"post-merge-evidence-rejected:{task['id']}:{merge_sha}:{post_ev.rejection_reason}",
+                        reason=post_reason,
+                        updates={
+                            "blocked_from_status": "MERGED",
+                            "merge_sha": str(merge_sha),
+                            "block_reason": post_ev.rejection_reason,
+                            "block_detail": post_reason,
+                            "next_step": "Verify full post-merge CI run on exact merge_sha before releasing",
+                        },
+                        lease_token=effective_lease,
+                    )
+                self._park_phase(
+                    project.id,
+                    phase,
+                    reason=post_reason,
+                    next_step="Verify full post-merge CI run on exact merge_sha before releasing",
+                )
+                return {
+                    "phase_id": phase.id,
+                    "title": phase.title,
+                    "runner": runner,
+                    "status": "PARKED",
+                    "detail": post_reason,
+                }
+
             if not phase.release_after_merge:
                 self.store.unpark_phase(phase.id)
                 self.store.update_phase(phase.id, status="completed")

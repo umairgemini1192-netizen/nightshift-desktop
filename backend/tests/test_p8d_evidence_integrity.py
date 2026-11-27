@@ -1,0 +1,881 @@
+"""Phase 8d tests: Trustworthy verification & evidence integrity (Amendment F).
+
+Covers docs/AGENT_PIPELINE.md sections 9.1 and 12.1 Phase 8d requirements:
+- Exact-SHA and race-safe expected_base_sha verification (pre-merge)
+- Post-merge merge_sha CI verification before release
+- Real job duration, skipped/compat-mode rejection, and non-empty artifact enforcement
+- Verified-build screenshot-manifest.json validation
+- PR-body-is-not-evidence rule across MergeGate, TaskOrchestrator, and EngineStateMachine
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.pipeline_contracts import MergeGate
+from nightshift.engine.pipeline_evidence import (
+    CiArtifact,
+    CiJobCheck,
+    is_untrusted_evidence_source,
+    persist_ci_evidence,
+    render_mechanical_pr_body,
+    validate_ci_evidence,
+    validate_evidence_record_trust,
+    validate_screenshot_manifest,
+    write_screenshot_manifest,
+)
+from nightshift.engine.pipeline_orchestrator import InvalidTransitionError, TaskOrchestrator
+from nightshift.engine.planner import PhaseDefinition
+from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig
+from nightshift.engine.vcs import FakeGitGh
+from nightshift.events import EventBus
+from nightshift.quota.ledger import QuotaLedger
+from nightshift.runners.fake import FakeRunner
+from nightshift.store import Store
+
+_MINIMAL_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 16
+
+
+def _ok_login_runner(cmd: list[str], timeout: int) -> tuple[int, str, str, bool]:
+    return (0, '{"loggedIn": true}\nLogged in to github.com\nOK', "", False)
+
+
+def _make_valid_jobs(
+    commit_sha: str,
+    *,
+    branch: str = "feat/p8d",
+    build_prefix: str = "build",
+) -> list[CiJobCheck]:
+    return [
+        CiJobCheck(
+            name="desktop-gates",
+            status="success",
+            commit_sha=commit_sha,
+            build_id=f"{build_prefix}-1",
+            duration_seconds=8.5,
+            is_gate_job=True,
+            branch=branch,
+        ),
+        CiJobCheck(
+            name="desktop-backend",
+            status="success",
+            commit_sha=commit_sha,
+            build_id=f"{build_prefix}-2",
+            duration_seconds=34.0,
+            branch=branch,
+        ),
+        CiJobCheck(
+            name="desktop-frontend",
+            status="success",
+            commit_sha=commit_sha,
+            build_id=f"{build_prefix}-3",
+            duration_seconds=62.0,
+            artifacts=[
+                CiArtifact(
+                    path="ui-screenshots/mission-control-idle-1440x900.png",
+                    size_bytes=4096,
+                    build_id=f"{build_prefix}-3",
+                ),
+                CiArtifact(
+                    path="ui-screenshots/screenshot-manifest.json",
+                    size_bytes=512,
+                    build_id=f"{build_prefix}-3",
+                ),
+            ],
+            branch=branch,
+        ),
+        CiJobCheck(
+            name="desktop-package",
+            status="success",
+            commit_sha=commit_sha,
+            build_id=f"{build_prefix}-4",
+            duration_seconds=120.0,
+            artifacts=[
+                CiArtifact(
+                    path="nightshift-windows/NightShift-windows.zip",
+                    size_bytes=12_345_678,
+                    build_id=f"{build_prefix}-4",
+                ),
+            ],
+            branch=branch,
+        ),
+    ]
+
+
+def _make_valid_manifest(
+    screenshots_dir: Path,
+    *,
+    commit_sha: str,
+    build_id: str = "build-3",
+    renderer: str = "playwright-mockbridge",
+) -> Path:
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    for vp, scale in (("1440x900", "100%"), ("1024x700", "100%"), ("1440x900-150pct", "150%")):
+        fname = f"mission-control-idle-{vp}.png"
+        png_path = screenshots_dir / fname
+        png_path.write_bytes(_MINIMAL_PNG + vp.encode("utf-8"))
+        sha = hashlib.sha256(png_path.read_bytes()).hexdigest()
+        entries.append(
+            {
+                "file": fname,
+                "viewport_or_device": vp,
+                "scale": scale,
+                "axe_violations": 0,
+                "overflow": False,
+                "sha256": sha,
+            }
+        )
+    return write_screenshot_manifest(
+        screenshots_dir / "screenshot-manifest.json",
+        build_id=build_id,
+        commit_sha=commit_sha,
+        renderer=renderer,
+        screenshots=entries,
+    )
+
+
+def _setup_task(
+    store: Store,
+    *,
+    task_id: str = "t-8d-01",
+    branch: str = "feat/p8d-test",
+    risk_class: str = "business_logic",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if store.get_project("proj") is None:
+        store.create_project("proj", "Proj", "owner/repo", "/tmp/repo")
+    if store.get_plan("plan-1") is None:
+        store.create_plan("plan-1", "proj", "Plan 1")
+    if store.get_phase("p1") is None:
+        store.upsert_phase("p1", "plan-1", "Phase 1", branch)
+    return store.create_task_with_contract(
+        task_id=task_id,
+        phase_id="p1",
+        plan_id="plan-1",
+        title="Evidence integrity task",
+        branch=branch,
+        risk_class=risk_class,
+        allowed_globs=["src/**"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. Exact-SHA, base-SHA, duration, skipped/compat-mode, and artifact checks
+# ---------------------------------------------------------------------------
+
+
+def test_validate_ci_evidence_accepts_valid_exact_sha_run() -> None:
+    jobs = _make_valid_jobs("sha_head_001")
+    res = validate_ci_evidence(
+        expected_commit_sha="sha_head_001",
+        required_jobs=["desktop-gates", "desktop-backend", "desktop-frontend", "desktop-package"],
+        observed_jobs=jobs,
+        required_artifacts_by_job={
+            "desktop-frontend": ["ui-screenshots"],
+            "desktop-package": ["nightshift-windows/NightShift-windows.zip"],
+        },
+        expected_base_sha="sha_main_001",
+        current_base_sha="sha_main_001",
+        require_base_sha_match=True,
+    )
+    assert res.verified is True
+    assert res.rejection_reason == ""
+    assert len(res.details) == 4
+
+
+def test_validate_ci_evidence_rejects_zero_duration_skipped_and_compat_mode() -> None:
+    # Zero duration
+    jobs_zero = _make_valid_jobs("sha_01")
+    jobs_zero[1] = CiJobCheck(
+        name="desktop-backend",
+        status="success",
+        commit_sha="sha_01",
+        build_id="build-2",
+        duration_seconds=0.0,
+    )
+    res_zero = validate_ci_evidence(
+        expected_commit_sha="sha_01",
+        required_jobs=["desktop-gates", "desktop-backend"],
+        observed_jobs=jobs_zero,
+    )
+    assert res_zero.verified is False
+    assert res_zero.rejection_reason == "suspicious_zero_duration_check"
+
+    # Sub-threshold gate (< 5s) and build (< 15s)
+    jobs_fast_gate = [
+        CiJobCheck(
+            name="desktop-gates",
+            status="success",
+            commit_sha="sha_01",
+            build_id="b1",
+            duration_seconds=2.0,
+            is_gate_job=True,
+        ),
+    ]
+    res_fast = validate_ci_evidence(
+        expected_commit_sha="sha_01",
+        required_jobs=["desktop-gates"],
+        observed_jobs=jobs_fast_gate,
+    )
+    assert res_fast.verified is False
+    assert res_fast.rejection_reason == "suspicious_zero_duration_check"
+
+    # Skipped job
+    jobs_skip = [
+        CiJobCheck(
+            name="desktop-backend",
+            status="skipped",
+            commit_sha="sha_01",
+            build_id="b2",
+            duration_seconds=25.0,
+        ),
+    ]
+    res_skip = validate_ci_evidence(
+        expected_commit_sha="sha_01",
+        required_jobs=["desktop-backend"],
+        observed_jobs=jobs_skip,
+    )
+    assert res_skip.verified is False
+    assert res_skip.rejection_reason == "suspicious_zero_duration_check"
+
+    # Compat-mode passthrough green
+    jobs_compat = [
+        CiJobCheck(
+            name="desktop-package",
+            status="success",
+            commit_sha="sha_01",
+            build_id="b4",
+            duration_seconds=45.0,
+            compat_mode=True,
+        ),
+    ]
+    res_compat = validate_ci_evidence(
+        expected_commit_sha="sha_01",
+        required_jobs=["desktop-package"],
+        observed_jobs=jobs_compat,
+    )
+    assert res_compat.verified is False
+    assert res_compat.rejection_reason == "suspicious_zero_duration_check"
+
+
+def test_validate_ci_evidence_rejects_stale_sha_drifted_base_and_empty_required_jobs() -> None:
+    # Stale commit SHA
+    jobs = _make_valid_jobs("sha_old_999")
+    res_stale = validate_ci_evidence(
+        expected_commit_sha="sha_new_001",
+        required_jobs=["desktop-gates", "desktop-backend"],
+        observed_jobs=jobs,
+    )
+    assert res_stale.verified is False
+    assert res_stale.rejection_reason == "stale_commit_sha"
+
+    # Drifted base branch SHA
+    res_drift = validate_ci_evidence(
+        expected_commit_sha="sha_old_999",
+        required_jobs=["desktop-gates"],
+        observed_jobs=jobs,
+        expected_base_sha="sha_main_001",
+        current_base_sha="sha_main_002",
+    )
+    assert res_drift.verified is False
+    assert res_drift.rejection_reason == "base_branch_drifted"
+
+    # Missing base SHA when strict match requested
+    res_missing_base = validate_ci_evidence(
+        expected_commit_sha="sha_old_999",
+        required_jobs=["desktop-gates"],
+        observed_jobs=jobs,
+        require_base_sha_match=True,
+    )
+    assert res_missing_base.verified is False
+    assert res_missing_base.rejection_reason == "missing_base_sha"
+
+    # Empty required_jobs fails closed
+    res_empty = validate_ci_evidence(
+        expected_commit_sha="sha_old_999",
+        required_jobs=[],
+        observed_jobs=jobs,
+    )
+    assert res_empty.verified is False
+    assert res_empty.rejection_reason == "no_required_jobs_configured"
+
+
+def test_validate_ci_evidence_enforces_non_empty_build_bound_artifacts() -> None:
+    # Missing required artifact
+    job_no_art = CiJobCheck(
+        name="desktop-package",
+        status="success",
+        commit_sha="sha_a1",
+        build_id="b-10",
+        duration_seconds=90.0,
+        artifacts=[],
+    )
+    res_missing = validate_ci_evidence(
+        expected_commit_sha="sha_a1",
+        required_jobs=["desktop-package"],
+        observed_jobs=[job_no_art],
+        required_artifacts_by_job={"desktop-package": ["nightshift-windows/NightShift-windows.zip"]},
+    )
+    assert res_missing.verified is False
+    assert res_missing.rejection_reason == "missing_required_artifact"
+
+    # 0-byte artifact rejected
+    job_zero_bytes = CiJobCheck(
+        name="desktop-package",
+        status="success",
+        commit_sha="sha_a1",
+        build_id="b-10",
+        duration_seconds=90.0,
+        artifacts=[CiArtifact(path="nightshift-windows/NightShift-windows.zip", size_bytes=0, build_id="b-10")],
+    )
+    res_empty_art = validate_ci_evidence(
+        expected_commit_sha="sha_a1",
+        required_jobs=["desktop-package"],
+        observed_jobs=[job_zero_bytes],
+        required_artifacts_by_job={"desktop-package": ["nightshift-windows/NightShift-windows.zip"]},
+    )
+    assert res_empty_art.verified is False
+    assert res_empty_art.rejection_reason == "missing_required_artifact"
+    assert "empty (0 bytes)" in res_empty_art.details[0]
+
+    # Artifact from a different build_id rejected
+    job_wrong_build = CiJobCheck(
+        name="desktop-package",
+        status="success",
+        commit_sha="sha_a1",
+        build_id="b-10",
+        duration_seconds=90.0,
+        artifacts=[CiArtifact(path="nightshift-windows/NightShift-windows.zip", size_bytes=1024, build_id="b-999")],
+    )
+    res_wrong_build = validate_ci_evidence(
+        expected_commit_sha="sha_a1",
+        required_jobs=["desktop-package"],
+        observed_jobs=[job_wrong_build],
+        required_artifacts_by_job={"desktop-package": ["nightshift-windows/NightShift-windows.zip"]},
+    )
+    assert res_wrong_build.verified is False
+    assert res_wrong_build.rejection_reason == "missing_required_artifact"
+    assert "does not belong to build" in res_wrong_build.details[0]
+
+
+# ---------------------------------------------------------------------------
+# 2. Verified-build screenshot manifest validation
+# ---------------------------------------------------------------------------
+
+
+def test_screenshot_manifest_validation_happy_and_tamper_cases(tmp_path: Path) -> None:
+    shots_dir = tmp_path / "screenshots"
+    manifest_path = _make_valid_manifest(shots_dir, commit_sha="sha_ui_123", build_id="ci-42")
+
+    # Valid manifest passes
+    ok = validate_screenshot_manifest(
+        manifest_path,
+        expected_commit_sha="sha_ui_123",
+        expected_build_id="ci-42",
+        required_viewports=["1440x900", "1024x700", "1440x900-150pct"],
+    )
+    assert ok.verified is True
+    assert len(ok.details) == 3
+
+    # Mismatched commit SHA rejected
+    bad_sha = validate_screenshot_manifest(manifest_path, expected_commit_sha="sha_other")
+    assert bad_sha.verified is False
+    assert bad_sha.rejection_reason == "screenshot_commit_sha_mismatch"
+
+    # Mismatched build_id rejected
+    bad_build = validate_screenshot_manifest(
+        manifest_path,
+        expected_commit_sha="sha_ui_123",
+        expected_build_id="ci-999",
+    )
+    assert bad_build.verified is False
+    assert bad_build.rejection_reason == "screenshot_build_id_mismatch"
+
+    # Missing required viewport rejected
+    bad_vp = validate_screenshot_manifest(
+        manifest_path,
+        expected_commit_sha="sha_ui_123",
+        required_viewports=["1440x900", "390x844"],
+    )
+    assert bad_vp.verified is False
+    assert bad_vp.rejection_reason == "missing_required_viewports"
+
+    # Tampered PNG content -> SHA-256 mismatch
+    (shots_dir / "mission-control-idle-1440x900.png").write_bytes(_MINIMAL_PNG + b"tampered")
+    bad_hash = validate_screenshot_manifest(manifest_path, expected_commit_sha="sha_ui_123")
+    assert bad_hash.verified is False
+    assert bad_hash.rejection_reason == "screenshot_sha256_mismatch"
+
+
+def test_screenshot_manifest_rejects_uncontrolled_renderer_axe_overflow_and_traversal(tmp_path: Path) -> None:
+    shots_dir = tmp_path / "shots"
+    shots_dir.mkdir()
+    png = shots_dir / "page.png"
+    png.write_bytes(_MINIMAL_PNG + b"ok")
+    sha = hashlib.sha256(png.read_bytes()).hexdigest()
+
+    # Uncontrolled renderer
+    m1 = write_screenshot_manifest(
+        shots_dir / "m1.json",
+        build_id="b1",
+        commit_sha="sha1",
+        renderer="manual-upload",
+        screenshots=[
+            {"file": "page.png", "viewport_or_device": "1440x900", "scale": "100%", "axe_violations": 0, "overflow": False, "sha256": sha}
+        ],
+    )
+    assert validate_screenshot_manifest(m1, expected_commit_sha="sha1").rejection_reason == "uncontrolled_screenshot_renderer"
+
+    # Axe violations > 0
+    m2 = write_screenshot_manifest(
+        shots_dir / "m2.json",
+        build_id="b1",
+        commit_sha="sha1",
+        screenshots=[
+            {"file": "page.png", "viewport_or_device": "1440x900", "scale": "100%", "axe_violations": 2, "overflow": False, "sha256": sha}
+        ],
+    )
+    assert validate_screenshot_manifest(m2, expected_commit_sha="sha1").rejection_reason == "axe_violations_present"
+
+    # Horizontal overflow
+    m3 = write_screenshot_manifest(
+        shots_dir / "m3.json",
+        build_id="b1",
+        commit_sha="sha1",
+        screenshots=[
+            {"file": "page.png", "viewport_or_device": "1440x900", "scale": "100%", "axe_violations": 0, "overflow": True, "sha256": sha}
+        ],
+    )
+    assert validate_screenshot_manifest(m3, expected_commit_sha="sha1").rejection_reason == "horizontal_overflow_detected"
+
+    # Path traversal
+    outside = tmp_path / "secret.png"
+    outside.write_bytes(_MINIMAL_PNG)
+    m4 = write_screenshot_manifest(
+        shots_dir / "m4.json",
+        build_id="b1",
+        commit_sha="sha1",
+        screenshots=[
+            {
+                "file": "../secret.png",
+                "viewport_or_device": "1440x900",
+                "scale": "100%",
+                "axe_violations": 0,
+                "overflow": False,
+                "sha256": hashlib.sha256(outside.read_bytes()).hexdigest(),
+            }
+        ],
+    )
+    assert validate_screenshot_manifest(m4, expected_commit_sha="sha1").rejection_reason == "screenshot_path_traversal"
+
+
+# ---------------------------------------------------------------------------
+# 3. PR-body-is-not-evidence rule (MergeGate, TaskOrchestrator, mechanical PR body)
+# ---------------------------------------------------------------------------
+
+
+def test_pr_body_cannot_satisfy_merge_gate_or_resume(tmp_path: Path) -> None:
+    assert is_untrusted_evidence_source("pr_body") is True
+    assert is_untrusted_evidence_source("pr_description:checks") is True
+    assert is_untrusted_evidence_source("self_report") is True
+    assert is_untrusted_evidence_source("circleci:desktop-backend") is False
+
+    with Store(tmp_path / "pr_body.db") as store:
+        store.migrate()
+        task, contract = _setup_task(store, task_id="t-prbody", branch="feat/prbody")
+        store.record_task_owner_approval("t-prbody", "owner", "sha_pr_1")
+        task = store.get_task("t-prbody")
+        assert task is not None
+
+        # Even if a row is inserted claiming CI passed from pr_body, MergeGate must reject it!
+        pr_body_record = {
+            "kind": "ci_check",
+            "source": "pr_body:claimed_green",
+            "commit_sha": "sha_pr_1",
+            "contract_sha256": contract["contract_sha256"],
+            "duration_seconds": 60.0,
+            "verified": 1,
+            "metadata_json": json.dumps({"job_name": "desktop-backend", "from_pr_body": True}),
+        }
+        trusted, _ = validate_evidence_record_trust(pr_body_record)
+        assert trusted is False
+
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False)
+        auth = gate.authorize_merge(
+            task=task,
+            contract=contract,
+            head_sha="sha_pr_1",
+            evidence_records=[pr_body_record],
+            required_ci_jobs=["desktop-backend"],
+        )
+        assert auth.allowed is False
+        assert auth.block_reason == "missing_verified_evidence"
+
+        # TaskOrchestrator.resume_from_blocked must also reject pr_body evidence!
+        orch = TaskOrchestrator(store)
+        orch.transition("t-prbody", "RUNNING", idempotency_key="r1", reason="start")
+        orch.transition("t-prbody", "VERIFYING", idempotency_key="r2", reason="pr", updates={"head_sha": "sha_pr_1", "pr_number": 5})
+        store.record_evidence(
+            task_id="t-prbody",
+            contract_sha256=contract["contract_sha256"],
+            commit_sha="sha_pr_1",
+            kind="ci_check",
+            source="pr_body",
+            duration_seconds=40.0,
+            verified=True,
+        )
+        orch.transition("t-prbody", "REVIEWING", idempotency_key="r3", reason="rev")
+        orch.transition("t-prbody", "BLOCKED", idempotency_key="r4", reason="awaiting_owner_approval")
+        with pytest.raises(InvalidTransitionError, match="verified CI evidence missing"):
+            orch.resume_from_blocked("t-prbody", current_head_sha="sha_pr_1", owner_approved_by="owner")
+
+        # Mechanical PR body renders real verified data deterministically
+        body = render_mechanical_pr_body(
+            task=task,
+            contract=contract,
+            changed_files=["src/app.py"],
+            evidence_records=[pr_body_record],
+            screenshots=["mission-control-idle-1440x900.png"],
+        )
+        assert "## Task: Evidence integrity task" in body
+        assert "`src/app.py`" in body
+        assert "mission-control-idle-1440x900.png" in body
+
+
+def test_merge_gate_requires_all_configured_jobs_and_screenshots_when_enabled(tmp_path: Path) -> None:
+    with Store(tmp_path / "gate_jobs.db") as store:
+        store.migrate()
+        task, contract = _setup_task(store, task_id="t-jobs", branch="feat/jobs")
+        store.record_task_owner_approval("t-jobs", "owner", "sha_j1")
+        task = store.get_task("t-jobs")
+        assert task is not None
+
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False)
+        partial_ci = [
+            {
+                "kind": "ci_check",
+                "source": "circleci:desktop-gates",
+                "commit_sha": "sha_j1",
+                "contract_sha256": contract["contract_sha256"],
+                "duration_seconds": 9.0,
+                "verified": 1,
+                "metadata_json": json.dumps({"job_name": "desktop-gates"}),
+            }
+        ]
+        res_missing_job = gate.authorize_merge(
+            task=task,
+            contract=contract,
+            head_sha="sha_j1",
+            evidence_records=partial_ci,
+            required_ci_jobs=["desktop-gates", "desktop-backend"],
+        )
+        assert res_missing_job.allowed is False
+        assert res_missing_job.block_reason == "missing_required_job_evidence"
+
+        full_ci = partial_ci + [
+            {
+                "kind": "ci_check",
+                "source": "circleci:desktop-backend",
+                "commit_sha": "sha_j1",
+                "contract_sha256": contract["contract_sha256"],
+                "duration_seconds": 35.0,
+                "verified": 1,
+                "metadata_json": json.dumps({"job_name": "desktop-backend"}),
+            }
+        ]
+        res_missing_shots = gate.authorize_merge(
+            task=task,
+            contract=contract,
+            head_sha="sha_j1",
+            evidence_records=full_ci,
+            required_ci_jobs=["desktop-gates", "desktop-backend"],
+            require_screenshot_evidence=True,
+        )
+        assert res_missing_shots.allowed is False
+        assert res_missing_shots.block_reason == "missing_verified_screenshots"
+
+        with_shots = full_ci + [
+            {
+                "kind": "screenshot",
+                "source": "screenshot-manifest:playwright-mockbridge",
+                "commit_sha": "sha_j1",
+                "contract_sha256": contract["contract_sha256"],
+                "duration_seconds": 0.0,
+                "verified": 1,
+                "metadata_json": "{}",
+            }
+        ]
+        res_ok = gate.authorize_merge(
+            task=task,
+            contract=contract,
+            head_sha="sha_j1",
+            evidence_records=with_shots,
+            required_ci_jobs=["desktop-gates", "desktop-backend"],
+            require_screenshot_evidence=True,
+        )
+        assert res_ok.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# 4. End-to-end EngineStateMachine integration tests (pre-merge & post-merge)
+# ---------------------------------------------------------------------------
+
+
+def _build_engine(
+    tmp_path: Path,
+    vcs: FakeGitGh,
+    *,
+    autonomous_merge: bool = True,
+) -> tuple[Store, EngineStateMachine]:
+    store = Store(tmp_path / "engine_p8d.db")
+    store.migrate()
+    events = EventBus(store)
+    quota = QuotaLedger(store)
+    logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+    runners = {
+        "agy": FakeRunner.success("agy", stdout="Implemented\n"),
+        "codex": FakeRunner.success("codex", stdout="LGTM. Clean change.\n"),
+    }
+    engine = EngineStateMachine(
+        store=store,
+        event_bus=events,
+        quota_ledger=quota,
+        vcs=vcs,
+        runners=runners,
+        login_checker=logins,
+        merge_gate=MergeGate(autonomous_merge_enabled=autonomous_merge, require_independent_reviewer=False),
+    )
+    return store, engine
+
+
+@pytest.mark.asyncio
+async def test_e2e_blocks_merge_on_zero_duration_ci_check(tmp_path: Path) -> None:
+    vcs = FakeGitGh()
+    pr = vcs.add_pr("feat/zero-dur", number=801, head_sha="sha_zero_1")
+    jobs = _make_valid_jobs("sha_zero_1", branch="feat/zero-dur")
+    jobs[1] = CiJobCheck(
+        name="desktop-backend",
+        status="success",
+        commit_sha="sha_zero_1",
+        build_id="build-2",
+        duration_seconds=0.0,
+        branch="feat/zero-dur",
+    )
+    vcs.commit_ci_checks["sha_zero_1"] = jobs
+
+    store, engine = _build_engine(tmp_path, vcs)
+    try:
+        project = ProjectConfig(
+            id="proj-8d",
+            name="NightShift",
+            repo="owner/nightshift",
+            local_path=tmp_path / "repo",
+            output_dir=tmp_path / "out",
+            required_ci_jobs=["desktop-gates", "desktop-backend", "desktop-frontend", "desktop-package"],
+        )
+        phase = PhaseDefinition(
+            id="p8d-zero",
+            title="Zero-duration test",
+            prompt="Implement feature",
+            branch="feat/zero-dur",
+            auto_merge=True,
+            release_after_merge=False,
+        )
+        rows = await engine.execute_plan(project, [phase], plan_id="plan-zero")
+        assert rows[0]["status"] == "PARKED"
+        assert "suspicious_zero_duration_check" in rows[0]["detail"]
+        assert "feat/zero-dur" not in vcs.merged_prs
+        assert pr["number"] == 801
+
+        task = store.get_task("task-p8d-zero")
+        assert task is not None
+        assert task["status"] == "BLOCKED"
+        assert task["blocked_from_status"] == "VERIFYING"
+        assert task["block_reason"] == "suspicious_zero_duration_check"
+
+        ev = store.list_evidence_records("task-p8d-zero", commit_sha="sha_zero_1")
+        assert any(r["rejection_reason"] == "suspicious_zero_duration_check" and r["verified"] == 0 for r in ev)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_blocks_merge_on_missing_required_artifact(tmp_path: Path) -> None:
+    vcs = FakeGitGh()
+    vcs.add_pr("feat/missing-art", number=802, head_sha="sha_art_1")
+    jobs = _make_valid_jobs("sha_art_1", branch="feat/missing-art")
+    jobs[3] = CiJobCheck(
+        name="desktop-package",
+        status="success",
+        commit_sha="sha_art_1",
+        build_id="build-4",
+        duration_seconds=110.0,
+        artifacts=[],
+        branch="feat/missing-art",
+    )
+    vcs.commit_ci_checks["sha_art_1"] = jobs
+
+    store, engine = _build_engine(tmp_path, vcs)
+    try:
+        project = ProjectConfig(
+            id="proj-8d-art",
+            name="NightShift",
+            repo="owner/nightshift",
+            local_path=tmp_path / "repo",
+            output_dir=tmp_path / "out",
+            required_ci_jobs=["desktop-gates", "desktop-backend", "desktop-frontend", "desktop-package"],
+            required_artifacts_by_job={"desktop-package": ["nightshift-windows/NightShift-windows.zip"]},
+        )
+        phase = PhaseDefinition(
+            id="p8d-art",
+            title="Missing artifact test",
+            prompt="Implement feature",
+            branch="feat/missing-art",
+            auto_merge=True,
+            release_after_merge=False,
+        )
+        rows = await engine.execute_plan(project, [phase], plan_id="plan-art")
+        assert rows[0]["status"] == "PARKED"
+        assert "missing_required_artifact" in rows[0]["detail"]
+        assert "feat/missing-art" not in vcs.merged_prs
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_blocks_release_when_post_merge_ci_is_stale_or_zero_duration(tmp_path: Path) -> None:
+    vcs = FakeGitGh()
+    vcs.add_pr("feat/post-merge-bad", number=803, head_sha="sha_head_803")
+    vcs.commit_ci_checks["sha_head_803"] = _make_valid_jobs("sha_head_803", branch="feat/post-merge-bad")
+    # FakeGitGh.merge_pr produces mergeCommit.oid = "sha_merge_123".
+    # Simulate post-merge CI returning stale PR head_sha instead of actual merge_sha!
+    vcs.commit_ci_checks["sha_merge_123"] = _make_valid_jobs("sha_head_803", branch="main")
+
+    store, engine = _build_engine(tmp_path, vcs)
+    try:
+        project = ProjectConfig(
+            id="proj-8d-post",
+            name="NightShift",
+            repo="owner/nightshift",
+            local_path=tmp_path / "repo",
+            output_dir=tmp_path / "out",
+            artifact_glob="*.zip",
+            required_ci_jobs=["desktop-gates", "desktop-backend", "desktop-frontend", "desktop-package"],
+        )
+        phase = PhaseDefinition(
+            id="p8d-post",
+            title="Post-merge stale SHA test",
+            prompt="Implement feature",
+            branch="feat/post-merge-bad",
+            auto_merge=True,
+            release_after_merge=True,
+        )
+        rows = await engine.execute_plan(project, [phase], plan_id="plan-post")
+        assert rows[0]["status"] == "PARKED"
+        assert "stale_commit_sha" in rows[0]["detail"]
+        # PR merged, but ZERO releases were published because post-merge merge_sha check failed!
+        assert "feat/post-merge-bad" in vcs.merged_prs
+        assert len(vcs.releases) == 0
+
+        task = store.get_task("task-p8d-post")
+        assert task is not None
+        assert task["status"] == "BLOCKED"
+        assert task["blocked_from_status"] == "MERGED"
+        assert task["block_reason"] == "stale_commit_sha"
+
+        post_ev = [
+            r for r in store.list_evidence_for_task("task-p8d-post") if r["kind"] == "post_merge_ci"
+        ]
+        assert post_ev
+        assert all(r["verified"] == 0 for r in post_ev)
+    finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_e2e_happy_path_with_screenshot_manifest_and_post_merge_evidence(tmp_path: Path) -> None:
+    vcs = FakeGitGh()
+    vcs.add_pr("feat/p8d-happy", number=804, head_sha="sha_head_804")
+    vcs.commit_ci_checks["sha_head_804"] = _make_valid_jobs(
+        "sha_head_804",
+        branch="feat/p8d-happy",
+        build_prefix="pre",
+    )
+    vcs.commit_ci_checks["sha_merge_123"] = _make_valid_jobs(
+        "sha_merge_123",
+        branch="main",
+        build_prefix="post",
+    )
+    manifest_path = _make_valid_manifest(
+        tmp_path / "ui-screenshots",
+        commit_sha="sha_head_804",
+        build_id="pre-3",
+    )
+
+    store, engine = _build_engine(tmp_path, vcs)
+    try:
+        project = ProjectConfig(
+            id="proj-8d-happy",
+            name="NightShift",
+            repo="owner/nightshift",
+            local_path=tmp_path / "repo",
+            output_dir=tmp_path / "out",
+            artifact_glob="*.zip",
+            required_ci_jobs=["desktop-gates", "desktop-backend", "desktop-frontend", "desktop-package"],
+            required_artifacts_by_job={
+                "desktop-frontend": ["ui-screenshots"],
+                "desktop-package": ["nightshift-windows/NightShift-windows.zip"],
+            },
+            screenshot_manifest_path=str(manifest_path),
+        )
+        phase = PhaseDefinition(
+            id="p8d-happy",
+            title="Full evidence integrity happy path",
+            prompt="Implement feature",
+            branch="feat/p8d-happy",
+            auto_merge=True,
+            release_after_merge=True,
+        )
+        rows = await engine.execute_plan(project, [phase], plan_id="plan-happy")
+        assert rows[0]["status"] == "COMPLETED"
+        assert "feat/p8d-happy" in vcs.merged_prs
+        assert len(vcs.releases) == 1
+
+        ev_all = store.list_evidence_for_task("task-p8d-happy")
+        assert sum(1 for r in ev_all if r["kind"] == "ci_check" and r["verified"] == 1) == 4
+        assert sum(1 for r in ev_all if r["kind"] == "screenshot" and r["verified"] == 1) == 1
+        assert sum(1 for r in ev_all if r["kind"] == "post_merge_ci" and r["verified"] == 1) == 4
+    finally:
+        store.close()
+
+
+def test_persist_ci_evidence_records_rejected_audit_row_when_no_jobs(tmp_path: Path) -> None:
+    with Store(tmp_path / "persist.db") as store:
+        store.migrate()
+        task, contract = _setup_task(store, task_id="t-empty-jobs", branch="feat/empty-jobs")
+        res = validate_ci_evidence(
+            expected_commit_sha="sha_e1",
+            required_jobs=["desktop-gates"],
+            observed_jobs=[],
+        )
+        assert res.verified is False
+        ids = persist_ci_evidence(
+            store,
+            task_id=task["id"],
+            contract_sha256=contract["contract_sha256"],
+            commit_sha="sha_e1",
+            kind="ci_check",
+            observed_jobs=[],
+            validation=res,
+        )
+        assert len(ids) == 1
+        rows = store.list_evidence_records(task["id"], commit_sha="sha_e1")
+        assert len(rows) == 1
+        assert rows[0]["verified"] == 0
+        assert rows[0]["rejection_reason"] == "missing_required_job"

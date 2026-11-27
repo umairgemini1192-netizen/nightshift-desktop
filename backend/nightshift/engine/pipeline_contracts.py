@@ -640,6 +640,8 @@ class MergeGate:
         diff_content: str = "",
         test_file_snapshots: dict[str, tuple[str | None, str | None]] | None = None,
         evidence_records: list[dict[str, Any]] | None = None,
+        required_ci_jobs: list[str] | None = None,
+        require_screenshot_evidence: bool = False,
         reviewer_provider: str | None = None,
         extra_protected_paths: list[str] | None = None,
         case_fold: bool | None = None,
@@ -740,22 +742,68 @@ class MergeGate:
                         block_reason="no_independent_reviewer",
                     )
 
-        # 6. Exact-SHA verified evidence check (when evidence records are provided)
+        # 6. Exact-SHA verified evidence check (when evidence records are provided; PR body is NEVER evidence)
         if evidence_records is not None:
-            valid_ci = [
-                rec
-                for rec in evidence_records
-                if rec.get("kind") == "ci_check"
-                and rec.get("commit_sha") == head_sha
-                and rec.get("contract_sha256") == contract.get("contract_sha256")
-                and bool(rec.get("verified"))
-            ]
+            from nightshift.engine.pipeline_evidence import validate_evidence_record_trust
+
+            valid_ci: list[dict[str, Any]] = []
+            for rec in evidence_records:
+                if (
+                    rec.get("kind") == "ci_check"
+                    and rec.get("commit_sha") == head_sha
+                    and rec.get("contract_sha256") == contract.get("contract_sha256")
+                    and bool(rec.get("verified"))
+                    and float(rec.get("duration_seconds") or 0.0) > 0.0
+                ):
+                    trusted, _ = validate_evidence_record_trust(rec)
+                    if trusted:
+                        valid_ci.append(rec)
             if not valid_ci:
                 return MergeAuthorization(
                     False,
                     f"No verified exact-SHA CI evidence found for commit {head_sha[:7]}.",
                     block_reason="missing_verified_evidence",
                 )
+            if required_ci_jobs:
+                covered_jobs: set[str] = set()
+                for rec in valid_ci:
+                    meta_raw = rec.get("metadata_json") or "{}"
+                    try:
+                        meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw)
+                    except Exception:
+                        meta = {}
+                    job_name = str(meta.get("job_name") or "").strip()
+                    if not job_name:
+                        src = str(rec.get("source") or "")
+                        if ":" in src:
+                            job_name = src.split(":", 1)[1].strip()
+                    if job_name:
+                        covered_jobs.add(job_name)
+                missing_jobs = [j for j in required_ci_jobs if j not in covered_jobs]
+                if missing_jobs:
+                    return MergeAuthorization(
+                        False,
+                        f"Missing verified CI evidence for required job(s): {', '.join(missing_jobs)} on {head_sha[:7]}.",
+                        block_reason="missing_required_job_evidence",
+                    )
+            if require_screenshot_evidence:
+                valid_shots: list[dict[str, Any]] = []
+                for rec in evidence_records:
+                    if (
+                        rec.get("kind") == "screenshot"
+                        and rec.get("commit_sha") == head_sha
+                        and rec.get("contract_sha256") == contract.get("contract_sha256")
+                        and bool(rec.get("verified"))
+                    ):
+                        trusted, _ = validate_evidence_record_trust(rec)
+                        if trusted:
+                            valid_shots.append(rec)
+                if not valid_shots:
+                    return MergeAuthorization(
+                        False,
+                        f"No verified screenshot manifest evidence found for commit {head_sha[:7]}.",
+                        block_reason="missing_verified_screenshots",
+                    )
 
         # 7. Governance and high_risk ALWAYS require explicit owner approval on exact head_sha
         owner_required = (

@@ -13,6 +13,7 @@ from nightshift.runners.base import run_subprocess_with_timeout
 
 if TYPE_CHECKING:
     from nightshift.engine.pipeline_contracts import DiffPathEntry
+    from nightshift.engine.pipeline_evidence import CiJobCheck
 
 
 class GitGhClient(Protocol):
@@ -51,6 +52,13 @@ class GitGhClient(Protocol):
         worktree_dir: Path,
         timeout_seconds: int = 3600,
     ) -> tuple[bool, str]: ...
+
+    def get_commit_ci_checks(
+        self,
+        repo: str,
+        commit_sha: str,
+        branch: str = "",
+    ) -> list[CiJobCheck]: ...
 
     def get_failed_ci_log(self, repo: str, branch: str) -> str: ...
 
@@ -311,6 +319,114 @@ class SubprocessGitGh:
             timeout_seconds=timeout_seconds,
         )
         return (rc == 0, out or err)
+
+    def get_commit_ci_checks(
+        self,
+        repo: str,
+        commit_sha: str,
+        branch: str = "",
+    ) -> list[CiJobCheck]:
+        """Query authoritative CI check-runs/statuses for ``commit_sha`` via GitHub API."""
+        from datetime import datetime, timezone
+        from nightshift.engine.pipeline_evidence import CiJobCheck, DEFAULT_GATE_JOB_NAMES
+
+        if not commit_sha:
+            return []
+
+        def _parse_iso_dt(raw: str | None) -> datetime | None:
+            if not raw:
+                return None
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+
+        results: list[CiJobCheck] = []
+        rc, out, _, _ = run_subprocess_with_timeout(
+            ["gh", "api", f"repos/{repo}/commits/{commit_sha}/check-runs"],
+            timeout_seconds=60,
+        )
+        if rc == 0 and out:
+            try:
+                payload = json.loads(out)
+                for run in payload.get("check_runs") or []:
+                    name = str(run.get("name") or "").strip()
+                    if not name:
+                        continue
+                    norm_name = name.split(":", 1)[-1].strip() if name.lower().startswith("ci/circleci:") else name
+                    status_raw = str(run.get("status") or "").lower()
+                    conclusion = str(run.get("conclusion") or "").lower()
+                    if status_raw == "completed":
+                        eff_status = conclusion or "failed"
+                    else:
+                        eff_status = status_raw or "running"
+                    started = _parse_iso_dt(run.get("started_at"))
+                    completed = _parse_iso_dt(run.get("completed_at"))
+                    duration = (
+                        max(0.0, (completed - started).total_seconds())
+                        if started and completed
+                        else 0.0
+                    )
+                    head_oid = str(run.get("head_sha") or commit_sha)
+                    build_id = str(run.get("id") or run.get("external_id") or "")
+                    results.append(
+                        CiJobCheck(
+                            name=norm_name,
+                            status=eff_status,
+                            commit_sha=head_oid,
+                            build_id=build_id,
+                            duration_seconds=duration,
+                            artifacts=[],
+                            compat_mode=False,
+                            is_gate_job=norm_name in DEFAULT_GATE_JOB_NAMES,
+                            branch=branch,
+                        )
+                    )
+            except Exception:
+                pass
+
+        # Also inspect commit statuses (CircleCI commonly reports ci/circleci: <job>)
+        rc_s, out_s, _, _ = run_subprocess_with_timeout(
+            ["gh", "api", f"repos/{repo}/commits/{commit_sha}/status"],
+            timeout_seconds=60,
+        )
+        if rc_s == 0 and out_s:
+            try:
+                st_payload = json.loads(out_s)
+                seen = {j.name for j in results}
+                for st in st_payload.get("statuses") or []:
+                    ctx = str(st.get("context") or "").strip()
+                    if not ctx:
+                        continue
+                    norm_name = ctx.split(":", 1)[-1].strip() if ctx.lower().startswith("ci/circleci:") else ctx
+                    if norm_name in seen:
+                        continue
+                    state = str(st.get("state") or "").lower()
+                    eff_status = "success" if state == "success" else ("running" if state == "pending" else "failed")
+                    created = _parse_iso_dt(st.get("created_at"))
+                    updated = _parse_iso_dt(st.get("updated_at"))
+                    duration = (
+                        max(0.0, (updated - created).total_seconds())
+                        if created and updated
+                        else 0.0
+                    )
+                    results.append(
+                        CiJobCheck(
+                            name=norm_name,
+                            status=eff_status,
+                            commit_sha=str(st_payload.get("sha") or commit_sha),
+                            build_id=str(st.get("id") or ""),
+                            duration_seconds=duration,
+                            artifacts=[],
+                            compat_mode=False,
+                            is_gate_job=norm_name in DEFAULT_GATE_JOB_NAMES,
+                            branch=branch,
+                        )
+                    )
+                    seen.add(norm_name)
+            except Exception:
+                pass
+        return results
 
     def get_failed_ci_log(self, repo: str, branch: str) -> str:
         rc, out, _, _ = run_subprocess_with_timeout(
@@ -620,6 +736,17 @@ class FakeGitGh:
         self.test_file_snapshots: dict[str, dict[str, tuple[str | None, str | None]]] = {}
         self.workflow_runs: dict[str, bool] = {"Android build": True, "Desktop build": True}
         self.artifacts_to_create: list[str] = ["NightShift-test.zip"]
+        self.commit_ci_checks: dict[str, list[Any]] = {}
+        self.default_ci_jobs: list[str] = [
+            "desktop-gates",
+            "desktop-backend",
+            "desktop-frontend",
+            "desktop-package",
+        ]
+        self.default_ci_artifacts_by_job: dict[str, list[str]] = {
+            "desktop-frontend": ["ui-screenshots/screenshot-manifest.json"],
+            "desktop-package": ["nightshift-windows/NightShift-windows.zip"],
+        }
         self.merge_conflict: bool = False
         self._next_pr_number = 100
 
@@ -748,6 +875,39 @@ class FakeGitGh:
                 passed = results.pop(0)
                 return passed, "CI passed" if passed else "CI failed"
         return True, "All checks passed"
+
+    def get_commit_ci_checks(
+        self,
+        repo: str,
+        commit_sha: str,
+        branch: str = "",
+    ) -> list[CiJobCheck]:
+        from nightshift.engine.pipeline_evidence import CiArtifact, CiJobCheck, DEFAULT_GATE_JOB_NAMES
+
+        if commit_sha in self.commit_ci_checks:
+            return list(self.commit_ci_checks[commit_sha])
+        checks: list[CiJobCheck] = []
+        for idx, job_name in enumerate(self.default_ci_jobs, start=1):
+            is_gate = job_name in DEFAULT_GATE_JOB_NAMES
+            build_id = f"fake-build-{commit_sha[:7]}-{idx}"
+            arts = [
+                CiArtifact(path=p, size_bytes=2048, build_id=build_id)
+                for p in self.default_ci_artifacts_by_job.get(job_name, [])
+            ]
+            checks.append(
+                CiJobCheck(
+                    name=job_name,
+                    status="success",
+                    commit_sha=commit_sha,
+                    build_id=build_id,
+                    duration_seconds=12.0 if is_gate else 45.0,
+                    artifacts=arts,
+                    compat_mode=False,
+                    is_gate_job=is_gate,
+                    branch=branch,
+                )
+            )
+        return checks
 
     def get_failed_ci_log(self, repo: str, branch: str) -> str:
         return self.failed_ci_logs.get(branch, "Build failed at Task :app:compileKotlin: Type mismatch error")

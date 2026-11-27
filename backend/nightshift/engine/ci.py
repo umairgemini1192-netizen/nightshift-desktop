@@ -31,6 +31,8 @@ class CiWatchResult:
     last_engine: str = ""
     review_findings: list[ReviewFinding] = field(default_factory=list)
     checked_sha: str | None = None
+    expected_base_sha: str | None = None
+    ci_jobs: list[Any] = field(default_factory=list)
     reviewer_engine: str = ""
     reviewer_provider: str = ""
     contributing_engines: list[str] = field(default_factory=list)
@@ -108,7 +110,8 @@ class CiPipelineManager:
             if on_status_change:
                 on_status_change(f"WATCHING_CI ({round_num + 1}/{max_retries + 1})")
 
-            # Bind the check and review to a stable PR head.
+            # Bind the check and review to a stable PR head and base branch SHA.
+            expected_base_sha = self.vcs.remote_branch_sha(local_repo, "main")
             snapshot = self.vcs.find_open_pr(repo, branch)
             checked_sha = str(snapshot.get("headRefOid") or "") if snapshot else ""
             if not checked_sha or self.vcs.local_head_sha(worktree_dir) != checked_sha:
@@ -187,6 +190,7 @@ class CiPipelineManager:
                 pr_snap = self.vcs.find_open_pr(repo, branch)
                 if not checked_sha or not pr_snap or str(pr_snap.get("headRefOid") or "") != checked_sha:
                     return CiWatchResult(passed=False, detail="PR head changed or could not be verified during CI and review.", last_engine=active_engine, contributing_engines=list(contributing_engines))
+                ci_jobs = self.vcs.get_commit_ci_checks(repo, checked_sha, branch=branch)
                 return CiWatchResult(
                     passed=True,
                     flaky=flaky_detected,
@@ -195,6 +199,8 @@ class CiPipelineManager:
                     last_engine=active_engine,
                     review_findings=review_findings,
                     checked_sha=checked_sha,
+                    expected_base_sha=expected_base_sha,
+                    ci_jobs=ci_jobs,
                     reviewer_engine=verified_reviewer_engine,
                     reviewer_provider=verified_reviewer_provider,
                     contributing_engines=list(contributing_engines),

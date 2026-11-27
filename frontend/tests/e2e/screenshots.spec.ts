@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test } from "@playwright/test";
+import { recordScreenshotManifestEntry } from "./manifest-helper";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCREENSHOTS_DIR = path.resolve(__dirname, "../../screenshots");
@@ -101,6 +102,14 @@ for (const scenario of MISSION_CONTROL_SCENARIOS) {
             : `mission-control-${scenario}-light-${vp.name}.png`;
         const outPath = path.join(SCREENSHOTS_DIR, filename);
         await page.screenshot({ path: outPath, fullPage: true });
+        recordScreenshotManifestEntry({
+          screenshotsDir: SCREENSHOTS_DIR,
+          filename,
+          viewportOrDevice: vp.name,
+          scale: `${vp.fontScalePct}%`,
+          axeViolations: blocking.length,
+          overflow: overflow.scrollWidth > overflow.clientWidth,
+        });
       });
     }
   }
@@ -154,6 +163,14 @@ for (const scenario of PLAN_STUDIO_SCENARIOS) {
             : `plan-studio-${scenario}-light-${vp.name}.png`;
         const outPath = path.join(SCREENSHOTS_DIR, filename);
         await page.screenshot({ path: outPath, fullPage: true });
+        recordScreenshotManifestEntry({
+          screenshotsDir: SCREENSHOTS_DIR,
+          filename,
+          viewportOrDevice: vp.name,
+          scale: `${vp.fontScalePct}%`,
+          axeViolations: blocking.length,
+          overflow: overflow.scrollWidth > overflow.clientWidth,
+        });
       });
     }
   }
@@ -205,8 +222,17 @@ for (const mod of OTHER_MODULES) {
             )}`,
           ).toEqual([]);
 
-          const outPath = path.join(SCREENSHOTS_DIR, `${mod.id}-${scenario}-${vp.name}-${theme}.png`);
+          const filename = `${mod.id}-${scenario}-${vp.name}-${theme}.png`;
+          const outPath = path.join(SCREENSHOTS_DIR, filename);
           await page.screenshot({ path: outPath, fullPage: true });
+          recordScreenshotManifestEntry({
+            screenshotsDir: SCREENSHOTS_DIR,
+            filename,
+            viewportOrDevice: vp.name,
+            scale: `${vp.fontScalePct}%`,
+            axeViolations: blocking.length,
+            overflow: overflow.scrollWidth > overflow.clientWidth,
+          });
         });
       }
     }
