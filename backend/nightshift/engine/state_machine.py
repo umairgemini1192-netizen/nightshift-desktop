@@ -463,12 +463,13 @@ class EngineStateMachine:
 
     def _ensure_pipeline_task(
         self,
+        project: ProjectConfig,
         phase: PhaseDefinition,
         plan_id: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Ensure a durable pipeline task and frozen requirement contract exist for ``phase``."""
         existing = self.store.get_task_by_branch(phase.branch)
-        if existing is not None:
+        if existing is not None and existing.get("project_id") == project.id and existing.get("phase_id") == phase.id:
             contract = self.store.get_task_contract(str(existing["contract_id"]))
             if contract is not None:
                 return existing, contract
@@ -483,6 +484,7 @@ class EngineStateMachine:
             task_id=task_id,
             phase_id=phase.id,
             plan_id=plan_id,
+            project_id=project.id,
             title=phase.title,
             branch=phase.branch,
             risk_class=phase.risk_class,
@@ -523,7 +525,7 @@ class EngineStateMachine:
             return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": str(e)}
 
         # Ensure a durable pipeline task + frozen requirement contract exists before coding/merging (AGENT_PIPELINE §3.1)
-        pipeline_task, pipeline_contract = self._ensure_pipeline_task(phase, plan_id)
+        pipeline_task, pipeline_contract = self._ensure_pipeline_task(project, phase, plan_id)
         contract_allowed_globs = json.loads(str(pipeline_contract.get("allowed_globs_json") or "[]"))
         contract_forbidden_globs = json.loads(str(pipeline_contract.get("forbidden_globs_json") or "[]"))
 
@@ -893,15 +895,15 @@ class EngineStateMachine:
             on_status_change=on_ci_status,
         )
 
-        if not ci_res.passed:
-            self._park_phase(project.id, phase, reason=ci_res.detail, next_step="Fix remaining CI failure")
-            return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": ci_res.detail}
-
         for fixer_engine in ci_res.contributing_engines:
             self.store.record_task_contributing_provider(
                 str(pipeline_task["id"]),
                 provider_for_engine(fixer_engine),
             )
+
+        if not ci_res.passed:
+            self._park_phase(project.id, phase, reason=ci_res.detail, next_step="Fix remaining CI failure")
+            return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": ci_res.detail}
         if ci_res.checked_sha:
             task_updates: dict[str, Any] = {"head_sha": ci_res.checked_sha, "pr_number": pr_number}
             if ci_res.reviewer_provider:
