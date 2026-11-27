@@ -90,6 +90,25 @@ def build_rtk_runner_env(
             warning=rg_ver.warning or "Portable ripgrep (rg.exe) failed verification; rtk-oss stays disabled.",
         )
 
+    # Apply optimizer settings: prepend rtk-oss and ripgrep to PATH for runner processes
+    rg_dir = str(rg_ver.executable_path.parent)
+    rtk_dir = str(rtk_ver.executable_path.parent)
+    current_path = base_path if base_path is not None else os.environ.get("PATH", "")
+    path_parts = [rg_dir, rtk_dir]
+    if current_path:
+        path_parts.append(current_path)
+    scoped_path = os.pathsep.join(path_parts)
+
+    env = tool_manager.build_process_env(
+        {
+            "PATH": scoped_path,
+            "RTK_BIN": str(rtk_ver.executable_path),
+            "RTK_RIPGREP_BIN": str(rg_ver.executable_path),
+            "RTK_ENABLED": "1",
+        }
+    )
+    return RtkEnvResult(enabled=True, env=env, warning="")
+
     rg_dir = str(rg_ver.executable_path.parent)
     rtk_dir = str(rtk_ver.executable_path.parent)
     current_path = base_path if base_path is not None else os.environ.get("PATH", "")
