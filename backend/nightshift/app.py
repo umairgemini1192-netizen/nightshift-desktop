@@ -106,8 +106,21 @@ def _write_cli_line(text: str) -> None:
             pass
 
 
-def run_self_test() -> int:
-    """Boot the engine without opening a window, verify core services, print OK, exit 0."""
+def _report_self_test(text: str, output_file: str | None) -> None:
+    """Report the self-test result on stdout and, when requested, in a file.
+
+    A windowed (console=False) PyInstaller build has no usable stdout, so CI passes
+    ``--self-test-output`` and checks the file plus the exit code.
+    """
+    _write_cli_line(text)
+    if output_file:
+        out = Path(output_file)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text + "\n", encoding="utf-8")
+
+
+def run_self_test(output_file: str | None = None) -> int:
+    """Boot the engine without opening a window, verify core services, report OK, exit 0."""
     data_dir = default_data_dir()
     data_dir.mkdir(parents=True, exist_ok=True)
     store: Store | None = None
@@ -133,11 +146,14 @@ def run_self_test() -> int:
             store.close()
             store = None
             registry = None
-        _write_cli_line("OK")
+        _report_self_test("OK", output_file)
         return 0
     except Exception as exc:
         logger.exception("Self-test failed")
-        _write_cli_line(f"FAIL: {exc}")
+        try:
+            _report_self_test(f"FAIL: {exc}", output_file)
+        except Exception:
+            logger.exception("Could not write self-test result")
         return 1
     finally:
         if registry is not None:
@@ -154,6 +170,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Boot the engine without opening a window, print OK, and exit 0.",
     )
     parser.add_argument(
+        "--self-test-output",
+        metavar="PATH",
+        default=None,
+        help="With --self-test, also write the result (OK or FAIL: ...) to this file.",
+    )
+    parser.add_argument(
         "--minimized",
         action="store_true",
         help="Launch minimized to the system tray.",
@@ -165,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
     """Launch the pywebview desktop window (EdgeChromium / WebView2 on Windows)."""
     args = parse_args(argv)
     if args.self_test:
-        return run_self_test()
+        return run_self_test(args.self_test_output)
 
     import webview  # type: ignore[import-not-found]
 

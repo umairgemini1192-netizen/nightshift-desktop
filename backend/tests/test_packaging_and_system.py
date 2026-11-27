@@ -49,6 +49,15 @@ def test_self_test_boots_engine_prints_ok_and_exits_zero(tmp_path: Path, monkeyp
     assert (tmp_path / "NightShift").is_dir()
 
 
+def test_self_test_writes_result_file_for_windowed_builds(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    out_file = tmp_path / "out" / "selftest.txt"
+    rc = main(["--self-test", "--self-test-output", str(out_file)])
+    assert rc == 0
+    assert out_file.read_text(encoding="utf-8").strip() == "OK"
+    assert capsys.readouterr().out.strip() == "OK"
+
+
 def test_parse_args_supports_self_test_and_minimized() -> None:
     ns = parse_args(["--self-test", "--minimized"])
     assert ns.self_test is True

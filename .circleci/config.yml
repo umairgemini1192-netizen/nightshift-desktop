@@ -96,13 +96,20 @@ jobs:
               Pop-Location
               python -m pip install -e "backend[dev,package]"
               python -m PyInstaller --noconfirm backend/packaging/nightshift.spec
-              $selfTestOut = & dist\NightShift\NightShift.exe --self-test
-              if ($LASTEXITCODE -ne 0) {
-                throw "NightShift.exe --self-test failed with exit code $LASTEXITCODE"
+              # NightShift.exe is a windowed app (no console): PowerShell does not wait for it and
+              # its stdout is empty. Wait for the process, then check exit code AND result file.
+              $resultFile = Join-Path $env:TEMP "nightshift-selftest.txt"
+              Remove-Item $resultFile -ErrorAction SilentlyContinue
+              $proc = Start-Process -FilePath "dist\NightShift\NightShift.exe" -ArgumentList @("--self-test", "--self-test-output", "`"$resultFile`"") -Wait -PassThru
+              if ($proc.ExitCode -ne 0) {
+                throw "NightShift.exe --self-test failed with exit code $($proc.ExitCode)"
               }
-              $trimmed = ($selfTestOut | Out-String).Trim()
+              if (-not (Test-Path $resultFile)) {
+                throw "NightShift.exe --self-test wrote no result file"
+              }
+              $trimmed = (Get-Content $resultFile -Raw).Trim()
               if ($trimmed -ne "OK") {
-                throw "NightShift.exe --self-test printed unexpected output: $trimmed"
+                throw "NightShift.exe --self-test reported unexpected result: $trimmed"
               }
               Write-Output "Smoke test passed: $trimmed"
               Compress-Archive -Path dist/NightShift/* -DestinationPath NightShift-windows.zip -Force
