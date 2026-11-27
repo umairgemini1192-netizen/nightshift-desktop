@@ -345,6 +345,36 @@ class EngineStateMachine:
                 payload={"project_id": project.id},
             ))
 
+            # Persist evidence configuration for desktop-started runs (P1)
+            evidence_metadata = {
+                "screenshot_manifest_path": project.screenshot_manifest_path,
+                "ui_contract": project.ui_contract,
+                "build_rules": project.build_rules,
+                "release_workflow": project.release_workflow,
+                "artifact_glob": project.artifact_glob,
+                "artifact_prefix": project.artifact_prefix,
+                "tag_prefix": project.tag_prefix,
+                "output_dir": str(project.output_dir),
+                "critical_paths": project.critical_paths,
+                "required_ci_jobs": project.required_ci_jobs,
+                "required_artifacts_by_job": project.required_artifacts_by_job,
+                "min_gate_duration_seconds": project.min_gate_duration_seconds,
+                "min_build_duration_seconds": project.min_build_duration_seconds,
+            }
+            self.store.record_evidence(
+                task_id=plan_id,
+                contract_sha256="",  # Empty for run-start evidence
+                commit_sha="",
+                kind="project_config",
+                source="run_start",
+                build_id="",
+                duration_seconds=0.0,
+                artifact_paths=None,
+                metadata=evidence_metadata,
+                verified=True,
+                rejection_reason="",
+            )
+
             # Crash recovery on startup: WIP-checkpoint & release leases for orphaned RUNNING tasks (AGENT_PIPELINE §4)
             def _crash_checkpoint(orphan_task: dict[str, Any]) -> None:
                 orphan_phase = str(orphan_task.get("phase_id") or "")

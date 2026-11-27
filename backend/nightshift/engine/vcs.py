@@ -360,13 +360,7 @@ class SubprocessGitGh:
                         eff_status = conclusion or "failed"
                     else:
                         eff_status = status_raw or "running"
-                    started = _parse_iso_dt(run.get("started_at"))
-                    completed = _parse_iso_dt(run.get("completed_at"))
-                    duration = (
-                        max(0.0, (completed - started).total_seconds())
-                        if started and completed
-                        else 0.0
-                    )
+                    duration = float(run.get("duration_seconds") or 0.0)
                     head_oid = str(run.get("head_sha") or commit_sha)
                     build_id = str(run.get("id") or run.get("external_id") or "")
                     artifacts = []
