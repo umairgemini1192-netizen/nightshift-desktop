@@ -63,6 +63,7 @@ export default function SettingsPage() {
   const setThemeMode = useAppStore((s) => s.setThemeMode);
   const bridge = useAppStore((s) => s.bridge);
   const snapshot = useAppStore((s) => s.snapshot);
+  const refreshSnapshot = useAppStore((s) => s.refreshSnapshot);
   const pushToast = useAppStore((s) => s.pushToast);
 
   // Projects CRUD state
@@ -114,7 +115,7 @@ export default function SettingsPage() {
         bridge.call<ProjectConfigItem[]>("settings.getProjects"),
         bridge.call<PriorityItem[]>("settings.getPriorityList"),
         bridge.call<GuardLimits>("settings.getGuardLimits"),
-        bridge.call<{ path: string }>("settings.openDataFolder"),
+        bridge.call<{ path: string }>("settings.getDataFolder"),
       ]);
 
       setProjects(projRes ?? []);
@@ -170,7 +171,7 @@ export default function SettingsPage() {
         tone: "success",
       });
       setShowProjectModal(false);
-      void loadSettingsData();
+      await Promise.all([loadSettingsData(), refreshSnapshot()]);
     } catch (err) {
       pushToast({
         title: "Could not save project",
@@ -189,7 +190,7 @@ export default function SettingsPage() {
         tone: "info",
       });
       setProjectToDelete(null);
-      void loadSettingsData();
+      await Promise.all([loadSettingsData(), refreshSnapshot()]);
     } catch (err) {
       pushToast({
         title: "Could not delete project",
@@ -654,7 +655,7 @@ export default function SettingsPage() {
           <Toggle
             id="toggle-notifications"
             label="Desktop notifications"
-            helperText="Sends toasts for run finished, phase parked, and circuit breaker. (TODO: Elevated Windows COM registration skipped in non-admin mode; uses standard notification API)."
+            helperText="Sends alerts for run finished, phase parked, and circuit breaker events using per-user Windows notifications."
             checked={notifications}
             onChange={handleToggleNotifications}
           />

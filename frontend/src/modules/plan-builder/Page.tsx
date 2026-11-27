@@ -42,6 +42,7 @@ const EFFORT_OPTIONS = [
 export default function PlanBuilderPage() {
   const bridge = useAppStore((s) => s.bridge);
   const pushToast = useAppStore((s) => s.pushToast);
+  const refreshSnapshot = useAppStore((s) => s.refreshSnapshot);
 
   const [plan, setPlan] = useState<{ id: string; title: string; project_id?: string; goal?: string } | null>(null);
   const [phases, setPhases] = useState<PlanPhase[]>([]);
@@ -71,6 +72,7 @@ export default function PlanBuilderPage() {
       setPlan(res?.plan ?? null);
       const loaded = (res?.phases ?? []).map((phase) => ({
         ...phase,
+        prompt: phase.prompt ?? "",
         depends_on: phase.depends_on ?? JSON.parse((phase as PlanPhase & { depends_on_json?: string }).depends_on_json ?? "[]"),
         auto_merge: Boolean(phase.auto_merge),
         release_after_merge: Boolean(phase.release_after_merge),
@@ -156,10 +158,22 @@ export default function PlanBuilderPage() {
         });
         return;
       }
-      const runPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
-      await bridge.call("plan.save", { plan: runPlan, phases });
-      setPlan(runPlan);
-      await bridge.call("engine.start", { planId: runPlan.id, projectId: runPlan.project_id, phases });
+      const targetPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      const saved = await bridge.call<{ planId?: string; projectId?: string }>("plan.save", {
+        plan: targetPlan,
+        phases,
+      });
+      const resolvedPlan = {
+        ...targetPlan,
+        id: saved?.planId ?? targetPlan.id,
+        project_id: saved?.projectId ?? targetPlan.project_id,
+      };
+      setPlan(resolvedPlan);
+      await bridge.call("engine.start", {
+        planId: resolvedPlan.id,
+        projectId: resolvedPlan.project_id,
+        phases,
+      });
       pushToast({
         title: "Overnight run started",
         description: "Continuous failover orchestrator is active.",
@@ -176,9 +190,18 @@ export default function PlanBuilderPage() {
 
   const handleSavePlan = async () => {
     try {
-      await bridge.call("plan.save", {
-        plan: plan ?? { id: "active_plan", title: "Continuous Delivery Plan" },
+      const targetPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      const saved = await bridge.call<{ planId?: string; projectId?: string }>("plan.save", {
+        plan: targetPlan,
         phases,
+      });
+      setPlan((current) => {
+        const base = current ?? targetPlan;
+        return {
+          ...base,
+          id: saved?.planId ?? base.id,
+          project_id: saved?.projectId ?? base.project_id,
+        };
       });
       pushToast({
         title: "Plan saved",
@@ -202,10 +225,20 @@ export default function PlanBuilderPage() {
       );
       if (res?.phases) {
         setPlan(res.plan);
-        setPhases(res.phases.map((phase) => ({ ...phase, auto_merge: Boolean(phase.auto_merge), release_after_merge: Boolean(phase.release_after_merge), force_rerun: Boolean(phase.force_rerun) })));
-        if (res.phases.length > 0) {
-          setSelectedId(res.phases[0].id);
-        }
+        setPhases(
+          res.phases.map((phase) => ({
+            ...phase,
+            prompt: phase.prompt ?? "",
+            depends_on: phase.depends_on ?? [],
+            timeout_minutes: phase.timeout_minutes ?? 90,
+            auto_merge: Boolean(phase.auto_merge),
+            release_after_merge: Boolean(phase.release_after_merge),
+            force_rerun: Boolean(phase.force_rerun),
+          })),
+        );
+        setSelectedPhases(new Set());
+        setSelectedId(res.phases[0]?.id ?? null);
+        await refreshSnapshot();
         setShowImportModal(false);
         setImportJson("");
         pushToast({
@@ -226,7 +259,7 @@ export default function PlanBuilderPage() {
   const handleExportQueue = async () => {
     try {
       const res = await bridge.call<Record<string, unknown>>("plan.exportQueue", {
-        planId: plan?.id ?? "active_plan",
+        planId: plan?.id,
       });
       setExportJson(JSON.stringify(res, null, 2));
       setShowExportModal(true);
@@ -240,7 +273,10 @@ export default function PlanBuilderPage() {
   };
 
   const handleAddPhase = () => {
-    const nextIdx = phases.length + 1;
+    let nextIdx = phases.length + 1;
+    while (phases.some((p) => p.id === `p${nextIdx}`)) {
+      nextIdx += 1;
+    }
     const newId = `p${nextIdx}`;
     const newPhase: PlanPhase = {
       id: newId,
@@ -260,6 +296,12 @@ export default function PlanBuilderPage() {
 
   const handleDeletePhase = (id: string) => {
     setPhases((prev) => prev.filter((p) => p.id !== id));
+    setSelectedPhases((prev) => {
+      if (!prev.has(id)) return prev;
+      const next = new Set(prev);
+      next.delete(id);
+      return next;
+    });
     if (selectedId === id) {
       const remaining = phases.filter((p) => p.id !== id);
       setSelectedId(remaining[0]?.id ?? null);
@@ -286,16 +328,26 @@ export default function PlanBuilderPage() {
   const updateBulkImplementer = async (reset: boolean) => {
     const ids = Array.from(selectedPhases);
     try {
-      const savedPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
-      await bridge.call("plan.save", { plan: savedPlan, phases });
-      setPlan(savedPlan);
+      const targetPlan = plan ?? { id: "active_plan", title: "Continuous Delivery Plan" };
+      const saved = await bridge.call<{ planId?: string; projectId?: string }>("plan.save", {
+        plan: targetPlan,
+        phases,
+      });
+      setPlan((current) => {
+        const base = current ?? targetPlan;
+        return {
+          ...base,
+          id: saved?.planId ?? base.id,
+          project_id: saved?.projectId ?? base.project_id,
+        };
+      });
       await bridge.call("plan.setImplementer", reset
         ? { phaseIds: ids, reset: true }
         : { phaseIds: ids, engine: bulkEngine, model: bulkModel, effort: bulkEffort });
       setPhases((prev) => prev.map((p) => ids.includes(p.id)
         ? reset
-          ? { ...p, overrideImplementer: undefined, implementer: "Antigravity" }
-          : { ...p, overrideImplementer: bulkEngine, implementer: bulkEngine }
+          ? { ...p, overrideImplementer: undefined, overrideModel: undefined, overrideEffort: undefined }
+          : { ...p, overrideImplementer: bulkEngine, overrideModel: bulkModel, overrideEffort: bulkEffort }
         : p));
       pushToast({
         title: reset ? "Reset to plan" : "Implementer overridden",
@@ -648,7 +700,7 @@ export default function PlanBuilderPage() {
                   <CodeEditor
                     id="phase-prompt"
                     label="Implementation prompt (.nightshift_prompt.md)"
-                    value={activePhase.prompt}
+                    value={activePhase.prompt ?? ""}
                     onChange={(val) => updateActivePhase({ prompt: val })}
                     language="prompt"
                     rows={8}

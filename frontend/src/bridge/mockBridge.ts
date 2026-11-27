@@ -360,23 +360,36 @@ export class MockBridge implements Bridge {
       case "plan.setImplementer":
         return { ok: true, saved: true } as T;
 
-      case "plan.importQueue":
+      case "plan.importQueue": {
+        const importedProject = {
+          id: "owner/imported-repo",
+          name: "owner/imported-repo",
+          repo: "owner/imported-repo",
+        };
+        const existingProjects = this.snapshot.projects.some((p) => p.id === importedProject.id)
+          ? this.snapshot.projects
+          : [...this.snapshot.projects, importedProject];
+        this.snapshot = {
+          ...this.snapshot,
+          activeProjectId: importedProject.id,
+          projects: existingProjects,
+        };
+        this.emit("app.snapshot", structuredClone(this.snapshot));
         return {
-          ok: true,
-          data: {
-            project: { id: "imported", repo: "owner/imported-repo" },
-            plan: { id: "plan_imported", title: "Imported Queue Plan" },
-            phases: [
-              { id: "p1", title: "Imported Phase 1", branch: "feat/p1", depends_on: [], ladder: "backend" },
-            ],
-          },
+          project: { ...importedProject, artifact_glob: "*.apk" },
+          plan: { id: `plan_${importedProject.id}`, title: "Imported Queue Plan", project_id: importedProject.id },
+          phases: [
+            { id: "p1", title: "Imported Phase 1", branch: "feat/p1", depends_on: [], ladder: "backend" },
+          ],
         } as T;
+      }
 
       case "plan.exportQueue":
         return {
           repo: "owner/nightshift-desktop",
           local_repo: "D:/DevCache/nightshift-desktop",
           desktop_apk_dir: "D:/DevCache/release",
+          artifact_glob: "*.apk",
           auto_merge: true,
           auto_release: false,
           max_ci_retries: 3,
@@ -656,6 +669,9 @@ export class MockBridge implements Bridge {
 
       case "settings.setGuardLimits":
         return { ok: true } as T;
+
+      case "settings.getDataFolder":
+        return { path: "C:\\Users\\AppData\\Local\\NightShift" } as T;
 
       case "settings.openDataFolder":
         return { opened: true, path: "C:\\Users\\AppData\\Local\\NightShift" } as T;

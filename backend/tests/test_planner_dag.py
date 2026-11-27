@@ -154,6 +154,8 @@ def test_queue_json_import_export_round_trip() -> None:
 
     # Import
     imported = import_queue_json(legacy_payload)
+    assert imported["project"]["id"] == "owner/drivelift-android"
+    assert import_queue_json({"repo": "another/drivelift-android"})["project"]["id"] != imported["project"]["id"]
     assert imported["project"]["repo"] == "owner/drivelift-android"
     assert imported["project"]["local_path"] == "D:/DevCache/drivelift"
     assert len(imported["phases"]) == 2
@@ -171,6 +173,7 @@ def test_queue_json_import_export_round_trip() -> None:
     assert exported["repo"] == legacy_payload["repo"]
     assert exported["local_repo"] == legacy_payload["local_repo"]
     assert exported["desktop_apk_dir"] == legacy_payload["desktop_apk_dir"]
+    assert exported["artifact_glob"] == "*.apk"
     assert exported["auto_merge"] == legacy_payload["auto_merge"]
     assert exported["auto_release"] == legacy_payload["auto_release"]
     assert exported["max_ci_retries"] == legacy_payload["max_ci_retries"]

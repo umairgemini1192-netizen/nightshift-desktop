@@ -163,6 +163,8 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     store.migrate()
     events = EventBus(store=store)
     bridge = BridgeAPI(store, events, ModuleRegistry())
+    opened_paths: list[str] = []
+    monkeypatch.setattr("nightshift.bridge.os.startfile", opened_paths.append, raising=False)
     monkeypatch.setattr(bridge._logins, "check_all", lambda **kwargs: {
         "gh": LoginCheckResult(tool="gh", state="Ready", detail="Verified")
     })
@@ -211,7 +213,7 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     save_resp = bridge.call("plan.save", {
         "plan": {"id": "plan2", "project_id": "p1", "title": "Saved Plan"},
         "phases": [
-            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "depends_on": [], "ladder": "ui", "timeout_minutes": 42, "auto_merge": False, "release_after_merge": True, "force_rerun": True},
+            {"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "implementer": "Codex CLI", "depends_on": [], "ladder": "ui", "timeout_minutes": 42, "auto_merge": False, "release_after_merge": True, "force_rerun": True},
             {"id": "p2-2", "title": "P2-2", "branch": "feat/p2-2", "depends_on": ["p2-1"]},
         ],
     })
@@ -231,6 +233,16 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert impl_resp["ok"]
     assert impl_resp["data"]["updated"] == 1
     assert store.get_phase_assignment("p2-1")["override_engine"] == "gemini"
+    assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
+    assert bridge.call("plan.setImplementer", {"phaseIds": ["p2-1"], "reset": True})["ok"]
+    assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
+    assert store.get_phase_assignment("p2-1")["override_engine"] is None
+    assert bridge.call("plan.save", {
+        "plan": {"id": "plan2", "project_id": "p1", "title": "Saved Plan"},
+        "phases": [{"id": "p2-1", "title": "P2-1", "branch": "feat/p2-1", "implementer": None}],
+    })["ok"]
+    assert store.get_phase_assignment("p2-1")["planned_engine"] == "codex"
+    assert store.get_phase("p2-2") is None
 
     # plan.exportQueue
     exp_resp = bridge.call("plan.exportQueue", {"planId": "plan2"})
@@ -241,11 +253,27 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     import_payload = {
         "repo": "owner/imported",
         "local_repo": "/local/imported",
-        "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1"}],
+        "artifact_glob": "*.zip",
+        "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1", "implementer": "Gemini CLI"}],
     }
     imp_resp = bridge.call("plan.importQueue", {"queue": import_payload})
     assert imp_resp["ok"]
-    assert imp_resp["data"]["project"]["id"] == "imported"
+    assert imp_resp["data"]["project"]["id"] == "owner/imported"
+    assert imp_resp["data"]["phases"][0]["implementer"] == "gemini"
+    assert store.get_project("owner/imported")["artifact_glob"] == "*.zip"
+    assert bridge.call("plan.get")["data"]["plan"]["id"] == "plan_owner/imported"
+    assert bridge.call("plan.setImplementer", {"phaseIds": ["imp1"], "engine": "Claude Code", "model": "sonnet", "effort": "medium"})["ok"]
+    reimp_resp = bridge.call("plan.importQueue", {"queue": {**import_payload, "artifact_glob": "dist/*.exe"}})
+    assert reimp_resp["ok"]
+    assert store.get_project("owner/imported")["artifact_glob"] == "dist/*.exe"
+    assert reimp_resp["data"]["phases"][0]["implementer"] == "gemini"
+    assert reimp_resp["data"]["phases"][0]["overrideImplementer"] == "claude"
+    minimal_reimp = bridge.call("plan.importQueue", {"queue": {"repo": "owner/imported", "phases": [{"id": "imp1", "title": "Imported Phase", "branch": "feat/imp1"}]}})
+    assert minimal_reimp["ok"]
+    assert store.get_project("owner/imported")["artifact_glob"] == "dist/*.exe"
+    assert store.get_project("owner/imported")["local_path"] == "/local/imported"
+    assert minimal_reimp["data"]["phases"][0]["implementer"] == "gemini"
+    assert minimal_reimp["data"]["phases"][0]["overrideImplementer"] == "claude"
 
     # runs.get
     run_detail = bridge.call("runs.get", {"runId": "plan1"})
@@ -316,9 +344,15 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert guards_set["ok"]
     assert bridge.call("settings.getGuardLimits")["data"]["maxAttempts"] == 5
 
+    data_folder_info = bridge.call("settings.getDataFolder")
+    assert data_folder_info["ok"]
+    assert data_folder_info["data"]["path"] == str(store.db_path.parent)
+    assert len(opened_paths) == 1
+
     data_folder = bridge.call("settings.openDataFolder")
     assert data_folder["ok"]
     assert data_folder["data"]["opened"] is True
+    assert len(opened_paths) == 2
 
     keep_awake = bridge.call("settings.setKeepAwake", {"enabled": True})
     assert keep_awake["ok"]
@@ -441,3 +475,112 @@ def test_council_approval_rejects_phase_from_other_plan(tmp_path):
         assert not result["ok"]
         assert store.get_phase("shared")["plan_id"] == "original"
         assert not any(p["id"] == "new" for p in store.list_plans())
+
+
+def test_plan_save_without_project_creates_fallback_and_handles_auto_implementer(tmp_path):
+    with Store(tmp_path / "empty_save.db") as store:
+        store.migrate()
+        bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+        saved = bridge.call(
+            "plan.save",
+            {
+                "plan": {"id": "active_plan", "title": "Fresh Plan", "goal": "Ship cleanly"},
+                "phases": [
+                    {"id": "p1", "title": "Phase 1", "branch": "feat/p1", "implementer": "Gemini CLI"},
+                ],
+            },
+        )
+        assert saved["ok"]
+        assert saved["data"]["projectId"] == "default"
+        assert store.get_project("default")["artifact_glob"] == "*.apk"
+        assert store.get_phase_assignment("p1")["planned_engine"] == "gemini"
+
+        auto_saved = bridge.call(
+            "plan.save",
+            {
+                "plan": {"id": "active_plan", "title": "Fresh Plan"},
+                "phases": [
+                    {"id": "p1", "title": "Phase 1", "branch": "feat/p1", "implementer": "Auto"},
+                ],
+            },
+        )
+        assert auto_saved["ok"]
+        assert store.get_plan("active_plan")["goal"] == "Ship cleanly"
+        assert store.get_phase_assignment("p1")["planned_engine"] is None
+
+
+def test_export_queue_unsaved_plan_and_deleted_active_project_fallback(tmp_path):
+    with Store(tmp_path / "export_and_delete.db") as store:
+        store.migrate()
+        bridge = BridgeAPI(store, EventBus(store=store), ModuleRegistry())
+
+        # Exporting an unsaved planId before first save never crashes on NoneType
+        unsaved_export = bridge.call("plan.exportQueue", {"planId": "active_plan"})
+        assert unsaved_export["ok"]
+        assert unsaved_export["data"]["phases"] == []
+
+        store.create_project("p_old", "Old Project", "owner/old", "/old")
+        store.create_plan("plan_old", "p_old", "Old Plan")
+
+        imp_resp = bridge.call(
+            "plan.importQueue",
+            {
+                "queue": {
+                    "repo": "owner/imported-export",
+                    "local_repo": "/local/imported-export",
+                    "artifact_glob": "release/*.aab",
+                    "phases": [
+                        {
+                            "id": "exp1",
+                            "title": "Export Phase",
+                            "branch": "feat/exp1",
+                            "implementer": "Codex CLI",
+                        }
+                    ],
+                }
+            },
+        )
+        assert imp_resp["ok"]
+
+        # Exporting without planId selects the active imported project's plan and preserves implementer
+        active_export = bridge.call("plan.exportQueue")
+        assert active_export["ok"]
+        assert active_export["data"]["repo"] == "owner/imported-export"
+        assert active_export["data"]["artifact_glob"] == "release/*.aab"
+        assert active_export["data"]["phases"][0]["implementer"] == "codex"
+
+        # Re-importing with a trimmed phase list prunes removed phases from the plan
+        reimp_two = bridge.call(
+            "plan.importQueue",
+            {
+                "queue": {
+                    "repo": "owner/imported-export",
+                    "phases": [
+                        {"id": "exp1", "title": "Export Phase", "branch": "feat/exp1"},
+                        {"id": "exp2", "title": "Temporary Phase", "branch": "feat/exp2"},
+                    ],
+                }
+            },
+        )
+        assert reimp_two["ok"]
+        assert store.get_phase("exp2") is not None
+        reimp_trimmed = bridge.call(
+            "plan.importQueue",
+            {
+                "queue": {
+                    "repo": "owner/imported-export",
+                    "phases": [
+                        {"id": "exp1", "title": "Export Phase", "branch": "feat/exp1"},
+                    ],
+                }
+            },
+        )
+        assert reimp_trimmed["ok"]
+        assert store.get_phase("exp2") is None
+
+        # Deleting the active imported project falls back cleanly to the remaining project in app.snapshot
+        assert bridge.call("settings.deleteProject", {"id": "owner/imported-export"})["ok"]
+        snap = bridge.call("app.snapshot")
+        assert snap["ok"]
+        assert snap["data"]["activeProjectId"] == "p_old"
+
