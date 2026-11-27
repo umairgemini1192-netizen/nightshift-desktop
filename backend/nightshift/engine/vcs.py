@@ -40,6 +40,10 @@ class GitGhClient(Protocol):
 
     def find_merged_pr(self, repo: str, branch: str) -> dict[str, Any] | None: ...
 
+    def list_prs_for_branch(self, repo: str, branch: str) -> list[dict[str, Any]]: ...
+
+    def get_pr_state(self, repo: str, pr_number: int) -> dict[str, Any] | None: ...
+
     def watch_pr_checks(
         self,
         repo: str,
@@ -56,6 +60,7 @@ class GitGhClient(Protocol):
         pr_number: int,
         local_repo: Path,
         strategy: str = "--merge",
+        match_head_commit: str | None = None,
     ) -> tuple[bool, str]: ...
 
     def create_checkpoint_commit_and_push(
@@ -115,6 +120,8 @@ class GitGhClient(Protocol):
         repo: str,
         tag_prefix: str = "v1.0.0-preview.",
     ) -> str: ...
+
+    def list_releases(self, repo: str) -> list[dict[str, Any]]: ...
 
 
 class SubprocessGitGh:
@@ -263,6 +270,34 @@ class SubprocessGitGh:
                 pass
         return None
 
+    def list_prs_for_branch(self, repo: str, branch: str) -> list[dict[str, Any]]:
+        rc, out, err, _ = run_subprocess_with_timeout(
+            [
+                "gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "all",
+                "--json", "number,url,state,headRefOid,mergeCommit,mergeable,mergeStateStatus",
+            ],
+            timeout_seconds=60,
+        )
+        if rc != 0:
+            raise RuntimeError(f"gh pr list failed for {branch}: {err or out}")
+        if not out:
+            return []
+        return list(json.loads(out))
+
+    def get_pr_state(self, repo: str, pr_number: int) -> dict[str, Any] | None:
+        rc, out, err, _ = run_subprocess_with_timeout(
+            [
+                "gh", "pr", "view", str(pr_number), "--repo", repo,
+                "--json", "number,url,state,headRefOid,mergeCommit",
+            ],
+            timeout_seconds=60,
+        )
+        if rc != 0:
+            raise RuntimeError(f"gh pr view #{pr_number} failed: {err or out}")
+        if not out:
+            return None
+        return dict(json.loads(out))
+
     def watch_pr_checks(
         self,
         repo: str,
@@ -305,9 +340,13 @@ class SubprocessGitGh:
         pr_number: int,
         local_repo: Path,
         strategy: str = "--merge",
+        match_head_commit: str | None = None,
     ) -> tuple[bool, str]:
+        cmd = ["gh", "pr", "merge", str(pr_number), "--repo", repo, strategy, "--delete-branch"]
+        if match_head_commit:
+            cmd.extend(["--match-head-commit", match_head_commit])
         rc, out, err, _ = run_subprocess_with_timeout(
-            ["gh", "pr", "merge", str(pr_number), "--repo", repo, strategy, "--delete-branch"],
+            cmd,
             cwd=local_repo,
             timeout_seconds=120,
         )
@@ -533,6 +572,31 @@ class SubprocessGitGh:
                 pass
         return f"{tag_prefix}{max_num + 1}"
 
+    def list_releases(self, repo: str) -> list[dict[str, Any]]:
+        rc, out, err, _ = run_subprocess_with_timeout(
+            ["gh", "api", f"repos/{repo}/releases?per_page=40"],
+            timeout_seconds=60,
+        )
+        if rc != 0:
+            raise RuntimeError(f"gh api releases failed for {repo}: {err or out}")
+        if not out:
+            return []
+        raw_items = json.loads(out)
+        results: list[dict[str, Any]] = []
+        for item in raw_items:
+            results.append(
+                {
+                    "tag": item.get("tag_name") or item.get("tagName") or "",
+                    "title": item.get("name") or "",
+                    "body": item.get("body") or "",
+                    "assets": [
+                        {"name": a.get("name") or "", "size": a.get("size") or 0}
+                        for a in (item.get("assets") or [])
+                    ],
+                }
+            )
+        return results
+
 
 class FakeGitGh:
     """In-memory fake VCS implementation for completely offline, deterministic testing."""
@@ -541,6 +605,7 @@ class FakeGitGh:
         self.branches: dict[str, str] = {"main": "sha_main_001"}
         self.prs: dict[str, dict[str, Any]] = {}
         self.merged_prs: dict[str, dict[str, Any]] = {}
+        self.closed_prs: dict[str, dict[str, Any]] = {}
         self.ci_results: dict[int, list[bool]] = {}  # list of outcomes per attempt
         self.ci_flaky: dict[int, bool] = {}
         self.failed_ci_logs: dict[str, str] = {}
@@ -608,11 +673,63 @@ class FakeGitGh:
             del self.worktrees[b]
         shutil.rmtree(worktree_dir, ignore_errors=True)
 
+    def add_closed_pr(
+        self,
+        branch: str,
+        number: int | None = None,
+        url: str | None = None,
+        head_sha: str = "sha_closed_1",
+    ) -> dict[str, Any]:
+        num = number or self._next_pr_number
+        self._next_pr_number += 1
+        pr = {
+            "number": num,
+            "url": url or f"https://github.com/test/repo/pull/{num}",
+            "state": "CLOSED",
+            "headRefOid": head_sha,
+        }
+        self.closed_prs[branch] = pr
+        return pr
+
     def find_open_pr(self, repo: str, branch: str) -> dict[str, Any] | None:
         return self.prs.get(branch)
 
     def find_merged_pr(self, repo: str, branch: str) -> dict[str, Any] | None:
         return self.merged_prs.get(branch)
+
+    def list_prs_for_branch(self, repo: str, branch: str) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        if branch in self.prs:
+            pr = dict(self.prs[branch])
+            pr.setdefault("state", "OPEN")
+            results.append(pr)
+        if branch in self.merged_prs:
+            pr = dict(self.merged_prs[branch])
+            pr.setdefault("state", "MERGED")
+            results.append(pr)
+        if branch in self.closed_prs:
+            pr = dict(self.closed_prs[branch])
+            pr.setdefault("state", "CLOSED")
+            results.append(pr)
+        return results
+
+    def get_pr_state(self, repo: str, pr_number: int) -> dict[str, Any] | None:
+        for pr in self.prs.values():
+            if int(pr["number"]) == pr_number:
+                out = dict(pr)
+                out.setdefault("state", "OPEN")
+                return out
+        for pr in self.merged_prs.values():
+            if int(pr["number"]) == pr_number:
+                out = dict(pr)
+                out.setdefault("state", "MERGED")
+                return out
+        for pr in self.closed_prs.values():
+            if int(pr["number"]) == pr_number:
+                out = dict(pr)
+                out.setdefault("state", "CLOSED")
+                return out
+        return None
 
     def watch_pr_checks(
         self,
@@ -641,9 +758,13 @@ class FakeGitGh:
         pr_number: int,
         local_repo: Path,
         strategy: str = "--merge",
+        match_head_commit: str | None = None,
     ) -> tuple[bool, str]:
         for branch, pr in list(self.prs.items()):
             if pr["number"] == pr_number:
+                if match_head_commit and str(pr.get("headRefOid") or "") != match_head_commit:
+                    return False, f"Head commit SHA mismatch: expected {match_head_commit}, got {pr.get('headRefOid')}"
+                pr["state"] = "MERGED"
                 pr["mergeCommit"] = {"oid": "sha_merge_123"}
                 self.merged_prs[branch] = pr
                 del self.prs[branch]
@@ -756,7 +877,9 @@ class FakeGitGh:
             "tag": tag,
             "title": title,
             "notes": notes,
+            "body": notes,
             "files": [str(f) for f in files],
+            "assets": [{"name": Path(f).name} for f in files],
             "prerelease": prerelease,
         }
         self.releases.append(rel)
@@ -769,3 +892,6 @@ class FakeGitGh:
     ) -> str:
         num = len(self.releases) + 1
         return f"{tag_prefix}{num}"
+
+    def list_releases(self, repo: str) -> list[dict[str, Any]]:
+        return [dict(r) for r in self.releases]

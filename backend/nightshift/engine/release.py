@@ -79,10 +79,15 @@ class ReleaseManager:
             sums_lines.append(f"{sha}  {art.name}")
         sums_path.write_text("\n".join(sums_lines) + "\n", encoding="utf-8")
 
-        # 5. Create GitHub Release
+        # 5. Create GitHub Release (embed merge_sha marker for durable reconciliation, AGENT_PIPELINE §4)
         release_files = matching_artifacts + [sums_path]
         title = f"{repo.split('/')[-1]} {tag}"
-        notes = f"Continuous Auto-Build: {title_note}\nMain CI run: {run_id}\n\nChecksums:\n```\n" + "\n".join(sums_lines) + "\n```"
+        notes = (
+            f"Continuous Auto-Build: {title_note}\n"
+            f"Main CI run: {run_id}\n"
+            f"<!-- nightshift-merge-sha: {merge_sha} -->\n\n"
+            f"Checksums:\n```\n" + "\n".join(sums_lines) + "\n```"
+        )
         rel_ok, rel_msg = self.vcs.create_github_release(repo, tag, title, notes, release_files, prerelease=True)
         if not rel_ok:
             raise RuntimeError(f"GitHub release creation failed: {rel_msg}")
