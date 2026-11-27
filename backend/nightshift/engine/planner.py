@@ -65,9 +65,9 @@ class PhaseDefinition:
             "ladder": self.ladder,
             "size": self.size,
             "timeout_minutes": self.timeout_minutes,
-            "auto_merge": int(self.auto_merge),
-            "release_after_merge": int(self.release_after_merge),
-            "force_rerun": int(self.force_rerun),
+            "auto_merge": self.auto_merge,
+            "release_after_merge": self.release_after_merge,
+            "force_rerun": self.force_rerun,
             "position": self.position,
         }
 
