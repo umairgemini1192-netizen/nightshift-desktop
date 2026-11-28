@@ -359,6 +359,10 @@ class GitGhClient(Protocol):
 
     def list_releases(self, repo: str) -> list[dict[str, Any]]: ...
 
+    def append_release_warning(self, repo: str, tag: str, warning_text: str) -> tuple[bool, str]: ...
+
+    def download_release_assets(self, repo: str, tag: str, dest_dir: Path) -> list[Path]: ...
+
 
 class SubprocessGitGh:
     """Production implementation calling real `git` and `gh` CLIs."""
@@ -1677,6 +1681,40 @@ class SubprocessGitGh:
             )
         return results
 
+    def append_release_warning(self, repo: str, tag: str, warning_text: str) -> tuple[bool, str]:
+        """Append a superseded warning to an existing GitHub release without deleting history or tags."""
+        rc_v, out_v, err_v, _ = run_subprocess_with_timeout(
+            ["gh", "release", "view", tag, "--repo", repo, "--json", "body"],
+            timeout_seconds=60,
+        )
+        if rc_v != 0:
+            return False, err_v or out_v or f"Could not inspect release {tag}"
+        try:
+            current_body = str(json.loads(out_v).get("body") or "")
+        except Exception:
+            current_body = ""
+        updated_body = (
+            f"{current_body}\n\n{warning_text}".strip()
+            if warning_text.strip() not in current_body
+            else current_body
+        )
+        rc_e, out_e, err_e, _ = run_subprocess_with_timeout(
+            ["gh", "release", "edit", tag, "--repo", repo, "--notes", updated_body],
+            timeout_seconds=60,
+        )
+        return (rc_e == 0, out_e or err_e)
+
+    def download_release_assets(self, repo: str, tag: str, dest_dir: Path) -> list[Path]:
+        """Download all assets for an existing GitHub release tag into ``dest_dir``."""
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        rc, _, err, _ = run_subprocess_with_timeout(
+            ["gh", "release", "download", tag, "--repo", repo, "--dir", str(dest_dir)],
+            timeout_seconds=300,
+        )
+        if rc != 0:
+            raise RuntimeError(f"Release asset download failed for {tag}: {err}")
+        return [p for p in dest_dir.rglob("*") if p.is_file()]
+
 
 class FakeGitGh:
     """In-memory fake VCS implementation for completely offline, deterministic testing."""
@@ -1693,6 +1731,7 @@ class FakeGitGh:
         self.checkpoints: list[dict[str, Any]] = []
         self.reverts: list[dict[str, Any]] = []
         self.releases: list[dict[str, Any]] = []
+        self.release_asset_bytes: dict[str, dict[str, bytes]] = {}
         self.branch_protection: dict[str, bool] = {"main": True}
         self.diffs: dict[str, str] = {}
         self.changed_files: dict[str, list[str]] = {}
@@ -2087,6 +2126,14 @@ class FakeGitGh:
         files: list[Path],
         prerelease: bool = True,
     ) -> tuple[bool, str]:
+        if any(str(r.get("tag") or "") == tag for r in self.releases):
+            return False, f"Release tag '{tag}' already exists; overwriting tags is forbidden."
+        stored_bytes: dict[str, bytes] = {}
+        for f in files:
+            fp = Path(f)
+            if fp.exists() and fp.is_file():
+                stored_bytes[fp.name] = fp.read_bytes()
+        self.release_asset_bytes[tag] = stored_bytes
         rel = {
             "tag": tag,
             "title": title,
@@ -2109,3 +2156,26 @@ class FakeGitGh:
 
     def list_releases(self, repo: str) -> list[dict[str, Any]]:
         return [dict(r) for r in self.releases]
+
+    def append_release_warning(self, repo: str, tag: str, warning_text: str) -> tuple[bool, str]:
+        for rel in self.releases:
+            if str(rel.get("tag") or "") == tag:
+                body = str(rel.get("body") or rel.get("notes") or "")
+                if warning_text.strip() not in body:
+                    updated = f"{body}\n\n{warning_text}".strip()
+                    rel["body"] = updated
+                    rel["notes"] = updated
+                return True, f"Appended warning to {tag}"
+        return False, f"Release {tag} not found"
+
+    def download_release_assets(self, repo: str, tag: str, dest_dir: Path) -> list[Path]:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        assets = self.release_asset_bytes.get(tag)
+        if not assets:
+            raise RuntimeError(f"No stored assets found for release {tag}")
+        written: list[Path] = []
+        for name, data in assets.items():
+            out_p = dest_dir / name
+            out_p.write_bytes(data)
+            written.append(out_p)
+        return written

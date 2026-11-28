@@ -158,6 +158,10 @@ class BridgeAPI:
             out["screenshot_manifest_path"] = str(p_data["screenshot_manifest_path"])
         if "screenshot_job_name" in p_data and p_data["screenshot_job_name"] is not None:
             out["screenshot_job_name"] = str(p_data["screenshot_job_name"])
+        if "smoke_command" in p_data and p_data["smoke_command"] is not None:
+            out["smoke_command"] = str(p_data["smoke_command"])
+        if "smoke_timeout_seconds" in p_data and p_data["smoke_timeout_seconds"] is not None:
+            out["smoke_timeout_seconds"] = int(p_data["smoke_timeout_seconds"])
         return out
 
     def _enrich_phase_with_assignment(self, ph: dict[str, Any]) -> dict[str, Any]:
@@ -1321,6 +1325,125 @@ class BridgeAPI:
                     "logins": {name: asdict(result) for name, result in checks.items()},
                 },
             }
+
+        # Pipeline governance controls (Phase 8e: owner approval, assertion waiver, release rollback)
+        if method == "pipeline.listTasks":
+            status_filter = payload.get("status")
+            plan_filter = payload.get("planId")
+            tasks = self._store.list_tasks(
+                status=str(status_filter) if status_filter else None,
+                plan_id=str(plan_filter) if plan_filter else None,
+            )
+            return {"ok": True, "data": tasks}
+
+        if method == "pipeline.approveTask":
+            task_id = str(payload.get("taskId") or "").strip()
+            head_sha = str(payload.get("headSha") or "").strip()
+            approved_by = str(payload.get("approvedBy") or "owner").strip() or "owner"
+            resume = bool(payload.get("resume", True))
+            if not task_id or not head_sha:
+                return {"ok": False, "error": "taskId and exact headSha are required to approve a task."}
+            task = self._store.get_task(task_id)
+            if task is None:
+                return {"ok": False, "error": f"Task not found: {task_id}"}
+            if task.get("head_sha") and str(task["head_sha"]) != head_sha:
+                return {
+                    "ok": False,
+                    "error": f"Head SHA mismatch: task is at {str(task['head_sha'])[:7]}, not {head_sha[:7]}.",
+                }
+            updated = self._store.record_task_owner_approval(task_id, approved_by, head_sha)
+            if resume and updated.get("status") == "BLOCKED":
+                from nightshift.engine.pipeline_orchestrator import InvalidTransitionError, TaskOrchestrator
+
+                try:
+                    updated = TaskOrchestrator(self._store).resume_from_blocked(
+                        task_id,
+                        current_head_sha=head_sha,
+                        owner_approved_by=approved_by,
+                        actor=approved_by,
+                    )
+                except InvalidTransitionError as exc:
+                    return {"ok": False, "error": str(exc)}
+            self._events.emit(
+                Event(
+                    kind="pipeline.owner_approved",
+                    plain_text=f"Owner approved task {task_id} for commit {head_sha[:7]}.",
+                    level="info",
+                    phase_id=str(updated.get("phase_id") or "") or None,
+                )
+            )
+            return {"ok": True, "data": updated}
+
+        if method == "pipeline.recordAssertionWaiver":
+            task_id = str(payload.get("taskId") or "").strip()
+            head_sha = str(payload.get("headSha") or "").strip()
+            reason = str(payload.get("reason") or "").strip()
+            if not task_id or not head_sha or not reason:
+                return {"ok": False, "error": "taskId, exact headSha, and written rationale are required."}
+            try:
+                updated = self._store.record_task_assertion_waiver(task_id, head_sha, reason)
+            except KeyError as exc:
+                return {"ok": False, "error": str(exc)}
+            self._events.emit(
+                Event(
+                    kind="pipeline.assertion_waiver",
+                    plain_text=f"Recorded owner assertion waiver for {task_id} at {head_sha[:7]}.",
+                    level="warn",
+                    phase_id=str(updated.get("phase_id") or "") or None,
+                )
+            )
+            return {"ok": True, "data": updated}
+
+        if method == "pipeline.listReleaseVerifications":
+            repo_filter = payload.get("repo")
+            limit = int(payload.get("limit") or 20)
+            rows = self._store.list_release_verifications(
+                repo=str(repo_filter) if repo_filter else None,
+                limit=limit,
+            )
+            return {"ok": True, "data": rows}
+
+        if method == "pipeline.rollbackRelease":
+            from nightshift.engine.release import ReleaseManager
+            from nightshift.engine.vcs import SubprocessGitGh
+
+            faulty_tag = str(payload.get("tag") or payload.get("faultyTag") or "").strip()
+            if not faulty_tag:
+                return {"ok": False, "error": "Release tag is required for rollback."}
+            rel_rec = self._store.get_release_verification(faulty_tag)
+            if rel_rec is None:
+                return {"ok": False, "error": f"Unknown release tag: {faulty_tag}"}
+            repo = str(payload.get("repo") or rel_rec.get("repo") or "").strip()
+            project_id = str(payload.get("projectId") or self._active_project_id or "")
+            proj = self._store.get_project(project_id) if project_id else None
+            if proj is None and repo:
+                proj = next((p for p in self._store.list_projects() if p.get("repo") == repo), None)
+            out_dir = Path(
+                str(payload.get("outputDir") or (proj.get("output_dir") if proj else "") or "dist")
+            )
+            local_repo = Path(str(proj["local_path"])) if proj and proj.get("local_path") else None
+            open_revert_pr = bool(payload.get("openRevertPr", False))
+
+            vcs = getattr(self._engine, "vcs", None) or SubprocessGitGh()
+            rel_mgr = getattr(self._engine, "release_mgr", None) or ReleaseManager(vcs)
+            res = rel_mgr.rollback_release(
+                store=self._store,
+                repo=repo,
+                faulty_tag=faulty_tag,
+                output_dir=out_dir,
+                open_revert_pr=open_revert_pr,
+                local_repo=local_repo,
+            )
+            if not res.ok:
+                return {"ok": False, "error": res.detail}
+            self._events.emit(
+                Event(
+                    kind="release.rolled_back",
+                    plain_text=res.detail,
+                    level="warn",
+                )
+            )
+            return {"ok": True, "data": asdict(res)}
 
         handler = self._registry.resolve(method)
         if handler is None:

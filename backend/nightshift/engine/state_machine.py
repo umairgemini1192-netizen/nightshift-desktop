@@ -34,7 +34,7 @@ from nightshift.engine.pipeline_evidence import (
 )
 from nightshift.engine.pipeline_orchestrator import LeaseHeartbeat, TaskOrchestrator, is_process_alive
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
-from nightshift.engine.release import ReleaseManager
+from nightshift.engine.release import ReleaseManager, SmokeRunnerFn
 from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient, SubprocessGitGh
 from nightshift.engine.verify import assess_diff_risk, check_diff_guards, redact_secrets, verify_deliverable
@@ -88,6 +88,8 @@ class ProjectConfig:
     min_build_duration_seconds: float = DEFAULT_MIN_BUILD_DURATION_S
     screenshot_manifest_path: str = ""
     screenshot_job_name: str = ""
+    smoke_command: str = ""
+    smoke_timeout_seconds: int = 120
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProjectConfig:
@@ -157,6 +159,8 @@ class ProjectConfig:
             min_build_duration_seconds=min_build,
             screenshot_manifest_path=str(data.get("screenshot_manifest_path") or ""),
             screenshot_job_name=str(data.get("screenshot_job_name") or ""),
+            smoke_command=str(data.get("smoke_command") or ""),
+            smoke_timeout_seconds=int(data.get("smoke_timeout_seconds") or 120),
         )
 
 

@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from nightshift.engine.pipeline_contracts import provider_for_engine
+from nightshift.engine.pipeline_contracts import canonical_contract_json, provider_for_engine
+from nightshift.engine.pipeline_review import (
+    ValidatedReviewResult,
+    build_isolated_review_prompt,
+    classify_task_risk,
+    parse_and_validate_review_output,
+    select_independent_reviewer,
+    tier_for_engine,
+)
 from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient
 from nightshift.engine.verify import RiskAssessment
@@ -20,6 +29,9 @@ class ReviewFinding:
     priority: str  # "P1" or "P2"
     message: str
     file_path: str | None = None
+    line: int | None = None
+    kind: str = "defect"
+    acceptance_criteria_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,7 +47,11 @@ class CiWatchResult:
     ci_jobs: list[Any] = field(default_factory=list)
     reviewer_engine: str = ""
     reviewer_provider: str = ""
+    reviewer_tier: str = ""
     contributing_engines: list[str] = field(default_factory=list)
+    effective_risk_class: str = ""
+    block_reason: str = ""
+    review_result: ValidatedReviewResult | None = None
 
 
 def parse_review_findings(text: str) -> list[ReviewFinding]:
@@ -69,19 +85,40 @@ class CiPipelineManager:
         self.scheduler = scheduler
         self.runners = runners
 
-    def select_reviewer(self, implementer_engine: str) -> tuple[str, Runner] | tuple[None, None]:
-        """Select independent reviewer per BLUEPRINT 5d.
+    def select_reviewer(
+        self,
+        implementer_engine: str,
+        *,
+        contributing_providers: set[str] | None = None,
+        risk_class: str = "business_logic",
+        graduated_economy_engines: set[str] | None = None,
+    ) -> tuple[str, Runner] | tuple[None, None]:
+        """Select an independent cross-provider reviewer (AGENT_PIPELINE §§2, 6.1, 9.2).
 
-        Order: Codex first -> Gemini CLI -> Economy engines (agy).
-        Must be a different engine from the implementer when possible.
+        Excludes ALL ``contributing_providers`` (coders, fixers, handoffs; ``agy`` and
+        ``gemini`` both map to ``google``). NEVER falls back to self-review.
         """
-        candidates = ["codex", "gemini", "agy"]
-        # Filter out the engine that just implemented if another is available
-        preferred_candidates = [c for c in candidates if c != implementer_engine] + [implementer_engine]
+        excluded = {provider_for_engine(p) for p in (contributing_providers or set()) if p}
+        if implementer_engine:
+            imp_prov = provider_for_engine(implementer_engine)
+            if imp_prov:
+                excluded.add(imp_prov)
 
-        for cand in preferred_candidates:
-            if cand in self.runners and self.scheduler.is_engine_available(cand):
-                return cand, self.runners[cand]
+        engine_tiers = {
+            str(e.get("id") or ""): str(e.get("cost_tier") or "")
+            for e in self.store.list_engines()
+            if e.get("id")
+        }
+        chosen, runner, _reason = select_independent_reviewer(
+            contributing_providers=excluded,
+            risk_class=risk_class,
+            runners=self.runners,
+            is_available=self.scheduler.is_engine_available,
+            engine_tiers=engine_tiers,
+            graduated_economy_engines=graduated_economy_engines,
+        )
+        if chosen and runner:
+            return chosen, runner
         return None, None
 
     async def watch_and_heal(
@@ -99,12 +136,26 @@ class CiPipelineManager:
         max_retries: int = 4,
         guardrail_header: str = "",
         on_status_change: Callable[[str], None] | None = None,
+        task_contract: dict[str, Any] | None = None,
+        contributing_providers: set[str] | None = None,
+        risk_class: str | None = None,
+        critical_paths: list[str] | None = None,
+        max_review_fix_rounds: int = 2,
+        require_independent_reviewer: bool = True,
     ) -> CiWatchResult:
         """Watch CI checks and auto-fix failures up to max_retries with engine rotation."""
         active_engine = initial_engine
         engine_failure_count = 0
         flaky_detected = False
+        review_fix_rounds_used = 0
         contributing_engines: list[str] = []
+        all_contributing_providers: set[str] = {
+            provider_for_engine(p) for p in (contributing_providers or set()) if p
+        }
+        if initial_engine and initial_engine not in ("unknown", "none"):
+            init_prov = provider_for_engine(initial_engine)
+            if init_prov:
+                all_contributing_providers.add(init_prov)
 
         for round_num in range(max_retries + 1):
             if on_status_change:
@@ -127,65 +178,276 @@ class CiPipelineManager:
                     ci_msg = "Passed on re-run without code change (flaky test)"
 
             if passed:
-                # CI is green! Now run Risk-based review loop (BLUEPRINT 5d)
+                # CI is green! Now run Risk-based independent review (AGENT_PIPELINE §§6.1, 9.2)
                 review_findings: list[ReviewFinding] = []
                 verified_reviewer_engine = ""
                 verified_reviewer_provider = ""
-                rev_engine_name, reviewer = self.select_reviewer(active_engine)
-                if reviewer and rev_engine_name:
-                    if on_status_change:
-                        on_status_change(f"REVIEWING ({rev_engine_name})")
-                    diff_text = self.vcs.get_diff(worktree_dir)
-                    review_prompt = (
-                        f"Perform an independent code review of this PR branch `{branch}`.\n"
-                        f"Check for bugs, crash hazards, accessibility issues (<48dp), and security flaws.\n"
-                        f"Mark any blocking issues with [P1] and non-blocking nits with [P2].\n"
-                        f"Diff:\n```\n{diff_text[-3000:]}\n```"
+                verified_reviewer_tier = ""
+                validated_review: ValidatedReviewResult | None = None
+                effective_risk_class = str(risk_class or (task_contract or {}).get("risk_class") or "business_logic")
+
+                diff_text = self.vcs.get_diff(worktree_dir)
+
+                if task_contract is not None:
+                    diff_entries = self.vcs.list_changed_entries(worktree_dir)
+                    raw_factors = task_contract.get("risk_factors_json")
+                    try:
+                        risk_factors = json.loads(str(raw_factors)) if raw_factors else None
+                    except Exception:
+                        risk_factors = None
+                    classification = classify_task_risk(
+                        diff_entries,
+                        diff_text,
+                        base_risk_class=effective_risk_class,
+                        risk_factors=risk_factors,
+                        critical_paths=critical_paths,
                     )
-                    rev_res = await reviewer.run(review_prompt, worktree_dir, effort="low", timeout_seconds=900)
-                    review_findings = parse_review_findings(f"{rev_res.stdout}\n{rev_res.stderr}")
-                    p1_findings = [f for f in review_findings if f.priority == "P1"]
+                    effective_risk_class = classification.risk_class
 
-                    # P1 gate: any open P1 blocks merge -> trigger one fix round
-                    if p1_findings and round_num >= max_retries:
-                        return CiWatchResult(
-                            passed=False, rounds_used=round_num,
-                            detail="Unresolved P1 review findings: " + "; ".join(f.message for f in p1_findings),
-                            last_engine=active_engine, review_findings=review_findings,
-                            contributing_engines=list(contributing_engines),
+                    if require_independent_reviewer and classification.requires_independent_review:
+                        rev_engine_name, reviewer = self.select_reviewer(
+                            active_engine,
+                            contributing_providers=all_contributing_providers,
+                            risk_class=effective_risk_class,
                         )
-                    if p1_findings and round_num < max_retries:
+                        if not reviewer or not rev_engine_name:
+                            return CiWatchResult(
+                                passed=False,
+                                rounds_used=round_num,
+                                detail=(
+                                    f"No independent reviewer available for risk class '{effective_risk_class}' "
+                                    f"outside contributing providers {sorted(all_contributing_providers)}."
+                                ),
+                                last_engine=active_engine,
+                                checked_sha=checked_sha,
+                                expected_base_sha=expected_base_sha,
+                                contributing_engines=list(contributing_engines),
+                                effective_risk_class=effective_risk_class,
+                                block_reason="no_independent_reviewer",
+                            )
+
                         if on_status_change:
-                            on_status_change("FIXING_REVIEW_P1")
-                        findings_text = "\n".join(f"- {f.message}" for f in p1_findings)
-                        fix_review_prompt = (
-                            f"{guardrail_header}\n\nIndependent reviewer ({rev_engine_name}) found blocking [P1] issues:\n"
-                            f"{findings_text}\n\nFix all P1 issues, commit, and push to `{branch}`."
+                            on_status_change(f"REVIEWING ({rev_engine_name})")
+
+                        rev_provider = provider_for_engine(rev_engine_name)
+                        rev_tier = tier_for_engine(rev_engine_name)
+                        contract_json = str(
+                            task_contract.get("canonical_json")
+                            or canonical_contract_json(task_contract)
                         )
-                        prompt_path = worktree_dir / ".nightshift_prompt.md"
-                        prompt_path.write_text(fix_review_prompt, encoding="utf-8")
 
-                        if not self.scheduler.has_run_budget_remaining():
-                            return CiWatchResult(passed=False, rounds_used=round_num, detail="Runaway protection: max AI invocations per run reached during review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
-                        choice = self.scheduler.select_engine(phase_id=phase_id, step_kind="fix_ci", current_engine=active_engine)
-                        if not choice:
-                            return CiWatchResult(passed=False, rounds_used=round_num, detail="No engine available for review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
-                        active_engine = choice.engine
-                        runner_obj = self.runners.get(active_engine) or self.runners.get(active_engine.split("-")[0])
-                        if not runner_obj:
-                            return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected review fixer {active_engine} is unavailable.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
-                        self.scheduler.record_invocation()
-                        self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
-                        timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
-                        if active_engine not in contributing_engines:
-                            contributing_engines.append(active_engine)
-                        await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
-                        # Re-verify CI after review fix
-                        continue
+                        # Strict input isolation: raw diff + frozen contract ONLY (no PR narrative)
+                        review_prompt = build_isolated_review_prompt(
+                            contract_canonical_json=contract_json,
+                            raw_diff=diff_text,
+                            head_sha=checked_sha,
+                        )
+                        rev_res = await reviewer.run(review_prompt, worktree_dir, effort="low", timeout_seconds=900)
+                        validated = parse_and_validate_review_output(
+                            rev_res.stdout or "",
+                            worktree_dir=worktree_dir,
+                            contract=task_contract,
+                            reviewer_engine=rev_engine_name,
+                            reviewer_provider=rev_provider,
+                            reviewer_tier=rev_tier,
+                        )
+                        # Retry ONCE with schema/citation errors if invalid (AGENT_PIPELINE §9.2)
+                        if (rev_res.rc != 0 or rev_res.timed_out or not validated.valid) and not rev_res.timed_out:
+                            retry_errors = validated.errors or [f"Reviewer exited with rc={rev_res.rc}"]
+                            retry_prompt = build_isolated_review_prompt(
+                                contract_canonical_json=contract_json,
+                                raw_diff=diff_text,
+                                head_sha=checked_sha,
+                                retry_validation_errors=retry_errors,
+                            )
+                            rev_res = await reviewer.run(retry_prompt, worktree_dir, effort="low", timeout_seconds=900)
+                            validated = parse_and_validate_review_output(
+                                rev_res.stdout or "",
+                                worktree_dir=worktree_dir,
+                                contract=task_contract,
+                                reviewer_engine=rev_engine_name,
+                                reviewer_provider=rev_provider,
+                                reviewer_tier=rev_tier,
+                            )
 
-                    if rev_res.rc == 0 and not rev_res.timed_out and not p1_findings:
+                        if rev_res.rc != 0 or rev_res.timed_out or not validated.valid:
+                            err_detail = "; ".join(validated.errors) if validated.errors else f"rc={rev_res.rc}"
+                            return CiWatchResult(
+                                passed=False,
+                                rounds_used=round_num,
+                                detail=f"Independent review output invalid: {err_detail}",
+                                last_engine=active_engine,
+                                checked_sha=checked_sha,
+                                expected_base_sha=expected_base_sha,
+                                reviewer_engine=rev_engine_name,
+                                reviewer_provider=rev_provider,
+                                reviewer_tier=rev_tier,
+                                contributing_engines=list(contributing_engines),
+                                effective_risk_class=effective_risk_class,
+                                block_reason="invalid_review_output",
+                                review_result=validated,
+                            )
+
+                        validated_review = validated
+                        review_findings = [
+                            ReviewFinding(
+                                priority=f.priority,
+                                message=f.message,
+                                file_path=f.file,
+                                line=f.line,
+                                kind=f.kind,
+                                acceptance_criteria_id=f.acceptance_criteria_id,
+                            )
+                            for f in validated.findings
+                        ]
+                        p1_findings = [f for f in review_findings if f.priority == "P1"]
+
+                        if p1_findings or validated.verdict == "CHANGES":
+                            if review_fix_rounds_used >= max_review_fix_rounds or round_num >= max_retries:
+                                return CiWatchResult(
+                                    passed=False,
+                                    rounds_used=round_num,
+                                    detail="Unresolved P1 review findings: " + "; ".join(f.message for f in p1_findings),
+                                    last_engine=active_engine,
+                                    review_findings=review_findings,
+                                    checked_sha=checked_sha,
+                                    expected_base_sha=expected_base_sha,
+                                    reviewer_engine=rev_engine_name,
+                                    reviewer_provider=rev_provider,
+                                    reviewer_tier=rev_tier,
+                                    contributing_engines=list(contributing_engines),
+                                    effective_risk_class=effective_risk_class,
+                                    block_reason="unresolved_p1_findings",
+                                    review_result=validated,
+                                )
+
+                            review_fix_rounds_used += 1
+                            if on_status_change:
+                                on_status_change("FIXING_REVIEW_P1")
+                            findings_text = "\n".join(
+                                f"- [{f.priority}] {f.file_path or ''}:{f.line or ''} {f.message}"
+                                for f in (p1_findings or review_findings)
+                            )
+                            fix_review_prompt = (
+                                f"{guardrail_header}\n\nIndependent reviewer ({rev_engine_name}) found blocking [P1] issues:\n"
+                                f"{findings_text}\n\nFix all P1 issues, commit, and push to `{branch}`."
+                            )
+                            prompt_path = worktree_dir / ".nightshift_prompt.md"
+                            prompt_path.write_text(fix_review_prompt, encoding="utf-8")
+
+                            if not self.scheduler.has_run_budget_remaining():
+                                return CiWatchResult(
+                                    passed=False,
+                                    rounds_used=round_num,
+                                    detail="Runaway protection: max AI invocations per run reached during review fix.",
+                                    last_engine=active_engine,
+                                    review_findings=review_findings,
+                                    contributing_engines=list(contributing_engines),
+                                    effective_risk_class=effective_risk_class,
+                                    block_reason="budget_exhausted",
+                                )
+                            choice = self.scheduler.select_engine(phase_id=phase_id, step_kind="fix_ci", current_engine=active_engine)
+                            if not choice:
+                                return CiWatchResult(
+                                    passed=False,
+                                    rounds_used=round_num,
+                                    detail="No engine available for review fix.",
+                                    last_engine=active_engine,
+                                    review_findings=review_findings,
+                                    contributing_engines=list(contributing_engines),
+                                    effective_risk_class=effective_risk_class,
+                                    block_reason="no_fixer_available",
+                                )
+                            active_engine = choice.engine
+                            runner_obj = self.runners.get(active_engine) or self.runners.get(active_engine.split("-")[0])
+                            if not runner_obj:
+                                return CiWatchResult(
+                                    passed=False,
+                                    rounds_used=round_num,
+                                    detail=f"Selected review fixer {active_engine} is unavailable.",
+                                    last_engine=active_engine,
+                                    review_findings=review_findings,
+                                    contributing_engines=list(contributing_engines),
+                                    effective_risk_class=effective_risk_class,
+                                    block_reason="no_fixer_available",
+                                )
+                            self.scheduler.record_invocation()
+                            self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
+                            timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
+                            if active_engine not in contributing_engines:
+                                contributing_engines.append(active_engine)
+                            fix_prov = provider_for_engine(active_engine)
+                            if fix_prov:
+                                all_contributing_providers.add(fix_prov)
+                            await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
+                            continue
+
                         verified_reviewer_engine = rev_engine_name
-                        verified_reviewer_provider = provider_for_engine(rev_engine_name)
+                        verified_reviewer_provider = rev_provider
+                        verified_reviewer_tier = rev_tier
+                else:
+                    # Legacy non-contract review mode (still enforces provider independence, no self-fallback)
+                    rev_engine_name, reviewer = self.select_reviewer(
+                        active_engine,
+                        contributing_providers=all_contributing_providers,
+                    )
+                    if reviewer and rev_engine_name:
+                        if on_status_change:
+                            on_status_change(f"REVIEWING ({rev_engine_name})")
+                        review_prompt = (
+                            f"Perform an independent code review of this PR branch `{branch}`.\n"
+                            f"Check for bugs, crash hazards, accessibility issues (<48dp), and security flaws.\n"
+                            f"Mark any blocking issues with [P1] and non-blocking nits with [P2].\n"
+                            f"Diff:\n```\n{diff_text[-3000:]}\n```"
+                        )
+                        rev_res = await reviewer.run(review_prompt, worktree_dir, effort="low", timeout_seconds=900)
+                        review_findings = parse_review_findings(f"{rev_res.stdout}\n{rev_res.stderr}")
+                        p1_findings = [f for f in review_findings if f.priority == "P1"]
+
+                        # P1 gate: any open P1 blocks merge -> trigger one fix round
+                        if p1_findings and round_num >= max_retries:
+                            return CiWatchResult(
+                                passed=False, rounds_used=round_num,
+                                detail="Unresolved P1 review findings: " + "; ".join(f.message for f in p1_findings),
+                                last_engine=active_engine, review_findings=review_findings,
+                                contributing_engines=list(contributing_engines),
+                            )
+                        if p1_findings and round_num < max_retries:
+                            if on_status_change:
+                                on_status_change("FIXING_REVIEW_P1")
+                            findings_text = "\n".join(f"- {f.message}" for f in p1_findings)
+                            fix_review_prompt = (
+                                f"{guardrail_header}\n\nIndependent reviewer ({rev_engine_name}) found blocking [P1] issues:\n"
+                                f"{findings_text}\n\nFix all P1 issues, commit, and push to `{branch}`."
+                            )
+                            prompt_path = worktree_dir / ".nightshift_prompt.md"
+                            prompt_path.write_text(fix_review_prompt, encoding="utf-8")
+
+                            if not self.scheduler.has_run_budget_remaining():
+                                return CiWatchResult(passed=False, rounds_used=round_num, detail="Runaway protection: max AI invocations per run reached during review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
+                            choice = self.scheduler.select_engine(phase_id=phase_id, step_kind="fix_ci", current_engine=active_engine)
+                            if not choice:
+                                return CiWatchResult(passed=False, rounds_used=round_num, detail="No engine available for review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
+                            active_engine = choice.engine
+                            runner_obj = self.runners.get(active_engine) or self.runners.get(active_engine.split("-")[0])
+                            if not runner_obj:
+                                return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected review fixer {active_engine} is unavailable.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
+                            self.scheduler.record_invocation()
+                            self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
+                            timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
+                            if active_engine not in contributing_engines:
+                                contributing_engines.append(active_engine)
+                            fix_prov = provider_for_engine(active_engine)
+                            if fix_prov:
+                                all_contributing_providers.add(fix_prov)
+                            await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
+                            # Re-verify CI after review fix
+                            continue
+
+                        if rev_res.rc == 0 and not rev_res.timed_out and not p1_findings:
+                            verified_reviewer_engine = rev_engine_name
+                            verified_reviewer_provider = provider_for_engine(rev_engine_name)
+                            verified_reviewer_tier = tier_for_engine(rev_engine_name)
 
                 pr_snap = self.vcs.find_open_pr(repo, branch)
                 if not checked_sha or not pr_snap or str(pr_snap.get("headRefOid") or "") != checked_sha:
@@ -203,7 +465,10 @@ class CiPipelineManager:
                     ci_jobs=ci_jobs,
                     reviewer_engine=verified_reviewer_engine,
                     reviewer_provider=verified_reviewer_provider,
+                    reviewer_tier=verified_reviewer_tier,
                     contributing_engines=list(contributing_engines),
+                    effective_risk_class=effective_risk_class,
+                    review_result=validated_review,
                 )
 
             # CI failed: check if retries exhausted
@@ -288,6 +553,9 @@ class CiPipelineManager:
             self.scheduler.record_invocation()
             if active_engine not in contributing_engines:
                 contributing_engines.append(active_engine)
+            fix_prov = provider_for_engine(active_engine)
+            if fix_prov:
+                all_contributing_providers.add(fix_prov)
             fix_timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 2400)
             await runner.run(
                 f"Read and fix the CI failure in .nightshift_prompt.md, commit, and push to {branch}.",
