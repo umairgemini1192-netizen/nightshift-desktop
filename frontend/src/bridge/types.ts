@@ -9,6 +9,7 @@ export type ScenarioName =
   | "handoff"
   | "ci-healing"
   | "finished"
+  | "governance"
   | "council-drafting"
   | "council-critique"
   | "council-final-ready"
