@@ -128,6 +128,7 @@ class Scheduler:
         max_run_hours: float = 12.0,
         aggressive_switchback: bool = False,
         router: Router | None = None,
+        runners: dict[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.quota_ledger = quota_ledger
@@ -137,7 +138,9 @@ class Scheduler:
         self.max_run_invocations = max_run_invocations
         self.max_run_hours = max_run_hours
         self.aggressive_switchback = aggressive_switchback
-        self.router = router if router is not None else Router(store, quota_ledger, login_checker)
+        self.router = router if router is not None else Router(store, quota_ledger, login_checker, runners=runners)
+        if router is not None and runners:
+            self.router.register_runners(runners)
 
         self.same_error_detector = SameErrorDetector()
         self.circuit_breaker = CircuitBreaker()
@@ -228,13 +231,20 @@ class Scheduler:
         step_kind: str = "implement",
         current_engine: str | None = None,
         exclude_engines: set[str] | None = None,
+        *,
+        task_id: str | None = None,
+        risk_class: str | None = None,
+        role: str | None = None,
+        contributing_providers: set[str] | None = None,
+        allowed_engines: set[str] | None = None,
+        enforce_pipeline_safeguards: bool = False,
     ) -> EngineChoice | None:
-        """Select the next engine according to BLUEPRINT 5a, 5c, and 5h.
+        """Select the next engine according to BLUEPRINT 5a, 5c, 5h, and AGENT_PIPELINE §6.2.
 
-        Hierarchy:
-          1. Explicit phase assignment (owner override > plan implementer) with fast switch-back
-          2. When unassigned ("Auto"): Smart quota-aware Router (5a/5h Economy-first)
-          3. Global fallback priority list (skipping unavailable/cooling engines)
+        When ``enforce_pipeline_safeguards`` is True (or ``task_id`` is provided), all
+        hard pipeline routing safeguards (free_only_mode, hard budgets, high_risk/governance
+        strong-tier rule, Economy benchmark graduation, provider independence) are enforced
+        via ``Router.route_pipeline_task`` BEFORE owner overrides or fallback selection.
         """
         excluded = set(exclude_engines or set())
         assignment = self.store.get_phase_assignment(phase_id)
@@ -246,6 +256,57 @@ class Scheduler:
             )
         )
         preferred_engine, pref_model, pref_effort = self.get_preferred_engine(phase_id)
+
+        if (enforce_pipeline_safeguards or task_id is not None) and self.router is not None:
+            resolved_role = role or (
+                "coder" if step_kind == "implement" else ("fixer" if step_kind == "fix_ci" else step_kind)
+            )
+            resolved_risk = risk_class
+            if not resolved_risk and task_id:
+                task_row = self.store.get_task(task_id)
+                if task_row:
+                    resolved_risk = str(task_row.get("risk_class") or "business_logic")
+            resolved_risk = resolved_risk or "business_logic"
+            effective_excluded = set(excluded)
+            for eng_row in self.store.list_engines():
+                e_id = str(eng_row.get("id") or "")
+                e_runner = str(eng_row.get("runner") or "")
+                e_model = str(eng_row.get("model") or "")
+                if (e_id and not self.is_engine_available(e_id, e_model)) or (
+                    e_runner and not self.is_engine_available(e_runner, e_model)
+                ):
+                    if e_id:
+                        effective_excluded.add(e_id)
+                    if e_runner:
+                        effective_excluded.add(e_runner)
+            owner_override = (
+                preferred_engine if has_explicit_assignment and preferred_engine not in effective_excluded else None
+            )
+            dec = self.router.route_pipeline_task(
+                role=resolved_role,
+                risk_class=resolved_risk,
+                contributing_providers=contributing_providers,
+                owner_override=owner_override,
+                task_id=task_id,
+                allowed_engines=allowed_engines,
+                exclude_engines=effective_excluded,
+            )
+            if dec.blocked or not dec.chosen_id:
+                return None
+            effective_engine = dec.runner if dec.runner in ("agy", "gemini", "codex", "claude", "qwen") else dec.chosen_id
+            is_sb = bool(
+                current_engine
+                and current_engine != effective_engine
+                and has_explicit_assignment
+                and (preferred_engine == effective_engine or preferred_engine == dec.chosen_id)
+            )
+            return EngineChoice(
+                engine=effective_engine,
+                model=dec.model or pref_model,
+                effort=dec.effort or pref_effort,
+                reason=dec.reason,
+                is_switchback=is_sb,
+            )
 
         # 1. Fast switch-back & explicit assignment check (BLUEPRINT 5c)
         if preferred_engine not in excluded and self.is_engine_available(preferred_engine, pref_model):

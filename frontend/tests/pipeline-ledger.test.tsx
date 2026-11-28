@@ -108,6 +108,7 @@ describe("Pipeline Ledger & Scores module (Phase 8f)", () => {
 
     expect(screen.getByText(/Pipeline stage maturity \(Amendment J\)/i)).toBeInTheDocument();
     expect(screen.getByText(/Monthly budget/i)).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: /Monthly budget/i })).toHaveAttribute("aria-valuemax", "100");
     expect(screen.getByText("v1.0.0-preview.2")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: /^Roll back$/i }));

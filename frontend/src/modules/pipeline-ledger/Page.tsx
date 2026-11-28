@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   Badge,
   type BadgeTone,
+  BudgetMeter,
   Button,
   ConfirmDialog,
   EmptyState,
@@ -621,28 +622,11 @@ export default function PipelineLedgerPage() {
                   <div className="flex flex-col gap-5">
                     {/* Monthly budget bar */}
                     {summary && (
-                      <div className="rounded-lg border border-border-subtle bg-surface-raised p-4 flex flex-col gap-2">
-                        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                          <span className="font-medium text-text-primary">
-                            Monthly budget ({summary.monthlyBudget.monthLabel})
-                          </span>
-                          <span className="font-mono text-text-secondary ns-tabular">
-                            ~${summary.monthlyBudget.spentUsdEst.toFixed(2)} / ${summary.monthlyBudget.capUsdEst.toFixed(2)} (estimate)
-                          </span>
-                        </div>
-                        <div className="h-2 w-full rounded-pill bg-bg-base overflow-hidden border border-border-subtle">
-                          <div
-                            className={`h-full rounded-pill ${
-                              monthlyPct >= 90
-                                ? "bg-status-danger"
-                                : monthlyPct >= 70
-                                  ? "bg-status-warning"
-                                  : "bg-accent-primary"
-                            }`}
-                            style={{ width: `${monthlyPct}%` }}
-                          />
-                        </div>
-                      </div>
+                      <BudgetMeter
+                        label={`Monthly budget (${summary.monthlyBudget.monthLabel})`}
+                        valueText={`~$${summary.monthlyBudget.spentUsdEst.toFixed(2)} / $${summary.monthlyBudget.capUsdEst.toFixed(2)} (estimate)`}
+                        percent={monthlyPct}
+                      />
                     )}
 
                     {/* Stage maturity matrix (Amendment J) */}

@@ -72,6 +72,22 @@ def _make_router(store: Store, events: EventBus | None = None) -> Router:
 
 def test_triage_output_strictly_bounded_and_structured(tmp_path: Path) -> None:
     store, _ = _make_store_with_task(tmp_path, task_id="t-triage-1")
+    # Graduate qwen for triage/business_logic so Economy routing allows it
+    store.upsert_model_score(
+        engine_id="qwen",
+        model="qwen-2.5-coder-32b",
+        role="triage",
+        risk_class="business_logic",
+        sample_tasks=10,
+        accepted_tasks=10,
+        total_attempts=10,
+        regression_count=0,
+        avg_retries=0.0,
+        avg_turnaround_min=0.5,
+        total_cost_usd_est=0.0,
+        cost_per_accepted_usd_est=0.0,
+        benchmark_graduated=True,
+    )
     triage_json = json.dumps(
         {
             "root_cause": "AssertionError in test_router expected 0.85 but got 0.75",
@@ -108,7 +124,8 @@ def test_triage_output_strictly_bounded_and_structured(tmp_path: Path) -> None:
 
     ledger_rows = store.list_pipeline_ledger(task_id="t-triage-1", role="triage")
     assert len(ledger_rows) == 1
-    assert ledger_rows[0]["outcome"] == "accepted"
+    # Successful triage output is recorded as attempt-level "ok", never task-level "accepted"
+    assert ledger_rows[0]["outcome"] == "ok"
 
 
 def test_triage_deterministic_fallback_and_secret_redaction() -> None:
@@ -387,12 +404,12 @@ def test_hard_budgets_stop_cleanly_across_all_three_scopes(tmp_path: Path) -> No
     store.set_setting("budget.maxNightUsdEst", "1.00")
     store.set_setting("budget.maxMonthUsdEst", "1.50")
 
-    # Exceed task token cap
+    # Exceed task token cap & accumulate paid API spend via claude
     econ.record_ledger_event(
         task_id="t-budget-1",
         role="coder",
-        engine_id="agy-gemini-4-neon",
-        model="gemini-4-neon",
+        engine_id="claude",
+        model="claude-3-7-sonnet",
         risk_class="business_logic",
         tokens_in=8000,
         tokens_out=3000,
@@ -400,18 +417,18 @@ def test_hard_budgets_stop_cleanly_across_all_three_scopes(tmp_path: Path) -> No
         outcome="retry",
         recompute=False,
     )
-    chk_task = econ.check_hard_budgets(task_id="t-budget-1", engine_id="agy-gemini-4-neon")
+    chk_task = econ.check_hard_budgets(task_id="t-budget-1", engine_id="claude", runner="claude", cost_tier="gold")
     assert not chk_task.allowed
     assert chk_task.scope == "task"
 
-    # Exceed night USD cap
-    chk_night = econ.check_hard_budgets(projected_usd_est=0.95)
+    # Exceed night paid USD cap
+    chk_night = econ.check_hard_budgets(engine_id="claude", runner="claude", cost_tier="gold", projected_usd_est=0.95)
     assert not chk_night.allowed
     assert chk_night.scope == "night"
 
-    # Raise night cap above month cap -> month cap stops cleanly
+    # Raise night cap above month cap -> month paid USD cap stops cleanly
     store.set_setting("budget.maxNightUsdEst", "5.00")
-    chk_month = econ.check_hard_budgets(projected_usd_est=1.45)
+    chk_month = econ.check_hard_budgets(engine_id="claude", runner="claude", cost_tier="gold", projected_usd_est=1.45)
     assert not chk_month.allowed
     assert chk_month.scope == "month"
 
@@ -471,3 +488,230 @@ def test_pipeline_ledger_bridge_overview_and_maturity_promotion(tmp_path: Path) 
     deck = generate_deck_data(store, project_id="proj-1")
     assert "budget_tonight" in deck
     assert "free-only mode" in deck["budget_tonight"]["displayLine"]
+
+
+# ---------------------------------------------------------------------------
+# 6. P1 Review Regression Tests (safeguards, triage eligibility, paid spend,
+#    attempt vs accepted separation, and production ledger wiring)
+# ---------------------------------------------------------------------------
+
+
+def test_triage_enforces_eligibility_on_every_candidate_and_falls_back_deterministically(tmp_path: Path) -> None:
+    store, _ = _make_store_with_task(tmp_path, task_id="t-triage-elig", risk_class="high_risk")
+    router = _make_router(store)
+    # Even if qwen is graduated for triage/high_risk, high_risk forbids Economy engines
+    store.upsert_model_score(
+        engine_id="qwen",
+        model="qwen-2.5-coder-32b",
+        role="triage",
+        risk_class="high_risk",
+        sample_tasks=12,
+        accepted_tasks=12,
+        total_attempts=12,
+        regression_count=0,
+        avg_retries=0.0,
+        avg_turnaround_min=0.5,
+        total_cost_usd_est=0.0,
+        cost_per_accepted_usd_est=0.0,
+        benchmark_graduated=True,
+    )
+    qwen = FakeRunner.success(name="qwen", stdout='{"root_cause":"x","file_line":"a.py:1","suggested_fix":"y"}')
+    gemini = FakeRunner.success(name="gemini", stdout="not json")
+    # Disable gemini so no eligible candidate can succeed
+    store.update_engine_enabled("gemini", False)
+
+    summary = asyncio.run(
+        run_triage_stage(
+            failing_log="FAILED app.py:12 AssertionError: boom",
+            workdir=tmp_path,
+            runners={"qwen": qwen, "gemini": gemini},
+            store=store,
+            router=router,
+            task_id="t-triage-elig",
+            risk_class="high_risk",
+        )
+    )
+    assert summary.used_fallback
+    assert not qwen.calls
+    assert not gemini.calls
+
+    # Also verify ungraduated qwen on business_logic without an explicit router is NEVER run
+    store2, _ = _make_store_with_task(tmp_path / "sub", task_id="t-triage-ungrad", risk_class="business_logic")
+    qwen2 = FakeRunner.success(name="qwen", stdout='{"root_cause":"x","file_line":"a.py:1","suggested_fix":"y"}')
+    summary2 = asyncio.run(
+        run_triage_stage(
+            failing_log="FAILED app.py:12 AssertionError: boom",
+            workdir=tmp_path,
+            runners={"qwen": qwen2},
+            store=store2,
+            task_id="t-triage-ungrad",
+            risk_class="business_logic",
+        )
+    )
+    assert summary2.used_fallback
+    assert not qwen2.calls
+
+
+def test_triage_success_does_not_count_as_accepted_change_or_promote_maturity(tmp_path: Path) -> None:
+    store = Store(tmp_path / "triage_maturity.db")
+    store.migrate()
+    store.create_project("proj-1", "NightShift", "owner/nightshift-desktop", str(tmp_path))
+    store.create_plan("plan-1", "proj-1", "Triage Maturity")
+    store.upsert_phase("p8f", "plan-1", "Triage Maturity", "feat/p8f")
+    router = _make_router(store)
+    econ = PipelineEconomics(store)
+
+    triage_json = json.dumps(
+        {
+            "root_cause": "AssertionError in test_foo",
+            "file_line": "backend/tests/test_foo.py:10",
+            "suggested_fix": "Fix assertion",
+        }
+    )
+    runners = {"gemini": FakeRunner.success(name="gemini", stdout=triage_json)}
+
+    for i in range(1, 6):
+        tid = f"queued-t{i}"
+        store.create_task_with_contract(task_id=tid, phase_id="p8f", plan_id="plan-1", title=tid, branch=f"feat/{tid}")
+        res = asyncio.run(
+            run_triage_stage(
+                failing_log="FAILED test_foo.py:10 AssertionError",
+                workdir=tmp_path,
+                runners=runners,
+                store=store,
+                router=router,
+                task_id=tid,
+                risk_class="business_logic",
+            )
+        )
+        assert not res.used_fallback
+
+    summary = econ.get_30d_summary(project_id="proj-1")
+    assert summary["acceptedChanges30d"] == 0
+    assert all(st["maturity"] == "Integration-tested" for st in econ.get_stage_maturity())
+
+
+def test_free_engine_cost_estimates_do_not_exhaust_free_only_paid_cap(tmp_path: Path) -> None:
+    store, _ = _make_store_with_task(tmp_path, task_id="t-free-cap")
+    econ = PipelineEconomics(store)
+    assert econ.is_free_only_mode() is True
+
+    # Record a Gemini triage invocation with positive estimated token cost + CI/storage
+    econ.record_ledger_event(
+        task_id="t-free-cap",
+        role="triage",
+        engine_id="gemini",
+        model="gemini-2.5-pro",
+        risk_class="business_logic",
+        tokens_in=20000,
+        tokens_out=5000,
+        ci_minutes=5.0,
+        artifact_mb=10.0,
+        wall_seconds=30.0,
+        outcome="ok",
+    )
+
+    tonight = econ.get_tonight_spend_summary()
+    assert tonight["paidSpentUsdEst"] == 0.0
+    assert tonight["economicCostUsdEst"] > 0.0
+    assert tonight["displayLine"] == "$0.00 / $0.00 (free-only mode)"
+
+    # Free engines (qwen, agy, gemini, codex) remain allowed across night and month scopes
+    for eng_id, runner, tier in (
+        ("qwen", "qwen", "economy"),
+        ("agy-gemini-4-neon", "agy", "standard"),
+        ("gemini", "gemini", "standard"),
+        ("codex", "codex", "standard"),
+    ):
+        chk = econ.check_hard_budgets(
+            task_id="t-free-cap",
+            role="coder",
+            engine_id=eng_id,
+            runner=runner,
+            cost_tier=tier,
+        )
+        assert chk.allowed, f"Free engine {eng_id} was wrongly blocked: {chk.reason}"
+
+    # Paid engine remains blocked under free-only mode
+    chk_paid = econ.check_hard_budgets(task_id="t-free-cap", role="coder", engine_id="claude", runner="claude", cost_tier="gold")
+    assert not chk_paid.allowed
+
+
+def test_production_dispatch_boundaries_enforce_safeguards_and_record_economics(tmp_path: Path) -> None:
+    from nightshift.engine.scheduler import Scheduler
+
+    store, _ = _make_store_with_task(tmp_path, task_id="t-disp-1", risk_class="business_logic")
+    quota = QuotaLedger(store)
+    runners = {
+        "claude": FakeRunner.success(name="claude"),
+        "qwen": FakeRunner.success(name="qwen"),
+        "agy": FakeRunner.success(name="agy"),
+    }
+    sched = Scheduler(store, quota, runners=runners)
+
+    # Owner override to paid claude MUST be blocked under default free_only_mode
+    store.set_phase_assignment("p8f", override_engine="claude")
+    choice_paid = sched.select_engine(
+        phase_id="p8f",
+        step_kind="implement",
+        task_id="t-disp-1",
+        risk_class="business_logic",
+        role="coder",
+        allowed_engines=set(runners.keys()),
+        enforce_pipeline_safeguards=True,
+    )
+    assert choice_paid is None
+
+    # Owner override to ungraduated Economy qwen MUST be blocked
+    store.set_phase_assignment("p8f", override_engine="qwen")
+    choice_ungrad = sched.select_engine(
+        phase_id="p8f",
+        step_kind="implement",
+        task_id="t-disp-1",
+        risk_class="business_logic",
+        role="coder",
+        allowed_engines=set(runners.keys()),
+        enforce_pipeline_safeguards=True,
+    )
+    assert choice_ungrad is None
+
+    # Auto assignment chooses eligible free Standard engine (agy)
+    store.set_phase_assignment("p8f", override_engine="auto")
+    choice_ok = sched.select_engine(
+        phase_id="p8f",
+        step_kind="implement",
+        task_id="t-disp-1",
+        risk_class="business_logic",
+        role="coder",
+        allowed_engines=set(runners.keys()),
+        enforce_pipeline_safeguards=True,
+    )
+    assert choice_ok is not None
+    assert choice_ok.engine == "agy"
+
+    # Terminal outcome propagation updates model_scores for attempt-level "ok" rows
+    econ = PipelineEconomics(store)
+    econ.record_ledger_event(
+        task_id="t-disp-1",
+        role="coder",
+        engine_id="agy",
+        model="gemini-4-neon",
+        risk_class="business_logic",
+        tokens_in=1000,
+        tokens_out=500,
+        wall_seconds=12.0,
+        outcome="ok",
+    )
+    assert econ.get_30d_summary()["acceptedChanges30d"] == 0
+    econ.record_task_terminal_outcome(task_id="t-disp-1", outcome="accepted", risk_class="business_logic", ci_minutes=1.5)
+    assert econ.get_30d_summary()["acceptedChanges30d"] == 1
+    score = store.get_model_score("agy", "gemini-4-neon", "coder", "business_logic")
+    assert score is not None
+    assert score["accepted_tasks"] == 1
+
+    # Reverted terminal outcome (e.g. rollback) flips task into regression_count
+    econ.record_task_terminal_outcome(task_id="t-disp-1", outcome="reverted", risk_class="business_logic")
+    score_rev = store.get_model_score("agy", "gemini-4-neon", "coder", "business_logic")
+    assert score_rev is not None
+    assert score_rev["accepted_tasks"] == 0
+    assert score_rev["regression_count"] == 1

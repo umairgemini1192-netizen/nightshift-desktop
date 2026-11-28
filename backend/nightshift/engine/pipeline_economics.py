@@ -116,6 +116,25 @@ def compute_entry_total_cost_usd_est(entry: dict[str, Any]) -> float:
     return round(token_cost + ci_cost + storage_cost, 6)
 
 
+def compute_entry_paid_api_cost_usd_est(entry: dict[str, Any], store: Store | None = None) -> float:
+    """Paid API USD spend for a single ``pipeline_ledger`` entry.
+
+    Free-only engines (Qwen, Antigravity, Gemini CLI, Codex CLI) and non-AI delivery rows
+    incur $0.00 paid API spend so their estimated economic cost / CI / storage never
+    exhausts the zero-paid-spend cap under ``free_only_mode``.
+    """
+    role = str(entry.get("role") or "").strip().lower()
+    engine_id = str(entry.get("engine_id") or "").strip()
+    if role == "delivery" or not engine_id or engine_id.lower() in ("pipeline", "fallback"):
+        return 0.0
+    eng_row = store.get_engine(engine_id) if store is not None else None
+    runner = str(eng_row.get("runner") or "") if eng_row else ""
+    cost_tier = str(eng_row.get("cost_tier") or "") if eng_row else ""
+    if is_free_only_engine(engine_id, runner=runner, cost_tier=cost_tier):
+        return 0.0
+    return round(max(0.0, float(entry.get("est_token_cost_usd") or 0.0)), 6)
+
+
 @dataclass(frozen=True)
 class BudgetCheckResult:
     """Result of checking per-task, per-night, and per-month hard budgets (AGENT_PIPELINE §7.1)."""
@@ -220,6 +239,67 @@ class PipelineEconomics:
             self.recompute_model_score(engine_id=engine_id, model=model, role=role, risk_class=risk_class)
         return row_id
 
+    def record_task_terminal_outcome(
+        self,
+        *,
+        task_id: str,
+        outcome: str,
+        risk_class: str = "business_logic",
+        ci_minutes: float = 0.0,
+        artifact_mb: float = 0.0,
+        wall_seconds: float = 0.0,
+        created_at: str | None = None,
+    ) -> int | None:
+        """Record a terminal task delivery outcome (``accepted`` or ``reverted``) and refresh scores.
+
+        Idempotent per ``(task_id, outcome)`` so crash recovery never double-counts deliveries.
+        """
+        norm_outcome = str(outcome or "").strip().lower()
+        if norm_outcome not in ("accepted", "reverted"):
+            raise ValueError(f"Unsupported terminal task outcome: {outcome!r}")
+
+        existing_rows = self.store.list_pipeline_ledger(task_id=task_id, limit=500)
+        already_recorded = any(
+            str(r.get("role") or "").lower() == "delivery"
+            and str(r.get("outcome") or "").lower() == norm_outcome
+            for r in existing_rows
+        )
+        row_id: int | None = None
+        if not already_recorded:
+            row_id = self.store.record_pipeline_ledger(
+                task_id=task_id,
+                attempt_id=None,
+                role="delivery",
+                engine_id="pipeline",
+                provider="pipeline",
+                model="delivery",
+                risk_class=risk_class,
+                tokens_in=0,
+                tokens_out=0,
+                est_token_cost_usd=0.0,
+                ci_minutes=ci_minutes,
+                artifact_mb=artifact_mb,
+                wall_seconds=wall_seconds,
+                outcome=norm_outcome,
+                is_estimate=True,
+                created_at=created_at,
+            )
+
+        # Recompute model_scores for every AI participant on this task
+        seen_keys: set[tuple[str, str, str, str]] = set()
+        for r in existing_rows:
+            r_role = str(r.get("role") or "").strip().lower()
+            r_eng = str(r.get("engine_id") or "").strip()
+            r_model = str(r.get("model") or "").strip()
+            r_risk = str(r.get("risk_class") or risk_class).strip().lower()
+            if not r_eng or r_role == "delivery" or r_eng.lower() in ("pipeline", "fallback"):
+                continue
+            key = (r_eng, r_model, r_role, r_risk)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                self.recompute_model_score(engine_id=r_eng, model=r_model, role=r_role, risk_class=r_risk)
+        return row_id
+
     def _incumbent_standard_cost(self, role: str, risk_class: str) -> float:
         """Return the lowest ``cost_per_accepted_usd_est`` among measured Standard engines for (role, risk_class)."""
         scores = self.store.list_model_scores(role=role, risk_class=risk_class)
@@ -273,8 +353,15 @@ class PipelineEconomics:
         for tid in tasks_order:
             t_rows = by_task[tid]
             outcomes = {str(x.get("outcome") or "").lower() for x in t_rows}
-            reverted = "reverted" in outcomes
-            accepted = ("accepted" in outcomes) and not reverted
+            task_all_rows = self.store.list_pipeline_ledger(task_id=tid, limit=500)
+            task_terminal_outcomes = {
+                str(x.get("outcome") or "").lower()
+                for x in task_all_rows
+                if str(x.get("outcome") or "").lower() in ("accepted", "reverted")
+            }
+            all_outcomes = outcomes | task_terminal_outcomes
+            reverted = "reverted" in all_outcomes
+            accepted = ("accepted" in all_outcomes) and not reverted
             if accepted:
                 accepted_tasks += 1
             if reverted:
@@ -399,30 +486,41 @@ class PipelineEconomics:
         return score_row, decision
 
     def get_monthly_spend_usd_est(self, *, now: datetime | None = None) -> float:
-        """Return total estimated USD spend in ``pipeline_ledger`` for the current UTC month."""
+        """Return total estimated economic USD cost in ``pipeline_ledger`` for the current UTC month."""
         ref = now or datetime.now(timezone.utc)
         month_start = ref.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
         rows = self.store.list_pipeline_ledger(since_iso=month_start, limit=10000)
         return round(sum(compute_entry_total_cost_usd_est(r) for r in rows), 6)
 
+    def get_monthly_paid_spend_usd_est(self, *, now: datetime | None = None) -> float:
+        """Return paid API USD spend in ``pipeline_ledger`` for the current UTC month."""
+        ref = now or datetime.now(timezone.utc)
+        month_start = ref.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+        rows = self.store.list_pipeline_ledger(since_iso=month_start, limit=10000)
+        return round(sum(compute_entry_paid_api_cost_usd_est(r, self.store) for r in rows), 6)
+
     def get_tonight_spend_summary(self, *, now: datetime | None = None) -> dict[str, Any]:
-        """Return tonight's estimated spend, invocations, and wall hours from ``pipeline_ledger``."""
+        """Return tonight's paid API spend, total economic estimate, invocations, and wall hours."""
         ref = now or datetime.now(timezone.utc)
         day_start = ref.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
         rows = self.store.list_pipeline_ledger(since_iso=day_start, limit=10000)
-        spent_usd = round(sum(compute_entry_total_cost_usd_est(r) for r in rows), 6)
-        wall_hours = round(sum(float(r.get("wall_seconds") or 0.0) for r in rows) / 3600.0, 4)
+        ai_rows = [r for r in rows if str(r.get("role") or "").lower() != "delivery"]
+        paid_spent_usd = round(sum(compute_entry_paid_api_cost_usd_est(r, self.store) for r in rows), 6)
+        economic_spent_usd = round(sum(compute_entry_total_cost_usd_est(r) for r in rows), 6)
+        wall_hours = round(sum(float(r.get("wall_seconds") or 0.0) for r in ai_rows) / 3600.0, 4)
         caps = self.get_budget_caps()
         free_only = self.is_free_only_mode()
         if free_only:
-            display_line = f"${spent_usd:.2f} / $0.00 (free-only mode)"
+            display_line = f"${paid_spent_usd:.2f} / $0.00 (free-only mode)"
         else:
-            display_line = f"~${spent_usd:.2f} / ${caps['max_night_usd_est']:.2f} tonight (estimate)"
+            display_line = f"~${paid_spent_usd:.2f} / ${caps['max_night_usd_est']:.2f} tonight (estimate)"
         return {
             "freeOnlyMode": free_only,
-            "spentUsdEst": spent_usd,
+            "spentUsdEst": paid_spent_usd,
+            "paidSpentUsdEst": paid_spent_usd,
+            "economicCostUsdEst": economic_spent_usd,
             "capUsdEst": caps["max_night_usd_est"],
-            "invocations": len(rows),
+            "invocations": len(ai_rows),
             "maxInvocations": int(caps["max_night_invocations"]),
             "wallHours": wall_hours,
             "maxHours": caps["max_night_hours"],
@@ -444,8 +542,10 @@ class PipelineEconomics:
         """Check all three nested hard budget caps (task, night, month) before launching an AI process."""
         free_only = self.is_free_only_mode()
         caps = self.get_budget_caps()
+        is_free_engine = bool(engine_id) and is_free_only_engine(engine_id, runner=runner, cost_tier=cost_tier)
+        effective_projected_paid_usd = 0.0 if is_free_engine else max(0.0, float(projected_usd_est))
 
-        if free_only and engine_id and not is_free_only_engine(engine_id, runner=runner, cost_tier=cost_tier):
+        if free_only and engine_id and not is_free_engine:
             return BudgetCheckResult(
                 allowed=False,
                 scope="month",
@@ -490,7 +590,7 @@ class PipelineEconomics:
 
                 task_rows = self.store.list_pipeline_ledger(task_id=task_id, limit=1000)
                 used_tokens = sum(int(r.get("tokens_in") or 0) + int(r.get("tokens_out") or 0) for r in task_rows)
-                used_usd = sum(compute_entry_total_cost_usd_est(r) for r in task_rows)
+                used_paid_usd = sum(compute_entry_paid_api_cost_usd_est(r, self.store) for r in task_rows)
                 used_wall_min = sum(float(r.get("wall_seconds") or 0.0) for r in task_rows) / 60.0
 
                 if max_tokens > 0 and used_tokens >= max_tokens:
@@ -499,11 +599,15 @@ class PipelineEconomics:
                         scope="task",
                         reason=f"Task {task_id} token budget exceeded ({used_tokens:,}/{max_tokens:,} tokens, estimate).",
                     )
-                if (used_usd + projected_usd_est) > max_usd + 1e-9 and (used_usd > 0.0 or projected_usd_est > 0.0):
+                if (
+                    not is_free_engine
+                    and (used_paid_usd + effective_projected_paid_usd) > max_usd + 1e-9
+                    and (used_paid_usd > 0.0 or effective_projected_paid_usd > 0.0)
+                ):
                     return BudgetCheckResult(
                         allowed=False,
                         scope="task",
-                        reason=f"Task {task_id} cost budget exceeded (${used_usd + projected_usd_est:.2f} / ${max_usd:.2f} estimate).",
+                        reason=f"Task {task_id} cost budget exceeded (${used_paid_usd + effective_projected_paid_usd:.2f} / ${max_usd:.2f} estimate).",
                     )
                 if max_wall_min > 0 and used_wall_min >= max_wall_min:
                     return BudgetCheckResult(
@@ -526,28 +630,32 @@ class PipelineEconomics:
                 scope="night",
                 reason=f"Nightly wall-clock cap reached ({tonight['wallHours']:.1f}/{tonight['maxHours']:.1f} hours).",
             )
-        if (tonight["spentUsdEst"] + projected_usd_est) > caps["max_night_usd_est"] + 1e-9 and (
-            tonight["spentUsdEst"] > 0.0 or projected_usd_est > 0.0
+        if (
+            not is_free_engine
+            and (tonight["paidSpentUsdEst"] + effective_projected_paid_usd) > caps["max_night_usd_est"] + 1e-9
+            and (tonight["paidSpentUsdEst"] > 0.0 or effective_projected_paid_usd > 0.0)
         ):
             return BudgetCheckResult(
                 allowed=False,
                 scope="night",
                 reason=(
-                    f"Nightly cost cap reached (${tonight['spentUsdEst'] + projected_usd_est:.2f} "
+                    f"Nightly cost cap reached (${tonight['paidSpentUsdEst'] + effective_projected_paid_usd:.2f} "
                     f"/ ${caps['max_night_usd_est']:.2f} estimate)."
                 ),
             )
 
         # 3. Per-month budget
-        monthly_usd = self.get_monthly_spend_usd_est(now=now)
-        if (monthly_usd + projected_usd_est) > caps["max_month_usd_est"] + 1e-9 and (
-            monthly_usd > 0.0 or projected_usd_est > 0.0
+        monthly_paid_usd = self.get_monthly_paid_spend_usd_est(now=now)
+        if (
+            not is_free_engine
+            and (monthly_paid_usd + effective_projected_paid_usd) > caps["max_month_usd_est"] + 1e-9
+            and (monthly_paid_usd > 0.0 or effective_projected_paid_usd > 0.0)
         ):
             return BudgetCheckResult(
                 allowed=False,
                 scope="month",
                 reason=(
-                    f"Monthly cost cap reached (${monthly_usd + projected_usd_est:.2f} "
+                    f"Monthly cost cap reached (${monthly_paid_usd + effective_projected_paid_usd:.2f} "
                     f"/ ${caps['max_month_usd_est']:.2f} estimate). Paid engines locked until next UTC month."
                 ),
             )
@@ -625,7 +733,8 @@ class PipelineEconomics:
         regression_rate_pct = round((reverted_tasks / reg_denom) * 100.0, 1) if reg_denom > 0 else 0.0
 
         caps = self.get_budget_caps()
-        monthly_usd = self.get_monthly_spend_usd_est(now=ref)
+        monthly_paid_usd = self.get_monthly_paid_spend_usd_est(now=ref)
+        monthly_economic_usd = self.get_monthly_spend_usd_est(now=ref)
         tonight = self.get_tonight_spend_summary(now=ref)
 
         return {
@@ -635,7 +744,8 @@ class PipelineEconomics:
             "goldSavedTasks": gold_saved_tasks,
             "freeOnlyMode": self.is_free_only_mode(),
             "monthlyBudget": {
-                "spentUsdEst": monthly_usd,
+                "spentUsdEst": monthly_paid_usd,
+                "economicCostUsdEst": monthly_economic_usd,
                 "capUsdEst": caps["max_month_usd_est"],
                 "monthLabel": ref.strftime("%Y-%m UTC"),
                 "isEstimate": True,
