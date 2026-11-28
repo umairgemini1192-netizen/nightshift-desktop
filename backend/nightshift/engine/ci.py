@@ -265,7 +265,15 @@ class CiPipelineManager:
                             on_status_change(f"REVIEWING ({rev_engine_name})")
 
                         rev_provider = provider_for_engine(rev_engine_name)
-                        rev_tier = tier_for_engine(rev_engine_name)
+                        engine_tiers_lookup = {
+                            str(e.get("id") or ""): str(e.get("cost_tier") or "")
+                            for e in self.store.list_engines()
+                            if e.get("id")
+                        }
+                        rev_tier = tier_for_engine(
+                            rev_engine_name,
+                            explicit_tier=engine_tiers_lookup.get(rev_engine_name) or None,
+                        )
                         contract_json = str(
                             task_contract.get("canonical_json")
                             or canonical_contract_json(task_contract)

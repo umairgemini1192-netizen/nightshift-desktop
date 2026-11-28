@@ -487,12 +487,12 @@ class ReleaseManager:
         4. Optionally open a revert PR on ``main`` for the faulty ``merge_sha``.
         5. Mark ``faulty_tag`` as ``rolled_back`` in ``release_verifications``.
         """
-        faulty = store.get_release_verification(faulty_tag)
+        faulty = store.get_release_verification(repo, faulty_tag)
         if faulty is None:
             return RollbackResult(
                 ok=False,
                 faulty_tag=faulty_tag,
-                detail=f"Release verification record not found for tag '{faulty_tag}'.",
+                detail=f"Release verification record not found for {repo} tag '{faulty_tag}'.",
             )
 
         prev_tag = str(faulty.get("previous_good_tag") or "").strip()
@@ -506,8 +506,18 @@ class ReleaseManager:
                 detail=f"No previous known-good release recorded for {repo}; cannot roll back '{faulty_tag}'.",
             )
 
-        prev_rec = store.get_release_verification(prev_tag)
+        prev_rec = store.get_release_verification(repo, prev_tag)
         expected_prev_sha = str((prev_rec or {}).get("artifact_sha256") or "").lower()
+        if prev_rec is None or str(prev_rec.get("smoke_status") or "") != "passed" or not expected_prev_sha:
+            return RollbackResult(
+                ok=False,
+                faulty_tag=faulty_tag,
+                restored_tag=prev_tag,
+                detail=(
+                    f"Previous release '{prev_tag}' for {repo} is not a verified passed release "
+                    f"with a recorded checksum; refusing unverified rollback."
+                ),
+            )
 
         # 1. Append superseded warning to faulty release notes (never delete tags/history)
         warning_text = (
@@ -596,6 +606,7 @@ class ReleaseManager:
 
         # 4. Update release_verifications record
         store.update_release_verification(
+            repo,
             faulty_tag,
             smoke_status="rolled_back",
             rolled_back_at=_utc_now(),

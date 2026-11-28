@@ -566,11 +566,18 @@ def test_merge_gate_conditional_auto_merge_and_owner_approval_policies(tmp_path:
             metadata={"job_name": "desktop-frontend"},
             verified=True,
         )
+        cosmetic_diff = (
+            "diff --git a/frontend/src/modules/mission-control/Page.tsx b/frontend/src/modules/mission-control/Page.tsx\n"
+            "@@ -1,2 +1,2 @@\n"
+            '-<GlassCard className="p-4">\n'
+            '+<GlassCard className="p-6">\n'
+        )
         res_ui_no_shot = gate.authorize_merge(
             task=t_ui,
             contract=c_ui,
             head_sha="sha_ui",
             diff_entries=[DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+            diff_content=cosmetic_diff,
             evidence_records=store.list_evidence_records("t-ui", commit_sha="sha_ui"),
         )
         assert res_ui_no_shot.allowed is False
@@ -591,6 +598,7 @@ def test_merge_gate_conditional_auto_merge_and_owner_approval_policies(tmp_path:
             contract=c_ui,
             head_sha="sha_ui",
             diff_entries=[DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+            diff_content=cosmetic_diff,
             evidence_records=store.list_evidence_records("t-ui", commit_sha="sha_ui"),
         )
         assert res_ui_ok.allowed is True
@@ -701,7 +709,7 @@ def test_release_smoke_test_fail_closed_and_rollback(tmp_path: Path) -> None:
             smoke_command=DESKTOP_SELFTEST_SMOKE,
         )
         assert s1.passed is True
-        rec1 = store.get_release_verification(tag1)
+        rec1 = store.get_release_verification("owner/repo", tag1)
         assert rec1 is not None and rec1["smoke_status"] == "passed"
 
         # 2. Unconfigured smoke_command fails closed as unavailable
@@ -744,7 +752,7 @@ def test_release_smoke_test_fail_closed_and_rollback(tmp_path: Path) -> None:
             smoke_command=DESKTOP_SELFTEST_SMOKE,
         )
         assert s2.passed is False
-        rec2 = store.get_release_verification(tag2)
+        rec2 = store.get_release_verification("owner/repo", tag2)
         assert rec2 is not None
         assert rec2["smoke_status"] == "failed"
         assert rec2["previous_good_tag"] == tag1
@@ -769,7 +777,7 @@ def test_release_smoke_test_fail_closed_and_rollback(tmp_path: Path) -> None:
         assert "SUPERSEDED / ROLLED BACK" in faulty_gh["body"]
         assert tag1 in faulty_gh["body"]
         # DB marks tag2 as rolled_back
-        rec2_after = store.get_release_verification(tag2)
+        rec2_after = store.get_release_verification("owner/repo", tag2)
         assert rec2_after is not None and rec2_after["smoke_status"] == "rolled_back"
         assert rec2_after["rolled_back_at"] is not None
         # Revert PR was created on main for sha_merge_bad
@@ -1008,3 +1016,356 @@ def test_bridge_pipeline_approve_task_and_rollback_release(tmp_path: Path) -> No
         assert rb_res["ok"] is True
         assert rb_res["data"]["restored_tag"] == "v1.0.0-preview.1"
         assert (out_dir / "app.zip").read_bytes() == b"good-zip-v1"
+
+
+# ---------------------------------------------------------------------------
+# 6. Regression tests for Codex review findings (P1/P2) & fail-closed hardening
+# ---------------------------------------------------------------------------
+
+
+def test_release_verifications_scoped_by_repo_and_tag(tmp_path: Path) -> None:
+    """Two repos publishing the same tag must never overwrite, satisfy, or roll back each other."""
+    with Store(tmp_path / "repo_scoped_rel.db") as store:
+        store.migrate()
+        events = EventBus(store)
+        vcs = FakeGitGh()
+        out_a = tmp_path / "dist_a"
+        out_b = tmp_path / "dist_b"
+        out_a.mkdir()
+        out_b.mkdir()
+        store.create_project("proj-a", "Repo A", "owner/repo-a", str(tmp_path), output_dir=str(out_a))
+        store.create_project("proj-b", "Repo B", "owner/repo-b", str(tmp_path), output_dir=str(out_b))
+
+        art_a = tmp_path / "a.zip"
+        art_a.write_bytes(b"repo-a-good-v1")
+        sha_a = compute_sha256(art_a)
+        sums_a = tmp_path / "SHA256SUMS.txt"
+        sums_a.write_text(f"{sha_a}  a.zip\n", encoding="utf-8")
+
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.1", "A v1", "Good A", [art_a, sums_a])
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.2", "A v2", "Bad A", [art_a, sums_a])
+
+        # Record passing v1 and failing v2 for repo-a
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_a1",
+            artifact_sha256=sha_a,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_a2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="deadbeef",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        # Record same tags for repo-b with completely different statuses/SHAs
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_b1",
+            artifact_sha256="1111" * 16,
+            smoke_command="smoke-b",
+            smoke_status="failed",
+            smoke_detail="Repo B failed",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_b2",
+            artifact_sha256="2222" * 16,
+            smoke_command="smoke-b",
+            smoke_status="passed",
+            verified_at="2026-11-28T02:00:00Z",
+        )
+
+        # Verify repo-a and repo-b records remain isolated
+        rec_a1 = store.get_release_verification("owner/repo-a", "v1.0.0-preview.1")
+        rec_b1 = store.get_release_verification("owner/repo-b", "v1.0.0-preview.1")
+        assert rec_a1 is not None and rec_a1["smoke_status"] == "passed" and rec_a1["merge_sha"] == "sha_a1"
+        assert rec_b1 is not None and rec_b1["smoke_status"] == "failed" and rec_b1["merge_sha"] == "sha_b1"
+
+        # Deck for proj-a only surfaces owner/repo-a's failed release, not owner/repo-b's
+        deck_a = generate_deck_data(store, "proj-a")
+        release_items = [item for item in deck_a["needs_you"] if item.get("release_tag")]
+        assert all(item.get("repo") == "owner/repo-a" for item in release_items)
+
+        class _StubEngine:
+            def __init__(self, vcs_obj: FakeGitGh) -> None:
+                self.vcs = vcs_obj
+                self.release_mgr = ReleaseManager(vcs_obj)
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_StubEngine(vcs))
+
+        # Rollback without repo/projectId fails closed
+        no_repo_res = bridge.call("pipeline.rollbackRelease", {"tag": "v1.0.0-preview.2"})
+        assert no_repo_res["ok"] is False
+
+        # Rollback for proj-a updates ONLY owner/repo-a's v1.0.0-preview.2, leaving owner/repo-b untouched
+        rb_a = bridge.call("pipeline.rollbackRelease", {"tag": "v1.0.0-preview.2", "projectId": "proj-a"})
+        assert rb_a["ok"] is True
+        rec_a2_after = store.get_release_verification("owner/repo-a", "v1.0.0-preview.2")
+        rec_b2_after = store.get_release_verification("owner/repo-b", "v1.0.0-preview.2")
+        assert rec_a2_after is not None and rec_a2_after["smoke_status"] == "rolled_back"
+        assert rec_b2_after is not None and rec_b2_after["smoke_status"] == "passed"
+
+
+def test_ui_files_escalate_to_business_logic_unless_diff_verified_cosmetic(tmp_path: Path) -> None:
+    """Executable logic or unverifiable diffs in UI directories must escalate to business_logic."""
+    # 1. Event handler / bridge call in Page.tsx -> escalates to business_logic
+    exec_diff = (
+        "diff --git a/frontend/src/modules/mission-control/Page.tsx b/frontend/src/modules/mission-control/Page.tsx\n"
+        "@@ -10,3 +10,4 @@\n"
+        " const Page = () => {\n"
+        '+  const res = await bridge.call("engine.start", {});\n'
+        '+  return <Button onClick={handleStart}>Start</Button>;\n'
+    )
+    res_exec = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+        exec_diff,
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_exec.risk_class == "business_logic"
+    assert res_exec.requires_independent_review is True
+
+    # 2. Empty diff content on UI file -> fail closed to business_logic
+    res_empty = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+        "",
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_empty.risk_class == "business_logic"
+    assert res_empty.requires_independent_review is True
+
+    # 3. Non-JSX .ts file under frontend/src/modules -> escalates to business_logic
+    res_ts = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/api.ts")],
+        "+export const POLL_MS = 500;\n",
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_ts.risk_class == "business_logic"
+
+    # 4. Structural deletion of UI component -> escalates to business_logic
+    res_del = classify_task_risk(
+        [DiffPathEntry("D", "frontend/src/modules/mission-control/Page.tsx")],
+        "-<GlassCard />\n",
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_del.risk_class == "business_logic"
+
+    # 5. Verified cosmetic styling/copy diff -> remains ui_cosmetic
+    cosmetic_diff = (
+        "diff --git a/frontend/src/modules/mission-control/Page.tsx b/frontend/src/modules/mission-control/Page.tsx\n"
+        "@@ -1,3 +1,3 @@\n"
+        '-<GlassCard className="p-4" style={{ padding: "var(--space-4)" }}>\n'
+        '+<GlassCard className="p-6" style={{ padding: "var(--space-6)" }}>\n'
+        "-  Old title\n"
+        "+  New title\n"
+    )
+    res_cosmetic = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+        cosmetic_diff,
+        base_risk_class="docs_format",
+    )
+    assert res_cosmetic.risk_class == "ui_cosmetic"
+    assert res_cosmetic.requires_independent_review is False
+
+    # 6. MergeGate blocks executable Page.tsx edit without independent review even with verified screenshots
+    with Store(tmp_path / "ui_gate.db") as store:
+        store.migrate()
+        t_ui, c_ui = _seed_task(
+            store,
+            task_id="t-ui-logic",
+            branch="feat/ui-logic",
+            risk_class="ui_cosmetic",
+            allowed_globs=["frontend/**"],
+        )
+        store.record_evidence(
+            task_id="t-ui-logic",
+            contract_sha256=c_ui["contract_sha256"],
+            commit_sha="sha_uilogic",
+            kind="ci_check",
+            source="circleci:desktop-frontend",
+            build_id="b-1",
+            duration_seconds=30.0,
+            verified=True,
+        )
+        store.record_evidence(
+            task_id="t-ui-logic",
+            contract_sha256=c_ui["contract_sha256"],
+            commit_sha="sha_uilogic",
+            kind="screenshot",
+            source="playwright:manifest",
+            build_id="b-1",
+            metadata={"renderer": "playwright-mockbridge"},
+            verified=True,
+        )
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=True)
+        auth = gate.authorize_merge(
+            task=t_ui,
+            contract=c_ui,
+            head_sha="sha_uilogic",
+            diff_entries=[DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+            diff_content=exec_diff,
+            evidence_records=store.list_evidence_records("t-ui-logic", commit_sha="sha_uilogic"),
+        )
+        assert auth.allowed is False
+        assert auth.effective_risk_class == "business_logic"
+        assert auth.block_reason == "no_independent_reviewer"
+
+
+@pytest.mark.asyncio
+async def test_review_rejects_omitted_or_null_findings_array(tmp_path: Path) -> None:
+    """APPROVE without an explicit findings array (or with findings: null) is malformed and never approves."""
+    wt = tmp_path / "wt"
+    (wt / "src").mkdir(parents=True)
+    (wt / "src" / "main.py").write_text("x = 1\n", encoding="utf-8")
+    contract = {"acceptance_criteria": [{"id": "ac-1", "description": "Works"}]}
+
+    # 1. Missing findings key
+    res_missing = parse_and_validate_review_output(
+        '{"verdict": "APPROVE", "summary": "LGTM"}',
+        worktree_dir=wt,
+        contract=contract,
+    )
+    assert res_missing.valid is False
+    assert res_missing.verdict == "INVALID"
+    assert any("findings" in e for e in res_missing.errors)
+
+    # 2. Explicit findings: null
+    res_null = parse_and_validate_review_output(
+        '{"verdict": "APPROVE", "summary": "LGTM", "findings": null}',
+        worktree_dir=wt,
+        contract=contract,
+    )
+    assert res_null.valid is False
+    assert res_null.verdict == "INVALID"
+    assert any("findings" in e for e in res_null.errors)
+
+    # 3. End-to-end in CiPipelineManager: missing findings triggers retry and blocks if still omitted
+    with Store(tmp_path / "missing_findings.db") as store:
+        store.migrate()
+        _, db_contract = _seed_task(store, task_id="t-mf", branch="feat/mf")
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/mf", number=303, head_sha="sha_303")
+        vcs.worktrees["feat/mf"] = wt
+        vcs.changed_files["feat/mf"] = ["src/main.py"]
+
+        codex_bad = FakeRunner(
+            name="codex",
+            responses=[
+                RunnerResult(rc=0, stdout='{"verdict": "APPROVE", "summary": "LGTM"}', stderr=""),
+                RunnerResult(rc=0, stdout='{"verdict": "APPROVE", "findings": null}', stderr=""),
+            ],
+        )
+        ci_mgr = CiPipelineManager(
+            vcs,
+            store,
+            Scheduler(store, QuotaLedger(store)),
+            {"agy": FakeRunner.success("agy"), "codex": codex_bad},
+        )
+        ci_res = await ci_mgr.watch_and_heal(
+            repo="owner/repo",
+            local_repo=tmp_path,
+            worktree_dir=wt,
+            phase_id="p1",
+            phase_title="P1",
+            branch="feat/mf",
+            pr_number=303,
+            initial_engine="agy",
+            risk=RiskAssessment(level="low"),
+            task_contract=db_contract,
+            contributing_providers={"google"},
+        )
+        assert ci_res.passed is False
+        assert ci_res.block_reason == "invalid_review_output"
+        assert len(codex_bad.calls) == 2
+
+
+def test_merge_gate_review_evidence_tier_and_unverified_rollback_fail_closed(tmp_path: Path) -> None:
+    """MergeGate rejects economy review evidence for high_risk; rollback refuses unverified target."""
+    with Store(tmp_path / "hardening.db") as store:
+        store.migrate()
+        t_hr, c_hr = _seed_task(
+            store,
+            task_id="t-hr-ev",
+            branch="feat/hr-ev",
+            risk_class="high_risk",
+            allowed_globs=["backend/**"],
+        )
+        store.record_task_contributing_provider("t-hr-ev", "google")
+        store.record_task_owner_approval("t-hr-ev", "owner", "sha_hr_ev")
+        store.record_evidence(
+            task_id="t-hr-ev",
+            contract_sha256=c_hr["contract_sha256"],
+            commit_sha="sha_hr_ev",
+            kind="ci_check",
+            source="circleci:desktop-backend",
+            build_id="b-1",
+            duration_seconds=20.0,
+            verified=True,
+        )
+        # Persist an economy-tier review evidence record for a high_risk task
+        store.record_evidence(
+            task_id="t-hr-ev",
+            contract_sha256=c_hr["contract_sha256"],
+            commit_sha="sha_hr_ev",
+            kind="review",
+            source="review:qwen",
+            metadata={
+                "reviewer_engine": "qwen",
+                "reviewer_provider": "alibaba",
+                "reviewer_tier": "economy",
+                "verdict": "APPROVE",
+                "p1_count": 0,
+            },
+            verified=True,
+        )
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=True)
+        auth = gate.authorize_merge(
+            task=store.get_task("t-hr-ev") or t_hr,
+            contract=c_hr,
+            head_sha="sha_hr_ev",
+            diff_entries=[DiffPathEntry("M", "backend/nightshift/engine/credentials.py")],
+            evidence_records=store.list_evidence_records("t-hr-ev", commit_sha="sha_hr_ev"),
+            require_review_evidence=True,
+            reviewer_provider="openai",
+            reviewer_engine="codex",
+            reviewer_tier="standard",
+        )
+        assert auth.allowed is False
+        assert auth.block_reason == "missing_verified_review"
+
+        # Rollback refuses if previous_good_tag is not a verified passed release
+        vcs = FakeGitGh()
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_1",
+            artifact_sha256="a" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="b" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        rb = ReleaseManager(vcs).rollback_release(
+            store=store,
+            repo="owner/repo",
+            faulty_tag="v1.0.0-preview.2",
+            output_dir=tmp_path / "dist",
+        )
+        assert rb.ok is False
+        assert "not a verified passed release" in rb.detail

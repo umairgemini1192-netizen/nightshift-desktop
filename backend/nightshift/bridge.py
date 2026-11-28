@@ -1410,12 +1410,14 @@ class BridgeAPI:
             faulty_tag = str(payload.get("tag") or payload.get("faultyTag") or "").strip()
             if not faulty_tag:
                 return {"ok": False, "error": "Release tag is required for rollback."}
-            rel_rec = self._store.get_release_verification(faulty_tag)
-            if rel_rec is None:
-                return {"ok": False, "error": f"Unknown release tag: {faulty_tag}"}
-            repo = str(payload.get("repo") or rel_rec.get("repo") or "").strip()
             project_id = str(payload.get("projectId") or self._active_project_id or "")
             proj = self._store.get_project(project_id) if project_id else None
+            repo = str(payload.get("repo") or (proj.get("repo") if proj else "") or "").strip()
+            if not repo:
+                return {"ok": False, "error": "Repository (repo or projectId) is required for rollback."}
+            rel_rec = self._store.get_release_verification(repo, faulty_tag)
+            if rel_rec is None:
+                return {"ok": False, "error": f"Unknown release tag '{faulty_tag}' for repository '{repo}'."}
             if proj is None and repo:
                 proj = next((p for p in self._store.list_projects() if p.get("repo") == repo), None)
             out_dir = Path(

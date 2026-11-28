@@ -571,6 +571,44 @@ def _migration_007_project_release_smoke_columns(conn: sqlite3.Connection) -> No
             conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
 
 
+def _migration_008_release_verifications_repo_tag_pk(conn: sqlite3.Connection) -> None:
+    """Scope release_verifications primary key by (repo, tag) so repositories never collide."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS release_verifications_v8 (
+            repo TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            task_id TEXT,
+            merge_sha TEXT NOT NULL,
+            previous_good_tag TEXT,
+            artifact_sha256 TEXT NOT NULL,
+            smoke_command TEXT NOT NULL,
+            smoke_status TEXT NOT NULL,
+            smoke_detail TEXT NOT NULL DEFAULT '',
+            verified_at TEXT,
+            rolled_back_at TEXT,
+            PRIMARY KEY (repo, tag)
+        );
+
+        INSERT OR REPLACE INTO release_verifications_v8 (
+            repo, tag, task_id, merge_sha, previous_good_tag,
+            artifact_sha256, smoke_command, smoke_status, smoke_detail,
+            verified_at, rolled_back_at
+        )
+        SELECT repo, tag, task_id, merge_sha, previous_good_tag,
+               artifact_sha256, smoke_command, smoke_status, smoke_detail,
+               verified_at, rolled_back_at
+        FROM release_verifications;
+
+        DROP TABLE release_verifications;
+        ALTER TABLE release_verifications_v8 RENAME TO release_verifications;
+
+        CREATE INDEX IF NOT EXISTS idx_release_verifications_repo_status
+            ON release_verifications(repo, smoke_status);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
@@ -579,6 +617,7 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (5, "005_agent_pipeline", _migration_005_agent_pipeline),
     (6, "006_project_evidence_columns", _migration_006_project_evidence_columns),
     (7, "007_project_release_smoke_columns", _migration_007_project_release_smoke_columns),
+    (8, "008_release_verifications_repo_tag_pk", _migration_008_release_verifications_repo_tag_pk),
 ]
 
 
@@ -2023,17 +2062,22 @@ class Store:
         verified_at: str | None = None,
         rolled_back_at: str | None = None,
     ) -> dict[str, Any]:
-        """Insert or update a ``release_verifications`` row keyed by ``tag``."""
+        """Insert or update a ``release_verifications`` row keyed by ``(repo, tag)``."""
+        norm_repo = str(repo or "").strip()
+        norm_tag = str(tag or "").strip()
+        if not norm_repo or not norm_tag:
+            raise ValueError("Both repo and tag are required for release_verifications.")
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO release_verifications (
-                    tag, task_id, repo, merge_sha, previous_good_tag,
+                    repo, tag, task_id, merge_sha, previous_good_tag,
                     artifact_sha256, smoke_command, smoke_status, smoke_detail,
                     verified_at, rolled_back_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tag) DO UPDATE SET
+                ON CONFLICT(repo, tag) DO UPDATE SET
                     task_id = COALESCE(excluded.task_id, release_verifications.task_id),
+                    merge_sha = excluded.merge_sha,
                     previous_good_tag = COALESCE(excluded.previous_good_tag, release_verifications.previous_good_tag),
                     artifact_sha256 = excluded.artifact_sha256,
                     smoke_command = excluded.smoke_command,
@@ -2043,9 +2087,9 @@ class Store:
                     rolled_back_at = COALESCE(excluded.rolled_back_at, release_verifications.rolled_back_at)
                 """,
                 (
-                    tag,
+                    norm_repo,
+                    norm_tag,
                     task_id,
-                    repo,
                     merge_sha,
                     previous_good_tag,
                     artifact_sha256,
@@ -2056,14 +2100,14 @@ class Store:
                     rolled_back_at,
                 ),
             )
-        row = self.get_release_verification(tag)
+        row = self.get_release_verification(norm_repo, norm_tag)
         assert row is not None
         return row
 
-    def get_release_verification(self, tag: str) -> dict[str, Any] | None:
+    def get_release_verification(self, repo: str, tag: str) -> dict[str, Any] | None:
         row = self._conn.execute(
-            "SELECT * FROM release_verifications WHERE tag = ?",
-            (tag,),
+            "SELECT * FROM release_verifications WHERE repo = ? AND tag = ?",
+            (repo, tag),
         ).fetchone()
         return dict(row) if row is not None else None
 
@@ -2109,7 +2153,7 @@ class Store:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def update_release_verification(self, tag: str, **fields: Any) -> dict[str, Any]:
+    def update_release_verification(self, repo: str, tag: str, **fields: Any) -> dict[str, Any]:
         allowed_cols = {
             "smoke_status",
             "smoke_detail",
@@ -2125,19 +2169,19 @@ class Store:
             updates.append(f"{k} = ?")
             values.append(v)
         if not updates:
-            row = self.get_release_verification(tag)
+            row = self.get_release_verification(repo, tag)
             if row is None:
-                raise KeyError(f"Unknown release tag: {tag}")
+                raise KeyError(f"Unknown release tag '{tag}' for repository '{repo}'")
             return row
-        values.append(tag)
+        values.extend([repo, tag])
         with self._conn:
             self._conn.execute(
-                f"UPDATE release_verifications SET {', '.join(updates)} WHERE tag = ?",
+                f"UPDATE release_verifications SET {', '.join(updates)} WHERE repo = ? AND tag = ?",
                 values,
             )
-        updated = self.get_release_verification(tag)
+        updated = self.get_release_verification(repo, tag)
         if updated is None:
-            raise KeyError(f"Unknown release tag: {tag}")
+            raise KeyError(f"Unknown release tag '{tag}' for repository '{repo}'")
         return updated
 
 

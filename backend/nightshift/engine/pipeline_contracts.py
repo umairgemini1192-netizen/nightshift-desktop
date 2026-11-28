@@ -885,7 +885,27 @@ class MergeGate:
                         except Exception:
                             meta = {}
                         rev_prov = provider_for_engine(str(meta.get("reviewer_provider") or ""))
-                        if rev_prov and rev_prov not in contributing and str(meta.get("verdict") or "").upper() == "APPROVE":
+                        rev_verdict = str(meta.get("verdict") or "").upper()
+                        try:
+                            p1_count = int(meta.get("p1_count") or 0)
+                        except (TypeError, ValueError):
+                            p1_count = 1
+                        tier_ok = True
+                        if policy.requires_strong_reviewer:
+                            rec_tier = str(meta.get("reviewer_tier") or "").strip().lower()
+                            rec_engine = str(meta.get("reviewer_engine") or "").strip()
+                            rec_default_tier = {
+                                "openai": "standard",
+                                "google": "standard",
+                                "anthropic": "gold",
+                            }.get(rev_prov, "economy")
+                            eff_rec_tier = (
+                                tier_for_engine(rec_engine, explicit_tier=rec_tier or None)
+                                if (rec_tier or rec_engine)
+                                else rec_default_tier
+                            )
+                            tier_ok = eff_rec_tier in STRONG_TIERS
+                        if rev_prov and rev_prov not in contributing and rev_verdict == "APPROVE" and p1_count == 0 and tier_ok:
                             valid_reviews.append(rec)
                 if not valid_reviews:
                     return MergeAuthorization(

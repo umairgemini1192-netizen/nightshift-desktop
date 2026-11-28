@@ -57,11 +57,12 @@ def generate_deck_data(
             })
             seen_ids.add(phase_id)
 
-    for rel in store.list_release_verifications(limit=5):
+    proj_repo = str(proj.get("repo") or "").strip() if proj else ""
+    for rel in store.list_release_verifications(repo=proj_repo or None, limit=5):
         if len(needs_you) >= 3:
             break
         if str(rel.get("smoke_status") or "") == "failed":
-            rel_key = f"release:{rel['tag']}"
+            rel_key = f"release:{rel['repo']}:{rel['tag']}"
             if rel_key not in seen_ids:
                 prev_tag = rel.get("previous_good_tag")
                 detail = str(rel.get("smoke_detail") or "Post-release smoke test failed.")
@@ -69,6 +70,7 @@ def generate_deck_data(
                     detail += f" Previous good release: {prev_tag}."
                 needs_you.append({
                     "phase_id": rel_key,
+                    "repo": str(rel["repo"]),
                     "release_tag": str(rel["tag"]),
                     "headline": f"Release {rel['tag']} failed launch smoke test",
                     "detail": detail,

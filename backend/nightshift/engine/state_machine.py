@@ -1457,7 +1457,7 @@ class EngineStateMachine:
                 evidence_records=self.store.list_evidence_records(task_id, commit_sha=ci_res.checked_sha),
                 required_ci_jobs=project.required_ci_jobs,
                 require_screenshot_evidence=bool(project.screenshot_manifest_path),
-                require_review_evidence=bool(ci_res.review_result is not None),
+                require_review_evidence=True,
                 reviewer_provider=ci_res.reviewer_provider or None,
                 reviewer_engine=ci_res.reviewer_engine or None,
                 reviewer_tier=ci_res.reviewer_tier or None,
@@ -1827,8 +1827,18 @@ class EngineStateMachine:
                         (p for p in (prepared_artifacts or []) if p.name != "SHA256SUMS.txt"),
                         None,
                     )
-                    existing_ver = self.store.get_release_verification(adopted_tag)
-                    already_smoke_passed = bool(existing_ver and existing_ver.get("smoke_status") == "passed")
+                    existing_ver = self.store.get_release_verification(project.repo, adopted_tag)
+                    expected_art_sha = (
+                        expected_checksums.get(primary_artifact.name, "")
+                        if primary_artifact is not None
+                        else ""
+                    )
+                    already_smoke_passed = bool(
+                        existing_ver
+                        and existing_ver.get("smoke_status") == "passed"
+                        and existing_ver.get("merge_sha") == str(merge_sha)
+                        and (not expected_art_sha or existing_ver.get("artifact_sha256") == expected_art_sha)
+                    )
                     if not already_smoke_passed:
                         smoke_res = self.release_mgr.verify_and_record_release(
                             store=self.store,

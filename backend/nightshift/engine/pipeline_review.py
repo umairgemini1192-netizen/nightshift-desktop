@@ -84,6 +84,7 @@ HIGH_RISK_DIFF_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 DOCS_EXTENSIONS: frozenset[str] = frozenset({".md", ".markdown", ".txt", ".rst"})
+UI_COSMETIC_EXTENSIONS: frozenset[str] = frozenset({".tsx", ".jsx", ".css", ".svg"})
 UI_COSMETIC_GLOBS: tuple[str, ...] = (
     "frontend/src/modules/**",
     "frontend/src/design/**",
@@ -91,6 +92,36 @@ UI_COSMETIC_GLOBS: tuple[str, ...] = (
     "frontend/src/**/*.css",
     "frontend/src/**/*.svg",
 )
+
+# Strict allowlist for verifying that a .tsx/.jsx diff is purely cosmetic (styling/layout/copy only).
+# Any executable logic, hooks, event handlers, bridge calls, or unrecognized syntax fails closed
+# and escalates to business_logic (requiring independent review).
+_COSMETIC_ATTR_NAME = (
+    r"(?:className|class|title|alt|role|size|variant|gap|padding|align|justify|"
+    r"width|height|viewBox|fill|stroke|strokeWidth|strokeLinecap|strokeLinejoin|"
+    r"d|rx|ry|cx|cy|r|x|y|x1|y1|x2|y2|xmlns|id|data-testid|tabIndex|lang|dir|"
+    r"aria-[a-zA-Z0-9-]+)"
+)
+_COSMETIC_STRING_VAL = r"""(?:"[^"{}]*"|'[^'{}]*')"""
+_COSMETIC_STYLE_VAL = (
+    r"""\{\{\s*(?:[a-zA-Z][a-zA-Z0-9_-]*\s*:\s*"""
+    r"""(?:"(?:var\(--[a-zA-Z0-9-]+\)|[^"{}()])*"|'(?:var\(--[a-zA-Z0-9-]+\)|[^'{}()])*'|-?\d+(?:\.\d+)?)\s*,?\s*)+\}\}"""
+)
+_COSMETIC_ATTR_RE = rf"(?:{_COSMETIC_ATTR_NAME}\s*=\s*{_COSMETIC_STRING_VAL}|style\s*=\s*{_COSMETIC_STYLE_VAL})"
+_COSMETIC_JSX_TAG_LINE_RE = re.compile(
+    rf"^(?:<>|</>|</[A-Za-z][A-Za-z0-9_.-]*>|/?>|"
+    rf"<[A-Za-z][A-Za-z0-9_.-]*(?:\s+{_COSMETIC_ATTR_RE})*(?:\s*/?>)?"
+    rf"(?:[^<>{{}}()=;`\\]*(?:</[A-Za-z][A-Za-z0-9_.-]*>))?)$"
+)
+_COSMETIC_JSX_ATTR_LINE_RE = re.compile(rf"^(?:{_COSMETIC_ATTR_RE}(?:\s+{_COSMETIC_ATTR_RE})*)(?:\s*/?>)?$")
+_COSMETIC_COMMENT_LINE_RE = re.compile(r"^(?://.*|/\*.*\*/|\*.*|\{/\*.*\*/\})$")
+_JS_EXEC_KEYWORD_RE = re.compile(
+    r"\b(?:import|export|const|let|var|function|return|if|else|for|while|switch|"
+    r"case|break|continue|try|catch|finally|throw|await|async|new|delete|typeof|"
+    r"void|interface|type|enum|class)\b"
+)
+_UNSAFE_CSS_RE = re.compile(r"(?:<script|javascript:|expression\s*\(|@import\s+url\s*\(\s*[\"']?https?://)", re.IGNORECASE)
+_UNSAFE_SVG_RE = re.compile(r"(?:<script|javascript:|<foreignObject|\bon[a-z]+\s*=)", re.IGNORECASE)
 
 
 def tier_for_engine(engine_name: str, *, explicit_tier: str | None = None) -> str:
@@ -252,7 +283,115 @@ def _is_docs_path(path: str, *, case_fold: bool | None = None) -> bool:
 
 def _is_ui_cosmetic_path(path: str, *, case_fold: bool | None = None) -> bool:
     norm = normalize_repo_path(path, case_fold=case_fold)
+    low = norm.lower()
+    if not low.endswith(tuple(UI_COSMETIC_EXTENSIONS)):
+        return False
     return any(_glob_matches(norm, pat, case_fold=case_fold) for pat in UI_COSMETIC_GLOBS)
+
+
+def _extract_changed_lines(diff_text: str) -> list[str]:
+    """Return added/removed content lines (without leading +/-), ignoring diff headers."""
+    changed: list[str] = []
+    for line in diff_text.splitlines():
+        if line.startswith(("+++", "---", "@@ ", "diff --git ", "index ", "new file mode", "deleted file mode", "rename ")):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            changed.append(line[1:])
+    return changed
+
+
+def _is_cosmetic_tsx_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if _COSMETIC_COMMENT_LINE_RE.match(stripped):
+        return True
+    if _COSMETIC_JSX_TAG_LINE_RE.match(stripped):
+        return True
+    if _COSMETIC_JSX_ATTR_LINE_RE.match(stripped):
+        return True
+    # Pure static text content inside JSX (no JS syntax/expression tokens or keywords)
+    if any(tok in stripped for tok in ("{", "}", "(", ")", "=", ";", "<", ">", "`", "=>", "&&", "||")):
+        return False
+    if _JS_EXEC_KEYWORD_RE.search(stripped):
+        return False
+    return True
+
+
+def _verify_cosmetic_ui_diff(
+    entries: list[DiffPathEntry],
+    diff_content: str,
+    *,
+    case_fold: bool | None = None,
+) -> tuple[bool, str]:
+    """Verify that every UI file diff is provably cosmetic (fail-closed).
+
+    Returns ``(True, "")`` only when all touched UI files have verifiable cosmetic-only
+    diffs (CSS/SVG without active content, or TSX/JSX lines strictly matching the
+    styling/layout/static-copy allowlist). Otherwise returns ``(False, reason)``.
+    """
+    ui_entries = [
+        e for e in entries
+        if any(not _is_docs_path(p, case_fold=case_fold) for p in e.all_paths())
+    ]
+    if not ui_entries:
+        return True, ""
+
+    for entry in ui_entries:
+        status_code = (entry.status or "").strip().upper()[:1]
+        if status_code in ("D", "R"):
+            return False, f"Structural UI file operation ({entry.status}) on '{entry.path}' requires review"
+
+    if not (diff_content or "").strip():
+        return False, "Cannot verify UI change is cosmetic because diff content is empty"
+
+    sections = _split_diff_sections(diff_content)
+    has_git_headers = any(line.startswith("diff --git ") for line in diff_content.splitlines())
+
+    if has_git_headers:
+        section_map: dict[str, list[str]] = {}
+        for sec_path, sec_text in sections:
+            key = normalize_repo_path(sec_path, case_fold=case_fold)
+            section_map.setdefault(key, []).extend(_extract_changed_lines(sec_text))
+
+        for entry in ui_entries:
+            norm_path = normalize_repo_path(entry.path, case_fold=case_fold)
+            changed = section_map.get(norm_path)
+            if not changed:
+                return False, f"UI file '{entry.path}' has no inspectable diff hunks; cannot verify cosmetic-only"
+            ok_file, reason = _verify_cosmetic_lines_for_file(entry.path, changed)
+            if not ok_file:
+                return False, reason
+        return True, ""
+
+    # Snippet diff without diff --git headers (e.g. unit test inline diff)
+    changed = _extract_changed_lines(diff_content)
+    if not changed:
+        return False, "Cannot verify UI change is cosmetic because diff has no changed lines"
+    for entry in ui_entries:
+        ok_file, reason = _verify_cosmetic_lines_for_file(entry.path, changed)
+        if not ok_file:
+            return False, reason
+    return True, ""
+
+
+def _verify_cosmetic_lines_for_file(path: str, changed_lines: list[str]) -> tuple[bool, str]:
+    low = path.lower()
+    joined = "\n".join(changed_lines)
+    if low.endswith(".css"):
+        if _UNSAFE_CSS_RE.search(joined):
+            return False, f"CSS diff in '{path}' contains active/remote expression"
+        return True, ""
+    if low.endswith(".svg"):
+        if _UNSAFE_SVG_RE.search(joined):
+            return False, f"SVG diff in '{path}' contains script/event handler"
+        return True, ""
+    if low.endswith((".tsx", ".jsx")):
+        for line in changed_lines:
+            if not _is_cosmetic_tsx_line(line):
+                return False, f"UI diff in '{path}' contains non-cosmetic/executable change: '{line.strip()[:80]}'"
+        return True, ""
+    return False, f"UI file '{path}' is not a cosmetic style/markup file"
 
 
 def classify_task_risk(
@@ -327,7 +466,16 @@ def classify_task_risk(
             if non_ui:
                 detected = _escalate_risk(detected, "business_logic")
             else:
-                detected = _escalate_risk(detected, "ui_cosmetic")
+                cosmetic_ok, cosmetic_reason = _verify_cosmetic_ui_diff(
+                    entries,
+                    diff_content,
+                    case_fold=case_fold,
+                )
+                if cosmetic_ok:
+                    detected = _escalate_risk(detected, "ui_cosmetic")
+                else:
+                    detected = _escalate_risk(detected, "business_logic")
+                    reasons.append(cosmetic_reason)
 
     # 2. Content-level high-risk signals on added lines
     added_lines = [
@@ -659,12 +807,11 @@ def parse_and_validate_review_output(
         errors.append(f"Invalid verdict '{verdict}'; expected 'APPROVE' or 'CHANGES'.")
 
     summary = str(parsed.get("summary") or "").strip()
-    raw_findings = parsed.get("findings")
-    if raw_findings is None:
-        raw_findings = []
-    if not isinstance(raw_findings, list):
-        errors.append("'findings' must be a JSON array.")
-        raw_findings = []
+    if "findings" not in parsed or not isinstance(parsed["findings"], list):
+        errors.append("Missing required 'findings' JSON array (must be a list, e.g. [] when approving).")
+        raw_findings: list[Any] = []
+    else:
+        raw_findings = parsed["findings"]
 
     # Extract valid acceptance criteria IDs from frozen contract
     raw_ac = contract.get("acceptance_criteria_json")
