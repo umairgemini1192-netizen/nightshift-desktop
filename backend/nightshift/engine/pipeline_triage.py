@@ -1,0 +1,299 @@
+"""Stage 4 TRIAGE role on small_job_ladder (AGENT_PIPELINE §2, §7.2, §12.1 — Phase 8f).
+
+Summarises failing CI / job log tails into a strict <= 10-line structured summary
+containing root cause, file:line location, and suggested fix so Stage 5 FIX receives
+compact, redacted context instead of raw multi-thousand-line logs.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from nightshift.engine.pipeline_contracts import provider_for_engine
+from nightshift.engine.pipeline_economics import PipelineEconomics
+from nightshift.engine.verify import redact_secrets
+from nightshift.runners.base import Runner
+from nightshift.store import Store
+
+SMALL_JOB_LADDER_DEFAULT: tuple[str, ...] = (
+    "qwen",
+    "deepseek",
+    "kimi",
+    "glm",
+    "minimax",
+    "gemini",
+    "codex",
+    "agy",
+)
+
+MAX_TRIAGE_LINES: int = 10
+MAX_LOG_TAIL_CHARS: int = 8000
+
+_FILE_LINE_RE = re.compile(
+    r"(?:File\s+\"([^\"]+)\",\s*line\s+(\d+)|"
+    r"([A-Za-z0-9_./\\-]+\.(?:py|ts|tsx|js|jsx|kt|java|go|rs|css|json)):(\d+))"
+)
+_ERROR_LINE_RE = re.compile(
+    r"(?:AssertionError|TypeError|ValueError|ImportError|ModuleNotFoundError|SyntaxError|"
+    r"FAILED|ERROR|Exception|TS\d{4}|error:|FAIL\s)",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class TriageSummary:
+    """Structured Stage 4 TRIAGE output strictly bounded to <= 10 lines."""
+
+    root_cause: str
+    file_line: str
+    suggested_fix: str
+    lines: list[str] = field(default_factory=list)
+    engine_id: str = ""
+    model: str = ""
+    used_fallback: bool = False
+    wall_seconds: float = 0.0
+
+    def render(self) -> str:
+        """Render the triage summary as plain text guaranteed to be <= 10 non-empty lines."""
+        raw_lines = [ln.strip() for ln in self.lines if ln.strip()]
+        if not raw_lines:
+            raw_lines = [
+                f"Root cause: {self.root_cause}",
+                f"Location: {self.file_line}",
+                f"Suggested fix: {self.suggested_fix}",
+            ]
+        return "\n".join(raw_lines[:MAX_TRIAGE_LINES])
+
+    @property
+    def line_count(self) -> int:
+        return len([ln for ln in self.render().splitlines() if ln.strip()])
+
+
+def build_triage_prompt(failing_log: str, *, job_name: str = "CI") -> str:
+    """Build a compact, secret-redacted Stage 4 TRIAGE prompt."""
+    redacted = redact_secrets(failing_log or "")
+    tail = redacted[-MAX_LOG_TAIL_CHARS:]
+    return (
+        f"You are the Stage 4 TRIAGE assistant for a failing {job_name} check.\n"
+        "Read the log tail below and return ONLY valid JSON with these exact keys:\n"
+        '  "root_cause": one concise sentence explaining why it failed,\n'
+        '  "file_line": primary "path/to/file:line" (or "unknown:0" if not in log),\n'
+        '  "suggested_fix": one concise sentence describing the targeted fix,\n'
+        '  "notes": optional array of up to 4 short bullet strings.\n'
+        "Total rendered summary must be <= 10 lines. Do not invent file paths or stack frames.\n\n"
+        f"--- FAILING LOG TAIL ---\n{tail}\n"
+    )
+
+
+def _extract_json_block(text: str) -> dict[str, Any] | None:
+    """Extract the first JSON object from model output (raw or fenced)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL)
+    candidate = fenced.group(1) if fenced else raw
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(candidate[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def parse_triage_output(raw_output: str) -> TriageSummary | None:
+    """Parse and validate structured triage output, enforcing <= 10 lines."""
+    obj = _extract_json_block(raw_output)
+    if obj is None:
+        return None
+    root_cause = redact_secrets(str(obj.get("root_cause") or "").strip()).replace("\n", " ")
+    file_line = redact_secrets(str(obj.get("file_line") or "").strip()).replace("\n", " ")
+    suggested_fix = redact_secrets(str(obj.get("suggested_fix") or "").strip()).replace("\n", " ")
+    if not root_cause or not file_line or not suggested_fix:
+        return None
+
+    lines = [
+        f"Root cause: {root_cause}",
+        f"Location: {file_line}",
+        f"Suggested fix: {suggested_fix}",
+    ]
+    raw_notes = obj.get("notes")
+    if isinstance(raw_notes, list):
+        for note in raw_notes:
+            cleaned = redact_secrets(str(note or "").strip()).replace("\n", " ")
+            if cleaned and len(lines) < MAX_TRIAGE_LINES:
+                lines.append(f"- {cleaned}")
+
+    return TriageSummary(
+        root_cause=root_cause,
+        file_line=file_line,
+        suggested_fix=suggested_fix,
+        lines=lines[:MAX_TRIAGE_LINES],
+    )
+
+
+def deterministic_triage_fallback(failing_log: str, *, job_name: str = "CI") -> TriageSummary:
+    """Deterministic fallback when no triage AI is available or output is malformed (always <= 10 lines)."""
+    redacted = redact_secrets(failing_log or "")
+    file_line = "unknown:0"
+    for match in _FILE_LINE_RE.finditer(redacted):
+        if match.group(1) and match.group(2):
+            file_line = f"{match.group(1)}:{match.group(2)}"
+            break
+        if match.group(3) and match.group(4):
+            file_line = f"{match.group(3)}:{match.group(4)}"
+            break
+
+    error_lines = [
+        ln.strip()
+        for ln in redacted.splitlines()
+        if ln.strip() and _ERROR_LINE_RE.search(ln)
+    ]
+    root_cause = error_lines[-1][:200] if error_lines else f"{job_name} check failed without a specific error line."
+    suggested_fix = f"Inspect {file_line} and resolve the failing assertion or error reported by {job_name}."
+    lines = [
+        f"Root cause: {root_cause}",
+        f"Location: {file_line}",
+        f"Suggested fix: {suggested_fix}",
+    ]
+    for extra in error_lines[-4:-1]:
+        if len(lines) < MAX_TRIAGE_LINES:
+            lines.append(f"- {extra[:180]}")
+
+    return TriageSummary(
+        root_cause=root_cause,
+        file_line=file_line,
+        suggested_fix=suggested_fix,
+        lines=lines[:MAX_TRIAGE_LINES],
+        engine_id="fallback",
+        model="deterministic",
+        used_fallback=True,
+    )
+
+
+def get_small_job_ladder(store: Store | None = None) -> list[str]:
+    """Return configured ``small_job_ladder`` from settings, or the default Economy-first ladder."""
+    if store is not None:
+        raw = store.get_setting("engines.ladders")
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and isinstance(parsed.get("small_job_ladder"), list):
+                    ladder = [str(x).strip() for x in parsed["small_job_ladder"] if str(x).strip()]
+                    if ladder:
+                        return ladder
+            except Exception:
+                pass
+    return list(SMALL_JOB_LADDER_DEFAULT)
+
+
+async def run_triage_stage(
+    *,
+    failing_log: str,
+    workdir: Path,
+    runners: dict[str, Runner],
+    store: Store | None = None,
+    router: Any | None = None,
+    task_id: str | None = None,
+    risk_class: str = "business_logic",
+    job_name: str = "CI",
+    timeout_seconds: int = 120,
+) -> TriageSummary:
+    """Execute Stage 4 TRIAGE on ``small_job_ladder`` and persist attempt + ledger metrics."""
+    prompt = build_triage_prompt(failing_log, job_name=job_name)
+    ladder = get_small_job_ladder(store)
+    economics = PipelineEconomics(store) if store is not None else None
+
+    # Prefer router selection if available and eligible on small_job_ladder
+    ordered_candidates: list[str] = []
+    if router is not None and hasattr(router, "route_pipeline_task"):
+        route = router.route_pipeline_task(
+            task_id=task_id,
+            role="triage",
+            risk_class=risk_class,
+            contributing_providers=set(),
+            allowed_engines=set(ladder),
+        )
+        if not route.blocked and route.chosen_id:
+            ordered_candidates.append(route.chosen_id)
+    for eng in ladder:
+        if eng not in ordered_candidates:
+            ordered_candidates.append(eng)
+
+    for candidate in ordered_candidates:
+        runner = runners.get(candidate)
+        if runner is None:
+            # Match prefix e.g. agy-gemini-4-neon -> agy
+            base = candidate.split("-")[0]
+            runner = runners.get(base)
+        if runner is None:
+            continue
+
+        if economics is not None:
+            eng_row = store.get_engine(candidate) if store is not None else None
+            bcheck = economics.check_hard_budgets(
+                task_id=task_id,
+                role="triage",
+                engine_id=candidate,
+                runner=str(eng_row.get("runner") or candidate) if eng_row else candidate,
+                cost_tier=str(eng_row.get("cost_tier") or "") if eng_row else "",
+            )
+            if not bcheck.allowed:
+                continue
+
+        t0 = time.monotonic()
+        res = await runner.run(prompt, workdir, timeout_seconds=timeout_seconds)
+        elapsed = round(time.monotonic() - t0, 3)
+        parsed = parse_triage_output(res.stdout) if res.rc == 0 else None
+        model_name = getattr(runner, "model", "") or candidate
+
+        attempt_id: int | None = None
+        if store is not None and task_id:
+            attempt_id = store.record_task_attempt(
+                task_id=task_id,
+                stage="TRIAGE",
+                role="triage",
+                engine_id=candidate,
+                provider=provider_for_engine(candidate),
+                model=model_name,
+                input_ref="redacted:ci_log_tail",
+                output_ref="redacted:triage_summary",
+                decision_reason=f"small_job_ladder triage ({candidate})",
+                rc=res.rc,
+                outcome="ok" if parsed is not None else "failed",
+                wall_seconds=elapsed,
+            )
+        if economics is not None and task_id:
+            economics.record_ledger_event(
+                task_id=task_id,
+                attempt_id=attempt_id,
+                role="triage",
+                engine_id=candidate,
+                model=model_name,
+                risk_class=risk_class,
+                tokens_in=len(prompt) // 4,
+                tokens_out=len(res.stdout or "") // 4,
+                wall_seconds=elapsed,
+                outcome="accepted" if parsed is not None else "retry",
+            )
+
+        if parsed is not None:
+            return TriageSummary(
+                root_cause=parsed.root_cause,
+                file_line=parsed.file_line,
+                suggested_fix=parsed.suggested_fix,
+                lines=parsed.lines[:MAX_TRIAGE_LINES],
+                engine_id=candidate,
+                model=model_name,
+                used_fallback=False,
+                wall_seconds=elapsed,
+            )
+
+    return deterministic_triage_fallback(failing_log, job_name=job_name)

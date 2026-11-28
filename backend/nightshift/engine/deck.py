@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from nightshift.engine.pipeline_economics import PipelineEconomics
 from nightshift.optimizer.ab_framework import ABFramework
 from nightshift.store import Store
 
@@ -207,6 +208,15 @@ def generate_deck_data(
             "action_kind": "open_settings",
         })
 
+    # 4d. Tonight's pipeline economics & budget line (AGENT_PIPELINE §11.1)
+    budget_tonight = PipelineEconomics(store).get_tonight_spend_summary()
+    active_task = next(
+        (t for t in store.list_tasks(project_id=project_id) if str(t.get("status") or "") in ("RUNNING", "VERIFYING", "REVIEWING", "APPROVED", "MERGED")),
+        None,
+    )
+    active_risk_class = str(active_task.get("risk_class") or "") if active_task else None
+    active_pipeline_stage = str(active_task.get("status") or "") if active_task else None
+
     # 5. One-line plain English headline
     if needs_you:
         headline = f"{len(needs_you)} phase(s) need your attention · {len(done_tonight)} completed tonight"
@@ -234,9 +244,12 @@ def generate_deck_data(
             "step": current_step,
             "engine": current_engine,
             "eta": eta_formatted,
+            "risk_class": active_risk_class,
+            "pipeline_stage": active_pipeline_stage,
         },
         "next": upcoming[:3],
         "usage_tonight": engine_usage,
+        "budget_tonight": budget_tonight,
         "gold_saved_tonight": gold_saved_tonight,
         "token_savings_tonight": token_savings_tonight,
         "handoff_count": handoff_count,

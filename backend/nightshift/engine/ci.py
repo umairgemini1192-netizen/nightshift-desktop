@@ -526,6 +526,24 @@ class CiPipelineManager:
             # Pull failed CI log
             failed_log = self.vcs.get_failed_ci_log(repo, branch)
 
+            # Stage 4 TRIAGE on small_job_ladder (AGENT_PIPELINE §2, §7.2 — Phase 8f)
+            triage_block = ""
+            if task_contract is not None:
+                from nightshift.engine.pipeline_triage import run_triage_stage
+
+                if on_status_change:
+                    on_status_change(f"TRIAGING_CI_{round_num + 1}")
+                triage_res = await run_triage_stage(
+                    failing_log=failed_log,
+                    workdir=worktree_dir,
+                    runners=self.runners,
+                    store=self.store,
+                    task_id=str(task_contract.get("task_id") or "") or None,
+                    risk_class=risk_class,
+                    job_name=f"PR #{pr_number} CI",
+                )
+                triage_block = f"\n\nStage 4 Triage Summary (<= 10 lines):\n{triage_res.render()}\n"
+
             # Same-error detector & engine rotation (BLUEPRINT 5d):
             # Rotate engine after 2 failed rounds by the same engine
             engine_failure_count += 1
@@ -582,7 +600,7 @@ class CiPipelineManager:
 
             fix_prompt = (
                 f"{guardrail_header}\n\nCI failed on PR #{pr_number} (branch `{branch}`).\n"
-                f"Fix the root cause, commit, and push to `{branch}`.{conflict_note}\n\n"
+                f"Fix the root cause, commit, and push to `{branch}`.{conflict_note}{triage_block}\n\n"
                 f"Failed CI Log Tail:\n```\n{failed_log[-2000:]}\n```"
             )
             prompt_file = worktree_dir / ".nightshift_prompt.md"

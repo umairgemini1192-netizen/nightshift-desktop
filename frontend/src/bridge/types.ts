@@ -91,9 +91,22 @@ export interface DeckPayload {
     engine?: string | null;
     why?: string | null;
     eta?: string | null;
+    risk_class?: string | null;
+    pipeline_stage?: string | null;
   };
   next: UpcomingPhaseItem[];
   usage_tonight: Record<string, EngineUsageTonight>;
+  budget_tonight?: {
+    freeOnlyMode: boolean;
+    spentUsdEst: number;
+    capUsdEst: number;
+    invocations: number;
+    maxInvocations: number;
+    wallHours: number;
+    maxHours: number;
+    displayLine: string;
+    isEstimate: boolean;
+  };
   handoff_count: number;
   gold_saved_tonight?: {
     jobs_done: number;
@@ -333,6 +346,135 @@ export interface TokenOptimizerState {
     globalConfigModified: boolean;
     candidatesTried: string[];
   };
+}
+
+export type MaturityLabel = "Implemented" | "Integration-tested" | "Production-proven";
+
+export interface PipelineStageSegmentItem {
+  id: string;
+  label: string;
+  role: string;
+  executor: string;
+  status: "done" | "running" | "failed" | "blocked" | "pending";
+}
+
+export interface PipelineEvidenceItem {
+  id: number;
+  kind: string;
+  source: string;
+  commitSha: string;
+  durationSeconds: number;
+  verified: boolean;
+  rejectionReason: string;
+}
+
+export interface PipelineAttemptItem {
+  id: number;
+  stage: string;
+  role: string;
+  engineId: string;
+  provider: string;
+  outcome: string;
+  wallSeconds: number;
+  decisionReason: string;
+  outputRef: string;
+}
+
+export interface PipelineTaskItem {
+  id: string;
+  phaseId: string;
+  title: string;
+  branch: string;
+  status: string;
+  riskClass: string;
+  prNumber?: number | null;
+  headSha: string;
+  contractSha256: string;
+  contributingProviders: string[];
+  reviewerProvider?: string | null;
+  maturity: MaturityLabel;
+  stages: PipelineStageSegmentItem[];
+  evidence: PipelineEvidenceItem[];
+  tokensEstimate: number;
+  ciMinutesEstimate: number;
+  costUsdEstimate: number;
+  wallSeconds: number;
+  attempts: PipelineAttemptItem[];
+  blockReason?: string;
+  blockDetail?: string;
+}
+
+export interface PipelineModelScore {
+  engineId: string;
+  model: string;
+  role: string;
+  riskClass: string;
+  tier: "economy" | "standard" | "gold";
+  sampleTasks: number;
+  acceptedTasks: number;
+  acceptanceRatePct: number;
+  avgRetries: number;
+  regressionRatePct: number;
+  costPerAcceptedUsdEst: number;
+  benchmarkGraduated: boolean;
+  graduationStatus: "graduated" | "benchmarking" | "demoted";
+  graduationLabel: string;
+  thresholdPct: number;
+  isEstimate: boolean;
+}
+
+export interface PipelineStageMaturity {
+  stage: string;
+  label: string;
+  role: string;
+  executor: string;
+  maturity: MaturityLabel;
+  evidence: string;
+}
+
+export interface PipelineReleaseVerification {
+  tag: string;
+  repo: string;
+  taskId?: string | null;
+  mergeSha: string;
+  previousGoodTag?: string | null;
+  smokeStatus: "pending" | "passed" | "failed" | "rolled_back";
+  smokeDetail: string;
+  verifiedAt?: string | null;
+  rolledBackAt?: string | null;
+}
+
+export interface PipelineLedgerOverview {
+  summary: {
+    acceptedChanges30d: number;
+    costPerAcceptedUsdEst: number;
+    regressionRatePct: number;
+    goldSavedTasks: number;
+    freeOnlyMode: boolean;
+    monthlyBudget: {
+      spentUsdEst: number;
+      capUsdEst: number;
+      monthLabel: string;
+      isEstimate: boolean;
+    };
+    tonightBudget: {
+      freeOnlyMode: boolean;
+      spentUsdEst: number;
+      capUsdEst: number;
+      invocations: number;
+      maxInvocations: number;
+      wallHours: number;
+      maxHours: number;
+      displayLine: string;
+      isEstimate: boolean;
+    };
+    isEstimate: boolean;
+  };
+  activeTasks: PipelineTaskItem[];
+  modelScores: PipelineModelScore[];
+  taskLedger: PipelineTaskItem[];
+  stageMaturity: PipelineStageMaturity[];
+  releaseVerifications: PipelineReleaseVerification[];
 }
 
 export interface Bridge {
