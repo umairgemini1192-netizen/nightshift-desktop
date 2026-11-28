@@ -7,6 +7,7 @@ import { AuroraCanvas } from "./AuroraCanvas";
 import { CommandPalette } from "./CommandPalette";
 import { MODULES } from "./registry";
 import { Sidebar } from "./Sidebar";
+import { RouteErrorBoundary } from "./RouteErrorBoundary";
 import { useAppStore } from "./store";
 import { ToastHost } from "./ToastHost";
 import { TopBar } from "./TopBar";
@@ -95,7 +96,25 @@ export function Shell() {
                       <Route
                         key={manifest.id}
                         path={manifest.route}
-                        element={<Component />}
+                        element={
+                          <RouteErrorBoundary
+                            key={manifest.id}
+                            routeKey={location.pathname}
+                            routeTitle={manifest.title}
+                            onError={(error, info) => {
+                              void bridge
+                                .call("app.logError", {
+                                  route: manifest.id,
+                                  title: manifest.title,
+                                  message: error.message,
+                                  stack: error.stack ?? info.componentStack ?? "",
+                                })
+                                .catch(() => {});
+                            }}
+                          >
+                            <Component />
+                          </RouteErrorBoundary>
+                        }
                       />
                     ))}
                     <Route path="*" element={<Navigate to={defaultRoute} replace />} />

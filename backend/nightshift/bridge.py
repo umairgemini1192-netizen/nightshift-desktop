@@ -6,9 +6,11 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -31,6 +33,7 @@ from nightshift.engine.state_machine import ProjectConfig, set_keep_awake
 from nightshift.events import Event, EventBus
 from nightshift.modules.registry import ModuleRegistry
 from nightshift.quota.ledger import QuotaLedger
+from nightshift.runners.base import resolve_bin
 from nightshift.store import Store
 
 logger = logging.getLogger(__name__)
@@ -273,6 +276,18 @@ class BridgeAPI:
         if method == "app.dismissFirstRun":
             self._store.set_setting("onboarding.completed", "1")
             return {"ok": True, "data": {"dismissed": True}}
+        if method == "app.logError":
+            route = str(payload.get("route") or "unknown")
+            message = str(payload.get("message") or "Unknown UI error")
+            self._events.emit(
+                Event(
+                    kind="ui.route_error",
+                    plain_text=f"UI error on {route}: {message}",
+                    level="error",
+                    payload={"route": route, "message": message},
+                )
+            )
+            return {"ok": True, "data": {"logged": True}}
         if method == "window.minimize":
             if self._window is not None and hasattr(self._window, "minimize"):
                 self._window.minimize()
@@ -306,19 +321,42 @@ class BridgeAPI:
             checks = self._logins.check_all(repo=repo, force=method == "logins.recheck")
             return {"ok": True, "data": {name: asdict(result) for name, result in checks.items()}}
         if method == "logins.openFix":
+            tool = str(payload.get("tool", "")).strip()
+            eng = self._store.get_engine(tool) if tool else None
+            matching = [
+                e for e in self._store.list_engines()
+                if str(e.get("id") or "") == tool or str(e.get("runner") or "") == tool
+            ] if tool else []
+            is_disabled = (eng is not None and not int(eng.get("enabled", 1))) or (
+                bool(matching) and all(not int(e.get("enabled", 1)) for e in matching)
+            )
+            if is_disabled:
+                return {"ok": False, "error": f"{tool} is disabled by owner."}
+            if tool == "gemini":
+                return {
+                    "ok": False,
+                    "error": "Gemini CLI uses an API key configured in AI Engines & Quota; interactive sign-in is disabled.",
+                }
             commands = {
                 "gh": ["gh", "auth", "login"],
                 "claude": ["claude", "auth", "login"],
                 "codex": ["codex", "login"],
-                "gemini": ["gemini"],
                 "agy": ["agy"],
                 "qwen": ["qwen"],
             }
-            command = commands.get(str(payload.get("tool", "")))
+            command = commands.get(tool)
             if command is None:
                 return {"ok": False, "error": "No login command is available for this tool."}
+            exe = resolve_bin(command[0])
+            if not exe:
+                return {"ok": False, "error": "Could not open the login command. Check that the tool is installed."}
+            if exe.lower().endswith(".ps1"):
+                ps = shutil.which("powershell.exe") or "powershell.exe"
+                launch_cmd = [ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", exe] + command[1:]
+            else:
+                launch_cmd = [exe] + command[1:]
             try:
-                subprocess.Popen(command, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+                subprocess.Popen(launch_cmd, creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
             except OSError:
                 return {"ok": False, "error": "Could not open the login command. Check that the tool is installed."}
             return {"ok": True, "data": {"opened": True}}
@@ -477,7 +515,16 @@ class BridgeAPI:
                     phase_defs.append(PhaseDefinition.from_dict(p) if isinstance(p, dict) else p)
                 except Exception as e:
                     return {"ok": True, "data": {"valid": False, "problems": [f"Malformed phase: {e}"]}}
-            problems = validate_plan(phase_defs)
+            ladders_raw = self._store.get_setting("engines.ladders")
+            custom_ladders: set[str] = set()
+            if ladders_raw:
+                try:
+                    parsed_ladders = json.loads(ladders_raw)
+                    if isinstance(parsed_ladders, dict):
+                        custom_ladders = {str(k) for k in parsed_ladders.keys()}
+                except Exception:
+                    pass
+            problems = validate_plan(phase_defs, known_ladders=KNOWN_LADDERS | custom_ladders)
             return {"ok": True, "data": {"valid": len(problems) == 0, "problems": problems}}
 
         if method == "plan.importQueue":
@@ -764,14 +811,37 @@ class BridgeAPI:
             runs = []
             for p in plans:
                 phases = self._store.list_phases(p["id"])
+                plan_status = str(p.get("status", "draft")).lower()
+                all_steps: list[dict[str, Any]] = []
+                for ph in phases:
+                    all_steps.extend(self._store.list_steps(ph["id"]))
+                has_non_pending_phase = any(
+                    str(ph.get("status", "pending")).lower() != "pending" for ph in phases
+                )
+                tasks_for_plan = self._store.list_tasks(plan_id=p["id"])
+                if plan_status == "draft" and not all_steps and not has_non_pending_phase and not tasks_for_plan:
+                    continue
+
                 done_phases = [ph for ph in phases if ph.get("status") in ("merged", "completed")]
                 failed_phases = [ph for ph in phases if ph.get("status") in ("failed", "parked")]
-                runners_used = set()
-                for ph in phases:
-                    steps = self._store.list_steps(ph["id"])
-                    for s in steps:
-                        if s.get("runner"):
-                            runners_used.add(s["runner"])
+                runners_used = {str(s["runner"]) for s in all_steps if s.get("runner")}
+                total_secs = 0.0
+                for s in all_steps:
+                    st_ts = s.get("started_at")
+                    fn_ts = s.get("finished_at")
+                    if st_ts and fn_ts:
+                        try:
+                            dt0 = datetime.fromisoformat(str(st_ts).replace("Z", "+00:00"))
+                            dt1 = datetime.fromisoformat(str(fn_ts).replace("Z", "+00:00"))
+                            total_secs += max(0.0, (dt1 - dt0).total_seconds())
+                        except Exception:
+                            pass
+                if total_secs > 0:
+                    mins = int(round(total_secs / 60.0))
+                    duration_str = f"{mins // 60} h {mins % 60} m" if mins >= 60 else f"{max(1, mins)} m"
+                else:
+                    duration_str = "-"
+
                 runs.append({
                     "id": p["id"],
                     "projectId": p.get("project_id", ""),
@@ -780,8 +850,8 @@ class BridgeAPI:
                     "phasesCount": len(phases),
                     "phasesDone": len(done_phases),
                     "phasesFailed": len(failed_phases),
-                    "duration": "1 h 15 m",
-                    "aiUsed": sorted(list(runners_used)) if runners_used else ["agy", "gemini"],
+                    "duration": duration_str,
+                    "aiUsed": sorted(runners_used),
                     "createdAt": p.get("created_at", ""),
                     "updatedAt": p.get("updated_at", ""),
                 })
@@ -795,45 +865,62 @@ class BridgeAPI:
                 plan = plans[0] if plans else {"id": run_id, "title": "Run", "project_id": "default"}
             phases = self._store.list_phases(plan.get("id"))
             proj = self._store.get_project(plan.get("project_id", ""))
-            repo = proj.get("repo", "owner/repo") if proj else "owner/repo"
+            repo = proj.get("repo", "") if proj else ""
             formatted_phases = []
             for ph in phases:
                 steps = self._store.list_steps(ph["id"])
-                runner = steps[-1]["runner"] if steps else "agy"
+                runner = str(steps[-1]["runner"]) if steps and steps[-1].get("runner") else "-"
                 pr_num = ph.get("pr_number")
+                ph_secs = 0.0
+                for s in steps:
+                    if s.get("started_at") and s.get("finished_at"):
+                        try:
+                            dt0 = datetime.fromisoformat(str(s["started_at"]).replace("Z", "+00:00"))
+                            dt1 = datetime.fromisoformat(str(s["finished_at"]).replace("Z", "+00:00"))
+                            ph_secs += max(0.0, (dt1 - dt0).total_seconds())
+                        except Exception:
+                            pass
+                ph_dur = f"{max(1, int(round(ph_secs / 60.0)))} m" if ph_secs > 0 else "-"
                 formatted_phases.append({
                     "id": ph["id"],
                     "title": ph.get("title", ph["id"]),
                     "status": ph.get("status", "pending"),
                     "runner": runner,
                     "pr_number": pr_num,
-                    "pr_url": f"https://github.com/{repo}/pull/{pr_num}" if pr_num else None,
+                    "pr_url": f"https://github.com/{repo}/pull/{pr_num}" if (pr_num and repo) else None,
                     "branch": ph.get("branch", ""),
-                    "duration": "24 m",
+                    "duration": ph_dur,
                 })
             digest_lines = [
                 f"# Morning Digest for {plan.get('title')}",
                 "",
-                f"**Project**: {proj.get('name', 'DriveLift') if proj else 'Default'}",
-                f"**Repo**: {repo}",
+                f"**Project**: {proj.get('name', plan.get('project_id', '')) if proj else 'Default'}",
+                f"**Repo**: {repo or '-'}",
                 "",
-                "### Completed Phases",
+                "### Phases",
             ]
             for ph in formatted_phases:
                 status_mark = "Merged" if ph["status"] in ("merged", "completed") else ph["status"].capitalize()
                 pr_part = f" (PR #{ph['pr_number']})" if ph["pr_number"] else ""
                 digest_lines.append(f"- **{ph['title']}**: {status_mark} via {ph['runner']}{pr_part}")
             digest = "\n".join(digest_lines)
+            artifacts: list[dict[str, str]] = []
+            if repo:
+                for rel in self._store.list_release_verifications(repo=repo, limit=5):
+                    tag = str(rel.get("tag") or "")
+                    if tag:
+                        artifacts.append({
+                            "name": f"Release {tag}",
+                            "size": str(rel.get("smoke_status") or "-"),
+                            "sha256": str(rel.get("merge_sha") or ""),
+                        })
             return {
                 "ok": True,
                 "data": {
-                    "run": next((run for run in self.call("runs.list")["data"] if run["id"] == plan["id"]), {"id": plan["id"], "title": plan.get("title", ""), "projectId": plan.get("project_id", ""), "status": "draft", "phasesCount": 0, "phasesDone": 0, "phasesFailed": 0, "duration": "", "aiUsed": [], "createdAt": "", "updatedAt": ""}),
+                    "run": next((run for run in self.call("runs.list")["data"] if run["id"] == plan["id"]), {"id": plan["id"], "title": plan.get("title", ""), "projectId": plan.get("project_id", ""), "status": plan.get("status", "draft"), "phasesCount": len(phases), "phasesDone": 0, "phasesFailed": 0, "duration": "-", "aiUsed": [], "createdAt": plan.get("created_at", ""), "updatedAt": plan.get("updated_at", "")}),
                     "digest": digest,
                     "phases": formatted_phases,
-                    "artifacts": [
-                        {"name": "app-release-unsigned.apk", "size": "18.4 MB", "sha256": "3a8c1f38e07c8d9"},
-                        {"name": "SHA256SUMS", "size": "120 B", "sha256": "c8e2b109af4e1d"},
-                    ],
+                    "artifacts": artifacts,
                 },
             }
 
@@ -856,10 +943,10 @@ class BridgeAPI:
             engines = self._store.list_engines()
             if not engines:
                 engines = [
-                    {"id": "agy", "runner": "agy", "model": "auto", "effort": "medium", "state": "ready", "quotaUsedPct": 65, "coolingUntil": None},
-                    {"id": "gemini", "runner": "gemini", "model": "gemini-2.5-pro", "effort": "medium", "state": "ready", "quotaUsedPct": 30, "coolingUntil": None},
-                    {"id": "codex", "runner": "codex", "model": "o3-mini", "effort": "medium", "state": "ready", "quotaUsedPct": 20, "coolingUntil": None},
-                    {"id": "claude", "runner": "claude", "model": "claude-3-7-sonnet", "effort": "medium", "state": "ready", "quotaUsedPct": 10, "coolingUntil": None},
+                    {"id": "agy", "runner": "agy", "model": "auto", "effort": "medium", "state": "ready", "quotaUsedPct": 0, "coolingUntil": None},
+                    {"id": "gemini", "runner": "gemini", "model": "gemini-2.5-pro", "effort": "medium", "state": "ready", "quotaUsedPct": 0, "coolingUntil": None},
+                    {"id": "codex", "runner": "codex", "model": "o3-mini", "effort": "medium", "state": "ready", "quotaUsedPct": 0, "coolingUntil": None},
+                    {"id": "claude", "runner": "claude", "model": "claude-3-7-sonnet", "effort": "medium", "state": "ready", "quotaUsedPct": 0, "coolingUntil": None},
                 ]
             names = {
                 "agy": "Antigravity",
@@ -1028,7 +1115,7 @@ class BridgeAPI:
 
         if method == "engines.getLadders":
             ladders_raw = self._store.get_setting("engines.ladders")
-            ladders = json.loads(ladders_raw) if ladders_raw else {
+            raw_ladders = json.loads(ladders_raw) if ladders_raw else {
                 "backend": ["agy", "gemini", "codex", "claude"],
                 "ui": ["agy", "gemini", "claude"],
                 "review": ["gemini", "codex", "claude"],
@@ -1036,21 +1123,44 @@ class BridgeAPI:
                 "small_job_ladder": ["qwen", "deepseek", "kimi", "glm", "minimax", "gemini", "codex", "agy"],
                 "default": ["agy", "gemini", "codex", "claude"],
             }
+            normalized_ladders: dict[str, list[dict[str, str | None]]] = {}
+            for cat, entries in (raw_ladders.items() if isinstance(raw_ladders, dict) else []):
+                norm_list: list[dict[str, str | None]] = []
+                for entry in entries if isinstance(entries, list) else []:
+                    if isinstance(entry, dict):
+                        runner = str(entry.get("runner") or entry.get("id") or "").strip()
+                        model = str(entry.get("model")).strip() if entry.get("model") else None
+                        effort = str(entry.get("effort")).strip() if entry.get("effort") else None
+                        if runner:
+                            norm_list.append({"runner": runner, "model": model, "effort": effort})
+                    elif isinstance(entry, str) and entry.strip():
+                        norm_list.append({"runner": entry.strip(), "model": None, "effort": None})
+                normalized_ladders[str(cat)] = norm_list
             return {
                 "ok": True,
                 "data": {
-                    "ladders": ladders,
+                    "ladders": normalized_ladders,
                     "pinnedNote": "Claude is pinned last due to token cost; reserved for complex failovers.",
                 },
             }
 
         if method == "engines.setLadders":
             new_ladders = payload.get("ladders") or {}
-            sanitized: dict[str, list[str]] = {}
+            sanitized: dict[str, list[Any]] = {}
             for cat, runners in new_ladders.items():
-                r_list = [r for r in runners if r != "claude"]
-                r_list.append("claude")
-                sanitized[cat] = r_list
+                non_claude: list[Any] = []
+                claude_entries: list[Any] = []
+                for r in runners:
+                    runner_id = str(r.get("runner") or "") if isinstance(r, dict) else str(r)
+                    if runner_id == "claude":
+                        claude_entries.append(r)
+                    else:
+                        non_claude.append(r)
+                if claude_entries:
+                    non_claude.extend(claude_entries)
+                else:
+                    non_claude.append("claude")
+                sanitized[cat] = non_claude
             self._store.set_setting("engines.ladders", json.dumps(sanitized))
             return {
                 "ok": True,
@@ -1073,11 +1183,45 @@ class BridgeAPI:
                 }
                 for d in raw_decisions
             ]
+            names = {
+                "agy": "Antigravity",
+                "gemini": "Gemini CLI",
+                "codex": "Codex CLI",
+                "claude": "Claude Code",
+                "qwen": "Qwen Code",
+                "deepseek": "DeepSeek",
+                "kimi": "Kimi K2",
+                "glm": "GLM",
+                "minimax": "MiniMax",
+            }
+            agg: dict[str, dict[str, Any]] = {}
+            for entry in entries:
+                runner = str(entry.get("runner") or "unknown")
+                tokens = int(entry.get("tokens_in") or 0) + int(entry.get("tokens_out") or 0)
+                cost = float(entry.get("cost_usd_est") or 0.0)
+                bucket = agg.setdefault(runner, {"tokens": 0, "cost": 0.0})
+                bucket["tokens"] += tokens
+                bucket["cost"] += cost
+            for p_entry in self._store.list_pipeline_ledger(limit=200):
+                runner = str(p_entry.get("engine_id") or "unknown")
+                tokens = int(p_entry.get("tokens_in") or 0) + int(p_entry.get("tokens_out") or 0)
+                cost = float(p_entry.get("est_token_cost_usd") or 0.0)
+                if runner not in agg:
+                    agg[runner] = {"tokens": tokens, "cost": cost}
+                elif not entries:
+                    agg[runner]["tokens"] += tokens
+                    agg[runner]["cost"] += cost
+
+            max_tokens = max((v["tokens"] for v in agg.values()), default=0)
             chart_data = [
-                {"runner": "agy", "name": "Antigravity", "tokens": 42000, "costEstimate": "$0.00 (Flat)", "pct": 65},
-                {"runner": "gemini", "name": "Gemini CLI", "tokens": 18500, "costEstimate": "$0.04 (Est.)", "pct": 30},
-                {"runner": "codex", "name": "Codex CLI", "tokens": 12000, "costEstimate": "$0.12 (Est.)", "pct": 20},
-                {"runner": "claude", "name": "Claude Code", "tokens": 4500, "costEstimate": "$0.09 (Est.)", "pct": 10},
+                {
+                    "runner": runner,
+                    "name": names.get(runner, runner),
+                    "tokens": int(stats["tokens"]),
+                    "costEstimate": f"${stats['cost']:.2f} (Est.)" if stats["cost"] > 0 else "$0.00 (Flat)",
+                    "pct": int(round((stats["tokens"] / max_tokens) * 100)) if max_tokens > 0 else 0,
+                }
+                for runner, stats in agg.items()
             ]
             return {
                 "ok": True,
@@ -1291,7 +1435,9 @@ class BridgeAPI:
             run_state = "running" if is_running else ("failed" if deck.get("needs_you") else "idle")
             scenario = "empty" if not projects else ("running" if is_running else ("failure" if parked else "idle"))
 
-            phases = self._store.list_phases(project_id=active_project_id) if active_project_id else []
+            project_plans = self._store.list_plans(active_project_id) if active_project_id else []
+            selected_plan = project_plans[0] if project_plans else None
+            phases = self._store.list_phases(selected_plan["id"]) if selected_plan else []
             done_count = len([ph for ph in phases if ph.get("status") in ("merged", "completed")])
 
             badges = {

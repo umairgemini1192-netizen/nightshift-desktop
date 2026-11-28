@@ -70,6 +70,27 @@ class LoginHealthChecker:
             if now - cached_time < timedelta(minutes=ttl_minutes):
                 return cached_res
 
+        # Check if disabled by owner first (skip probes and never offer Fix/login)
+        if self._store is not None:
+            eng = self._store.get_engine(tool)
+            matching = [
+                e for e in self._store.list_engines()
+                if str(e.get("id") or "") == tool or str(e.get("runner") or "") == tool
+            ]
+            is_disabled = (eng is not None and not int(eng.get("enabled", 1))) or (
+                bool(matching) and all(not int(e.get("enabled", 1)) for e in matching)
+            )
+            if is_disabled:
+                res = LoginCheckResult(
+                    tool=tool,
+                    state="Disabled by owner",
+                    detail=f"{tool} is disabled by owner",
+                    checked_at=now.isoformat(),
+                )
+                self._cache[cache_key] = (now, res)
+                self._store.record_login_check(tool, res.state, res.detail, res.back_at)
+                return res
+
         # Check if cooling down first (skip probes during cooldown per BLUEPRINT 5f)
         if self._quota_ledger is not None and self._quota_ledger.is_cooling_down(tool):
             back_at = self._quota_ledger.get_reset_at(tool)

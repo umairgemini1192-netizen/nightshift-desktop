@@ -186,7 +186,11 @@ def get_small_job_ladder(store: Store | None = None) -> list[str]:
             try:
                 parsed = json.loads(raw)
                 if isinstance(parsed, dict) and isinstance(parsed.get("small_job_ladder"), list):
-                    ladder = [str(x).strip() for x in parsed["small_job_ladder"] if str(x).strip()]
+                    ladder = []
+                    for x in parsed["small_job_ladder"]:
+                        val = str(x.get("runner") or "").strip() if isinstance(x, dict) else str(x).strip()
+                        if val:
+                            ladder.append(val)
                     if ladder:
                         return ladder
             except Exception:

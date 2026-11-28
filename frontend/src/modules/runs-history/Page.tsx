@@ -180,7 +180,7 @@ export default function RunsHistoryPage() {
               <div>
                 <p className="text-xs text-text-secondary">Duration</p>
                 <p className="mt-1 text-sm font-semibold text-text-primary ns-tabular">
-                  {detail.run.duration || "1 h 42 m"}
+                  {detail.run.duration || "-"}
                 </p>
               </div>
               <div>
@@ -329,7 +329,7 @@ export default function RunsHistoryPage() {
                             hour: "2-digit",
                             minute: "2-digit",
                           })
-                        : "Nov 25, 22:15"}
+                        : "-"}
                     </td>
                     <td className="py-3 font-medium">
                       <div className="font-semibold text-text-primary">{run.title}</div>
@@ -349,18 +349,22 @@ export default function RunsHistoryPage() {
                       )}
                     </td>
                     <td className="py-3 text-text-secondary ns-tabular">
-                      {run.duration || "1 h 42 m"}
+                      {run.duration || "-"}
                     </td>
                     <td className="py-3">
                       <div className="flex flex-wrap gap-1">
-                        {run.aiUsed?.map((engine) => (
-                          <span
-                            key={engine}
-                            className="rounded bg-surface-elevated px-1.5 py-0.5 text-xs text-text-secondary"
-                          >
-                            {engine}
-                          </span>
-                        )) ?? <span className="text-text-muted">None</span>}
+                        {run.aiUsed && run.aiUsed.length > 0 ? (
+                          run.aiUsed.map((engine) => (
+                            <span
+                              key={engine}
+                              className="rounded bg-surface-elevated px-1.5 py-0.5 text-xs text-text-secondary"
+                            >
+                              {engine}
+                            </span>
+                          ))
+                        ) : (
+                          <span className="text-text-muted">-</span>
+                        )}
                       </div>
                     </td>
                     <td className="py-3 text-right">

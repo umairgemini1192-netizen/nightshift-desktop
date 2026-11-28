@@ -228,8 +228,11 @@ def generate_deck_data(
     elif done_tonight and not upcoming:
         headline = f"All {len(done_tonight)} phases completed cleanly tonight"
         state = "good"
+    elif upcoming:
+        headline = f"{proj_name} · {len(upcoming)} phase(s) ready to run"
+        state = "idle"
     else:
-        headline = f"{proj_name} is ready for execution"
+        headline = f"{proj_name} is ready — create or import a plan to start"
         state = "idle"
 
     return {

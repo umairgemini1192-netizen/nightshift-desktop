@@ -298,6 +298,9 @@ export class MockBridge implements Bridge {
         this.firstRunDismissed = true;
         return { dismissed: true } as T;
 
+      case "app.logError":
+        return { logged: true } as T;
+
       case "app.selectProject": {
         const projectId = typeof args?.projectId === "string" ? args.projectId : null;
         this.snapshot = { ...this.snapshot, activeProjectId: projectId };
@@ -768,7 +771,38 @@ export class MockBridge implements Bridge {
       case "engines.update":
         return { ok: true } as T;
 
-      case "engines.getLadders":
+      case "engines.getLadders": {
+        const useObjectLadders =
+          typeof window !== "undefined" &&
+          new URLSearchParams(window.location.search).get("ladders") === "object";
+        if (useObjectLadders) {
+          return {
+            ladders: {
+              backend: [
+                { runner: "agy", model: "gemini-4-neon", effort: "medium" },
+                { runner: "gemini", model: "gemini-2.5-pro", effort: "medium" },
+                { runner: "codex", model: "o3-mini", effort: "medium" },
+                { runner: "claude", model: "claude-3-7-sonnet", effort: "medium" },
+              ],
+              ui: [
+                { runner: "agy", model: "gemini-4-neon", effort: "medium" },
+                { runner: "gemini", model: "gemini-2.5-pro", effort: "medium" },
+                { runner: "claude", model: "claude-3-7-sonnet", effort: "medium" },
+              ],
+              review: [
+                { runner: "gemini", model: "gemini-2.5-pro", effort: "medium" },
+                { runner: "codex", model: "o3-mini", effort: "medium" },
+                { runner: "claude", model: "claude-3-7-sonnet", effort: "medium" },
+              ],
+              ci_fix: [
+                { runner: "codex", model: "o3-mini", effort: "medium" },
+                { runner: "gemini", model: "gemini-2.5-pro", effort: "medium" },
+                { runner: "claude", model: "claude-3-7-sonnet", effort: "medium" },
+              ],
+            },
+            pinnedNote: "Claude is pinned last due to token cost; reserved for complex failovers.",
+          } as T;
+        }
         return {
           ladders: {
             backend: ["agy", "gemini", "codex", "claude"],
@@ -778,6 +812,7 @@ export class MockBridge implements Bridge {
           },
           pinnedNote: "Claude is pinned last due to token cost; reserved for complex failovers.",
         } as T;
+      }
 
       case "engines.setLadders":
         return { ok: true, ladders: args?.ladders } as T;

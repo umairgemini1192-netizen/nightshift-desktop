@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   Badge,
   Button,
+  EmptyState,
   EngineCard,
   type EngineAvailability,
   GlassCard,
@@ -32,7 +33,32 @@ const LADDER_CATEGORIES = [
   { id: "ci_fix", label: "CI self-healing rounds" },
 ] as const;
 
-type CategoryId = (typeof LADDER_CATEGORIES)[number]["id"];
+type CategoryId = string;
+
+export interface LadderObjectEntry {
+  runner: string;
+  model?: string | null;
+  effort?: string | null;
+}
+
+export type LadderEntry = string | LadderObjectEntry;
+
+function getLadderRunner(entry: LadderEntry): string {
+  return typeof entry === "string" ? entry : entry.runner;
+}
+
+function getLadderKey(entry: LadderEntry, idx: number): string {
+  if (typeof entry === "string") return `${entry}-${idx}`;
+  return `${entry.runner}:${entry.model ?? ""}:${entry.effort ?? ""}-${idx}`;
+}
+
+function getLadderLabel(entry: LadderEntry, engineNameMap: Record<string, string>): string {
+  if (typeof entry === "string") {
+    return engineNameMap[entry] || entry;
+  }
+  const base = engineNameMap[entry.runner] || entry.runner;
+  return entry.model ? `${base} (${entry.runner}:${entry.model})` : base;
+}
 
 interface LedgerChartItem {
   runner: string;
@@ -71,7 +97,7 @@ export default function EnginesQuotaPage() {
   const pushToast = useAppStore((s) => s.pushToast);
 
   const [engines, setEngines] = useState<EngineItem[]>([]);
-  const [ladders, setLadders] = useState<Record<string, string[]>>({
+  const [ladders, setLadders] = useState<Record<string, LadderEntry[]>>({
     backend: ["agy", "gemini", "codex", "claude"],
     ui: ["agy", "gemini", "claude"],
     review: ["gemini", "codex", "claude"],
@@ -105,7 +131,7 @@ export default function EnginesQuotaPage() {
       setLoading(true);
       const [engRes, ladderRes, ledgerRes] = await Promise.all([
         bridge.call<EngineItem[]>("engines.list"),
-        bridge.call<{ ladders: Record<string, string[]>; pinnedNote: string }>("engines.getLadders"),
+        bridge.call<{ ladders: Record<string, LadderEntry[]>; pinnedNote: string }>("engines.getLadders"),
         bridge.call<{ routerDecisions: RouterDecision[]; chartData: LedgerChartItem[] }>("engines.getLedger"),
       ]);
 
@@ -319,7 +345,7 @@ export default function EnginesQuotaPage() {
     }
 
     // Rule: Claude cannot be moved above the last position
-    if (list[fromIndex] === "claude" && toIndex < list.length - 1) {
+    if (getLadderRunner(list[fromIndex]) === "claude" && toIndex < list.length - 1) {
       pushToast({
         title: "Claude must stay last",
         description: pinnedNote,
@@ -332,8 +358,9 @@ export default function EnginesQuotaPage() {
     list.splice(toIndex, 0, item);
 
     // Guarantee Claude stays at the end
-    const sanitized = list.filter((r) => r !== "claude");
-    sanitized.push("claude");
+    const nonClaude = list.filter((r) => getLadderRunner(r) !== "claude");
+    const claudeEntries = list.filter((r) => getLadderRunner(r) === "claude");
+    const sanitized: LadderEntry[] = claudeEntries.length > 0 ? [...nonClaude, ...claudeEntries] : [...nonClaude, "claude"];
 
     const updated = { ...ladders, [category]: sanitized };
     setLadders(updated);
@@ -483,7 +510,12 @@ export default function EnginesQuotaPage() {
           <GlassCard title="Category Failover Ladders" icon="Layers">
             {/* Category tabs */}
             <div className="flex flex-wrap gap-1 border-b border-border-subtle pb-3">
-              {LADDER_CATEGORIES.map((cat) => {
+              {[
+                ...LADDER_CATEGORIES,
+                ...Object.keys(ladders)
+                  .filter((k) => !LADDER_CATEGORIES.some((c) => c.id === k))
+                  .map((k) => ({ id: k, label: k })),
+              ].map((cat) => {
                 const isActive = activeCategory === cat.id;
                 return (
                   <button
@@ -510,11 +542,13 @@ export default function EnginesQuotaPage() {
 
             {/* Ladder reorder list */}
             <div className="mt-3 flex flex-col gap-2">
-              {(ladders[activeCategory] ?? []).map((runnerKey, idx, arr) => {
+              {(ladders[activeCategory] ?? []).map((entry, idx, arr) => {
+                const runnerKey = getLadderRunner(entry);
                 const isClaude = runnerKey === "claude";
+                const label = getLadderLabel(entry, engineNameMap);
                 return (
                   <div
-                    key={runnerKey}
+                    key={getLadderKey(entry, idx)}
                     className="ns-glass flex items-center justify-between rounded-lg p-2.5 text-xs"
                   >
                     <div className="flex items-center gap-2">
@@ -522,8 +556,11 @@ export default function EnginesQuotaPage() {
                         #{idx + 1}
                       </span>
                       <span className="font-medium text-text-primary">
-                        {engineNameMap[runnerKey] || runnerKey}
+                        {label}
                       </span>
+                      {typeof entry !== "string" && entry.effort && (
+                        <Badge tone="neutral">{entry.effort}</Badge>
+                      )}
                       {isClaude && <Badge tone="warning">Pinned Last</Badge>}
                     </div>
 
@@ -533,7 +570,7 @@ export default function EnginesQuotaPage() {
                         type="button"
                         disabled={idx === 0 || isClaude}
                         onClick={() => moveLadderEngine(activeCategory, idx, idx - 1)}
-                        aria-label={`Move ${runnerKey} up`}
+                        aria-label={`Move ${label} up`}
                         className="rounded p-1 text-text-muted hover:text-text-primary disabled:opacity-20"
                       >
                         <Icon name="ChevronUp" size={16} />
@@ -542,7 +579,7 @@ export default function EnginesQuotaPage() {
                         type="button"
                         disabled={idx === arr.length - 1 || isClaude}
                         onClick={() => moveLadderEngine(activeCategory, idx, idx + 1)}
-                        aria-label={`Move ${runnerKey} down`}
+                        aria-label={`Move ${label} down`}
                         className="rounded p-1 text-text-muted hover:text-text-primary disabled:opacity-20"
                       >
                         <Icon name="ChevronDown" size={16} />
@@ -597,8 +634,15 @@ export default function EnginesQuotaPage() {
             </p>
           }
         >
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            {chartData.map((item) => (
+          {chartData.length === 0 ? (
+            <EmptyState
+              icon="Cpu"
+              title="No data yet"
+              description="Token and quota usage from real runs will appear here once recorded."
+            />
+          ) : (
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+              {chartData.map((item) => (
               <div
                 key={item.runner}
                 className="flex flex-col gap-2 rounded-lg bg-surface-elevated/30 p-3"
@@ -632,7 +676,8 @@ export default function EnginesQuotaPage() {
                 </div>
               </div>
             ))}
-          </div>
+            </div>
+          )}
         </GlassCard>
       </section>
 

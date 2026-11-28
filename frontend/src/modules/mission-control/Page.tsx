@@ -152,7 +152,9 @@ export default function MissionControlPage() {
 
   // Inspect readiness
   const loginEntries = Object.entries(logins);
-  const unreadyLogins = loginEntries.filter(([, item]) => item.state !== "Ready");
+  const unreadyLogins = loginEntries.filter(
+    ([, item]) => item.state !== "Ready" && item.state !== "Disabled by owner",
+  );
   const readyImplementers = loginEntries.filter(
     ([name, item]) => ["agy", "gemini", "codex", "claude"].includes(name) && item.state === "Ready",
   );
@@ -591,12 +593,16 @@ export default function MissionControlPage() {
             const item = logins[key];
             const state = item?.state ?? "Checking";
             const isReady = state === "Ready";
+            const isDisabledByOwner = state === "Disabled by owner";
+            const isApiKeyOnly = key === "gemini";
             const tone =
               isReady
                 ? "success"
-                : state === "Limit reached" || state === "Cooling down"
-                  ? "warning"
-                  : "danger";
+                : isDisabledByOwner
+                  ? "neutral"
+                  : state.startsWith("Limit reached") || state === "Cooling down"
+                    ? "warning"
+                    : "danger";
 
             return (
               <div
@@ -608,7 +614,7 @@ export default function MissionControlPage() {
                   {state}
                   {item?.backAt ? ` (back at ${item.backAt})` : ""}
                 </Badge>
-                {!isReady && (
+                {!isReady && !isDisabledByOwner && !isApiKeyOnly && (
                   <button
                     type="button"
                     onClick={() => handleFixTool(key)}
@@ -816,75 +822,97 @@ export default function MissionControlPage() {
             <span className="text-xs text-text-muted">estimate from local ledger</span>
           }
         >
-          <div className="flex flex-col gap-3">
-            {[
-              { id: "agy", name: "Antigravity", model: "auto" },
-              { id: "gemini", name: "Gemini CLI", model: "gemini-2.5-pro" },
-              { id: "codex", name: "Codex CLI", model: "o3-mini" },
-              { id: "claude", name: "Claude Code", model: "claude-3-7-sonnet" },
-            ].map((eng) => {
-              const usage = deck?.usage_tonight?.[eng.id];
-              const budgetPct = usage?.budgetPct ?? 0;
-              const barWidth = Math.min(Math.max(budgetPct, 0), 100);
+          {(() => {
+            const hasUsageData =
+              Object.keys(deck?.usage_tonight ?? {}).length > 0 ||
+              (deck?.handoff_count ?? 0) > 0 ||
+              (deck?.budget_tonight?.invocations ?? 0) > 0 ||
+              (deck?.gold_saved_tonight?.jobs_done ?? 0) > 0;
 
+            if (!hasUsageData) {
               return (
-                <div key={eng.id} className="flex flex-col gap-1">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-medium text-text-primary">{eng.name}</span>
-                    <span className="font-mono text-text-muted ns-tabular">
-                      ~{budgetPct}% budget used (estimate)
+                <EmptyState
+                  icon="Cpu"
+                  title="No data yet"
+                  description="AI usage, spend, and gold savings will appear here once a run records ledger data."
+                />
+              );
+            }
+
+            return (
+              <>
+                <div className="flex flex-col gap-3">
+                  {[
+                    { id: "agy", name: "Antigravity", model: "auto" },
+                    { id: "gemini", name: "Gemini CLI", model: "gemini-2.5-pro" },
+                    { id: "codex", name: "Codex CLI", model: "o3-mini" },
+                    { id: "claude", name: "Claude Code", model: "claude-3-7-sonnet" },
+                  ].map((eng) => {
+                    const usage = deck?.usage_tonight?.[eng.id];
+                    const budgetPct = usage?.budgetPct ?? 0;
+                    const barWidth = Math.min(Math.max(budgetPct, 0), 100);
+
+                    return (
+                      <div key={eng.id} className="flex flex-col gap-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-medium text-text-primary">{eng.name}</span>
+                          <span className="font-mono text-text-muted ns-tabular">
+                            ~{budgetPct}% budget used (estimate)
+                          </span>
+                        </div>
+                        <div className="h-1.5 w-full rounded-pill bg-surface-raised overflow-hidden border border-border-subtle">
+                          <div
+                            className={`h-full rounded-pill ${
+                              budgetPct >= 90
+                                ? "bg-status-danger"
+                                : budgetPct >= 70
+                                  ? "bg-status-warning"
+                                  : "bg-accent-primary"
+                            }`}
+                            style={{ width: `${barWidth}%` }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                <div className="mt-4 border-t border-border-subtle pt-3 flex flex-col gap-2">
+                  <div className="flex items-center justify-between text-xs text-text-secondary">
+                    <div className="flex items-center gap-1.5">
+                      <Icon name="ArrowRightLeft" size={16} className="text-accent-primary" />
+                      <span>Handoffs tonight:</span>
+                    </div>
+                    <span className="font-mono font-semibold text-text-primary ns-tabular">
+                      {deck?.handoff_count ?? 0}
                     </span>
                   </div>
-                  <div className="h-1.5 w-full rounded-pill bg-surface-raised overflow-hidden border border-border-subtle">
-                    <div
-                      className={`h-full rounded-pill ${
-                        budgetPct >= 90
-                          ? "bg-status-danger"
-                          : budgetPct >= 70
-                            ? "bg-status-warning"
-                            : "bg-accent-primary"
-                      }`}
-                      style={{ width: `${barWidth}%` }}
-                    />
+
+                  <div className="flex items-center justify-between text-xs text-text-secondary">
+                    <div className="flex items-center gap-1.5">
+                      <Icon name="ShieldCheck" size={16} className="text-accent-primary" />
+                      <span>Spend tonight:</span>
+                    </div>
+                    <span className="font-mono font-medium text-text-primary ns-tabular">
+                      {deck?.budget_tonight?.displayLine ?? "$0.00 / $0.00 (free-only mode)"}
+                    </span>
                   </div>
+
+                  {deck?.gold_saved_tonight && deck.gold_saved_tonight.jobs_done > 0 && (
+                    <div className="flex items-center justify-between text-xs rounded border border-border-subtle bg-surface-raised px-2 py-1.5">
+                      <div className="flex items-center gap-1.5 text-text-secondary">
+                        <Icon name="Coins" size={16} className="text-accent-primary" />
+                        <span>Gold saved:</span>
+                      </div>
+                      <span className="font-mono font-medium text-accent-primary ns-tabular">
+                        {deck.gold_saved_tonight.estimate_label}
+                      </span>
+                    </div>
+                  )}
                 </div>
-              );
-            })}
-          </div>
-
-          <div className="mt-4 border-t border-border-subtle pt-3 flex flex-col gap-2">
-            <div className="flex items-center justify-between text-xs text-text-secondary">
-              <div className="flex items-center gap-1.5">
-                <Icon name="ArrowRightLeft" size={16} className="text-accent-primary" />
-                <span>Handoffs tonight:</span>
-              </div>
-              <span className="font-mono font-semibold text-text-primary ns-tabular">
-                {deck?.handoff_count ?? 0}
-              </span>
-            </div>
-
-            <div className="flex items-center justify-between text-xs text-text-secondary">
-              <div className="flex items-center gap-1.5">
-                <Icon name="ShieldCheck" size={16} className="text-accent-primary" />
-                <span>Spend tonight:</span>
-              </div>
-              <span className="font-mono font-medium text-text-primary ns-tabular">
-                {deck?.budget_tonight?.displayLine ?? "$0.00 / $0.00 (free-only mode)"}
-              </span>
-            </div>
-
-            {deck?.gold_saved_tonight && (
-              <div className="flex items-center justify-between text-xs rounded border border-border-subtle bg-surface-raised px-2 py-1.5">
-                <div className="flex items-center gap-1.5 text-text-secondary">
-                  <Icon name="Coins" size={16} className="text-accent-primary" />
-                  <span>Gold saved:</span>
-                </div>
-                <span className="font-mono font-medium text-accent-primary ns-tabular">
-                  {deck.gold_saved_tonight.estimate_label ?? "$0.00 gold saved tonight (estimate)"}
-                </span>
-              </div>
-            )}
-          </div>
+              </>
+            );
+          })()}
         </GlassCard>
       </div>
 

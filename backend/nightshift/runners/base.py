@@ -73,7 +73,7 @@ class RunnerResult:
 
 
 def resolve_bin(name: str) -> str | None:
-    """Resolve an executable binary on PATH, supporting Windows extensions."""
+    """Resolve an executable binary on PATH, supporting Windows extensions and user CLI dirs."""
     if sys.platform == "win32":
         candidates = (f"{name}.exe", f"{name}.cmd", f"{name}.bat", name, f"{name}.ps1")
     else:
@@ -82,6 +82,26 @@ def resolve_bin(name: str) -> str | None:
         found = shutil.which(candidate)
         if found:
             return found
+
+    if sys.platform == "win32":
+        extra_dirs: list[str] = []
+        for env_key, sub in (
+            ("APPDATA", "npm"),
+            ("LOCALAPPDATA", os.path.join("Microsoft", "WinGet", "Links")),
+            ("USERPROFILE", os.path.join(".local", "bin")),
+            ("LOCALAPPDATA", "Programs"),
+        ):
+            base = os.environ.get(env_key)
+            if base:
+                p = os.path.join(base, sub)
+                if os.path.isdir(p):
+                    extra_dirs.append(p)
+        if extra_dirs:
+            search_path = os.pathsep.join(extra_dirs)
+            for candidate in candidates:
+                found = shutil.which(candidate, path=search_path)
+                if found:
+                    return found
     return None
 
 
