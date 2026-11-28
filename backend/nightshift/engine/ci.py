@@ -483,6 +483,8 @@ class CiPipelineManager:
                                     block_reason="no_fixer_available",
                                 )
                             self.scheduler.record_invocation()
+                            if task_id_val:
+                                self.store.increment_task_counter(task_id_val, "review_fix_rounds")
                             self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
                             timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
                             if active_engine not in contributing_engines:
@@ -568,6 +570,8 @@ class CiPipelineManager:
                             if not runner_obj:
                                 return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected review fixer {active_engine} is unavailable.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
                             self.scheduler.record_invocation()
+                            if task_id_val:
+                                self.store.increment_task_counter(task_id_val, "review_fix_rounds")
                             self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
                             timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
                             if active_engine not in contributing_engines:
@@ -734,6 +738,8 @@ class CiPipelineManager:
 
             sha_before = self.vcs.remote_branch_sha(local_repo, branch)
             self.scheduler.record_invocation()
+            if task_id_val:
+                self.store.increment_task_counter(task_id_val, "ci_fix_rounds")
             if active_engine not in contributing_engines:
                 contributing_engines.append(active_engine)
             fix_prov = provider_for_engine(active_engine)

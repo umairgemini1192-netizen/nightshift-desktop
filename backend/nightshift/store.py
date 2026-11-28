@@ -2040,6 +2040,22 @@ class Store:
             raise KeyError(f"Unknown task_id: {task_id}")
         return updated
 
+    def increment_task_counter(self, task_id: str, field: str, delta: int = 1) -> int:
+        """Atomically increment one of the durable task attempt/fix counters."""
+        allowed_counters = {"attempt_count", "ci_fix_rounds", "review_fix_rounds"}
+        if field not in allowed_counters:
+            raise ValueError(f"Disallowed task counter field: {field}")
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE tasks SET {field} = COALESCE({field}, 0) + ?, updated_at = ? WHERE id = ?",
+                (int(delta), now, task_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"Unknown task_id: {task_id}")
+            row = self._conn.execute(f"SELECT {field} FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
     def record_evidence(
         self,
         *,

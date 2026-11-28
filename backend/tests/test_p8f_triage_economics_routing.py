@@ -726,3 +726,248 @@ def test_production_dispatch_boundaries_enforce_safeguards_and_record_economics(
     assert score_rev is not None
     assert score_rev["accepted_tasks"] == 0
     assert score_rev["regression_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_lazy_runners_stay_eligible_for_subsequent_phase_and_failover(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 regression: lazily cached runners in self.runners must not become an allowlist."""
+    from nightshift.engine.logins import LoginHealthChecker
+    from nightshift.engine.planner import PhaseDefinition
+    from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig
+    from nightshift.engine.vcs import FakeGitGh
+    from nightshift.events import EventBus
+    from nightshift.runners.base import RunnerResult
+
+    store = Store(tmp_path / "nightshift.db")
+    store.migrate()
+    events = EventBus(store)
+    quota = QuotaLedger(store)
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    vcs = FakeGitGh()
+    vcs.branches["feat/p1"] = "sha-p1"
+    vcs.branches["feat/p2"] = "sha-p2"
+    logins = LoginHealthChecker(store=store, quota_ledger=quota)
+
+    # Normal desktop startup: runners=None (empty cache, lazily populated)
+    engine = EngineStateMachine(
+        store=store,
+        event_bus=events,
+        quota_ledger=quota,
+        vcs=vcs,
+        runners=None,
+        login_checker=logins,
+    )
+    # Pretend all CLIs are installed and logged in
+    engine.scheduler.router.is_engine_installed = lambda _r: True  # type: ignore[method-assign]
+    monkeypatch.setattr(engine.scheduler, "is_engine_available", lambda _e, _m="": True)
+
+    invoked_runners: list[str] = []
+
+    class StubTemplateRunner:
+        def __init__(self, name: str, *_args: Any, **_kwargs: Any) -> None:
+            self.name = name
+
+        async def run(self, _instruction: str, _workdir: Path, **_kwargs: Any) -> RunnerResult:
+            invoked_runners.append(self.name)
+            return RunnerResult(rc=1, stdout="", stderr="simulated failure")
+
+    monkeypatch.setattr("nightshift.engine.state_machine.TemplateRunner", StubTemplateRunner)
+
+    project = ProjectConfig(
+        id="proj-lazy",
+        name="LazyTest",
+        repo="owner/lazy",
+        local_path=repo_dir,
+    )
+    store.create_project("proj-lazy", "LazyTest", "owner/lazy", str(repo_dir))
+    store.create_plan("plan-lazy", "proj-lazy", "Lazy Plan")
+    store.upsert_phase("p1", "plan-lazy", "Phase 1", "feat/p1")
+    store.upsert_phase("p2", "plan-lazy", "Phase 2", "feat/p2")
+    store.upsert_phase_assignment("p1", override_engine="agy")
+    store.upsert_phase_assignment("p2", override_engine="codex")
+
+    # Phase 1: agy fails on attempt 1 -> should fail over to another catalogue engine (not blocked by cache)
+    p1 = PhaseDefinition(id="p1", title="Phase 1", branch="feat/p1", prompt="Do p1", auto_merge=False)
+    engine.scheduler.max_implement_attempts = 2
+    await engine._execute_phase(project, p1, "plan-lazy", "main")
+    assert "agy" in engine.runners
+    assert invoked_runners[0] == "agy"
+    assert len(invoked_runners) == 2
+    assert invoked_runners[1] != "agy"
+
+    # Phase 2: explicitly pinned to codex -> must still be eligible even though agy is already cached
+    invoked_runners.clear()
+    engine.scheduler.max_implement_attempts = 1
+    p2 = PhaseDefinition(id="p2", title="Phase 2", branch="feat/p2", prompt="Do p2", auto_merge=False)
+    await engine._execute_phase(project, p2, "plan-lazy", "main")
+    assert invoked_runners == ["codex"]
+    assert "codex" in engine.runners
+
+
+@pytest.mark.asyncio
+async def test_task_attempt_and_fix_counters_enforce_contract_budgets(tmp_path: Path) -> None:
+    """P1 regression: attempt_count, ci_fix_rounds, and review_fix_rounds advance and enforce contract limits."""
+    from nightshift.engine.ci import CiPipelineManager
+    from nightshift.engine.logins import LoginHealthChecker
+    from nightshift.engine.planner import PhaseDefinition
+    from nightshift.engine.scheduler import Scheduler
+    from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig
+    from nightshift.engine.vcs import FakeGitGh
+    from nightshift.engine.verify import RiskAssessment
+    from nightshift.events import EventBus
+    from nightshift.runners.base import RunnerResult
+
+    # 1. Coder max_attempts=1 stops before 2nd attempt even when scheduler allows 3
+    store, task_coder = _make_store_with_task(
+        tmp_path,
+        task_id="t-cap-coder",
+        budget={"max_tokens": 120000, "max_usd_est": 0.50, "max_attempts": 1, "max_ci_fix_rounds": 1, "max_review_fix_rounds": 1},
+    )
+    events = EventBus(store)
+    quota = QuotaLedger(store)
+    repo_dir = tmp_path / "repo_coder"
+    repo_dir.mkdir()
+    vcs = FakeGitGh()
+    vcs.branches["feat/t-cap-coder"] = "sha1"
+    logins = LoginHealthChecker(store=store, quota_ledger=quota)
+
+    coder_calls = 0
+
+    class CountingFailRunner(FakeRunner):
+        async def run(self, instruction: str, workdir: Path, **kwargs: Any) -> RunnerResult:
+            nonlocal coder_calls
+            coder_calls += 1
+            return RunnerResult(rc=1, stdout="", stderr="coder fail")
+
+    engine = EngineStateMachine(
+        store=store,
+        event_bus=events,
+        quota_ledger=quota,
+        vcs=vcs,
+        runners={"agy": CountingFailRunner("agy"), "codex": CountingFailRunner("codex")},
+        login_checker=logins,
+    )
+    engine.scheduler.is_engine_available = lambda _e, _m="": True  # type: ignore[method-assign]
+    engine.scheduler.max_implement_attempts = 3
+    project = ProjectConfig(id="proj-1", name="NightShift", repo="owner/nightshift-desktop", local_path=repo_dir)
+    phase = PhaseDefinition(id="p8f", title="Capped Coder", branch="feat/t-cap-coder", prompt="Fix bug", auto_merge=False)
+    res = await engine._execute_phase(project, phase, "plan-1", "main")
+    assert res["status"] == "PARKED"
+    assert coder_calls == 1
+    assert store.get_task(str(task_coder["id"]))["attempt_count"] == 1
+
+    # 2. CI-fix max_ci_fix_rounds=1 stops before 2nd CI-fix round even when max_retries=4
+    ci_dir = tmp_path / "ci_sub"
+    ci_dir.mkdir()
+    store_ci, task_ci = _make_store_with_task(
+        ci_dir,
+        task_id="t-cap-ci",
+        budget={"max_tokens": 120000, "max_usd_est": 0.50, "max_attempts": 3, "max_ci_fix_rounds": 1, "max_review_fix_rounds": 1},
+    )
+    contract_ci = store_ci.get_task_contract(str(task_ci["contract_id"]))
+    wt_ci = tmp_path / "ci_wt"
+    wt_ci.mkdir()
+    vcs_ci = FakeGitGh()
+    vcs_ci.add_pr("feat/ci", number=10, head_sha="sha-ci")
+    vcs_ci.ci_results[10] = [False, False, False, False, False]
+    vcs_ci.local_head_sha = lambda _d: "sha-ci"  # type: ignore[method-assign]
+    ci_fix_calls = 0
+
+    class CountingFixRunner(FakeRunner):
+        async def run(self, instruction: str, workdir: Path, **kwargs: Any) -> RunnerResult:
+            nonlocal ci_fix_calls
+            if "fix the CI failure" in instruction:
+                ci_fix_calls += 1
+            return RunnerResult(rc=0, stdout="fixed", stderr="")
+
+    runners_ci = {"agy": CountingFixRunner("agy"), "codex": CountingFixRunner("codex")}
+    sched_ci = Scheduler(store_ci, QuotaLedger(store_ci), runners=runners_ci)
+    sched_ci.is_engine_available = lambda _e, _m="": True  # type: ignore[method-assign]
+    ci_mgr = CiPipelineManager(vcs=vcs_ci, store=store_ci, scheduler=sched_ci, runners=runners_ci)
+    ci_res = await ci_mgr.watch_and_heal(
+        repo="owner/nightshift-desktop",
+        local_repo=wt_ci,
+        worktree_dir=wt_ci,
+        phase_id="p8f",
+        phase_title="CI Cap",
+        branch="feat/ci",
+        pr_number=10,
+        initial_engine="agy",
+        risk=RiskAssessment(level="low", reasons=[]),
+        max_retries=4,
+        task_contract=contract_ci,
+        require_independent_reviewer=False,
+    )
+    assert not ci_res.passed
+    assert ci_fix_calls == 1
+    assert store_ci.get_task("t-cap-ci")["ci_fix_rounds"] == 1
+
+    # 3. Review-fix max_review_fix_rounds=1 stops before 2nd review-fix round even when max_review_fix_rounds arg=3
+    rev_dir = tmp_path / "rev_sub"
+    rev_dir.mkdir()
+    store_rev, task_rev = _make_store_with_task(
+        rev_dir,
+        task_id="t-cap-rev",
+        budget={"max_tokens": 120000, "max_usd_est": 0.50, "max_attempts": 3, "max_ci_fix_rounds": 3, "max_review_fix_rounds": 1},
+    )
+    contract_rev = store_rev.get_task_contract(str(task_rev["contract_id"]))
+    wt_rev = tmp_path / "rev_wt"
+    wt_rev.mkdir()
+    (wt_rev / "app.py").write_text("x = 1\n", encoding="utf-8")
+    vcs_rev = FakeGitGh()
+    vcs_rev.add_pr("feat/rev", number=11, head_sha="sha-rev")
+    vcs_rev.ci_results[11] = [True, True, True]
+    vcs_rev.local_head_sha = lambda _d: "sha-rev"  # type: ignore[method-assign]
+    vcs_rev.get_diff = lambda _d: "diff --git a/app.py b/app.py\n+x = 1\n"  # type: ignore[method-assign]
+    vcs_rev.list_changed_files = lambda _d: ["app.py"]  # type: ignore[method-assign]
+
+    review_fix_calls = 0
+
+    class CountingRevFixRunner(FakeRunner):
+        async def run(self, instruction: str, workdir: Path, **kwargs: Any) -> RunnerResult:
+            nonlocal review_fix_calls
+            review_fix_calls += 1
+            return RunnerResult(rc=0, stdout="fixed review", stderr="")
+
+    class ChangesReviewer(FakeRunner):
+        async def run(self, instruction: str, workdir: Path, **kwargs: Any) -> RunnerResult:
+            payload = json.dumps({
+                "verdict": "CHANGES",
+                "summary": "Still broken",
+                "findings": [
+                    {
+                        "priority": "P1",
+                        "kind": "defect",
+                        "file": "app.py",
+                        "line": 1,
+                        "message": "Bug remains",
+                    }
+                ],
+            })
+            return RunnerResult(rc=0, stdout=payload, stderr="")
+
+    runners_rev = {"agy": CountingRevFixRunner("agy"), "codex": ChangesReviewer("codex")}
+    sched_rev = Scheduler(store_rev, QuotaLedger(store_rev), runners=runners_rev)
+    sched_rev.is_engine_available = lambda _e, _m="": True  # type: ignore[method-assign]
+    ci_mgr_rev = CiPipelineManager(vcs=vcs_rev, store=store_rev, scheduler=sched_rev, runners=runners_rev)
+    rev_res = await ci_mgr_rev.watch_and_heal(
+        repo="owner/nightshift-desktop",
+        local_repo=wt_rev,
+        worktree_dir=wt_rev,
+        phase_id="p8f",
+        phase_title="Rev Cap",
+        branch="feat/rev",
+        pr_number=11,
+        initial_engine="agy",
+        risk=RiskAssessment(level="low", reasons=[]),
+        max_retries=4,
+        max_review_fix_rounds=3,
+        task_contract=contract_rev,
+        require_independent_reviewer=True,
+    )
+    assert not rev_res.passed
+    assert review_fix_calls == 1
+    assert store_rev.get_task("t-cap-rev")["review_fix_rounds"] == 1

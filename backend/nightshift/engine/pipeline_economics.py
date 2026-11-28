@@ -569,19 +569,20 @@ class PipelineEconomics:
                 max_rev_fix = int(budget.get("max_review_fix_rounds", 2))
                 max_wall_min = float(budget.get("max_wall_minutes", 90.0))
 
-                if role == "coder" and int(task.get("attempt_count") or 0) >= max_attempts:
+                norm_role = (role or "coder").strip().lower()
+                if norm_role == "coder" and int(task.get("attempt_count") or 0) >= max_attempts:
                     return BudgetCheckResult(
                         allowed=False,
                         scope="task",
                         reason=f"Task {task_id} reached max code attempts ({task['attempt_count']}/{max_attempts}).",
                     )
-                if role == "fixer" and int(task.get("ci_fix_rounds") or 0) >= max_ci_fix:
+                if norm_role == "fixer" and int(task.get("ci_fix_rounds") or 0) >= max_ci_fix:
                     return BudgetCheckResult(
                         allowed=False,
                         scope="task",
                         reason=f"Task {task_id} reached max CI-fix rounds ({task['ci_fix_rounds']}/{max_ci_fix}).",
                     )
-                if role == "review_fixer" and int(task.get("review_fix_rounds") or 0) >= max_rev_fix:
+                if norm_role == "review_fixer" and int(task.get("review_fix_rounds") or 0) >= max_rev_fix:
                     return BudgetCheckResult(
                         allowed=False,
                         scope="task",

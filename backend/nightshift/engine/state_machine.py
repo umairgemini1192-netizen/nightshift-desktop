@@ -241,6 +241,7 @@ class EngineStateMachine:
         self.events = event_bus
         self.quota = quota_ledger
         self.vcs = vcs or SubprocessGitGh()
+        self._restrict_to_registered_runners = bool(runners)
         self.runners = runners or {}
         self.logins = login_checker or LoginHealthChecker(store=store, quota_ledger=quota_ledger)
         self._network_backoff_seconds = network_backoff_seconds
@@ -854,7 +855,20 @@ class EngineStateMachine:
                     or pipeline_contract.get("risk_class")
                     or "business_logic"
                 )
-                allowed_coder_engines = set(self.runners.keys()) if self.runners else None
+                allowed_coder_engines = (
+                    set(self.runners.keys())
+                    if (self._restrict_to_registered_runners and self.runners)
+                    else None
+                )
+
+                if pending_choice is not None:
+                    pending_budget = self.economics.check_hard_budgets(
+                        task_id=task_id,
+                        role="coder",
+                        engine_id=pending_choice.engine,
+                    )
+                    if not pending_budget.allowed:
+                        pending_choice = None
 
                 choice = pending_choice or self.scheduler.select_engine(
                     phase_id=phase.id,
@@ -914,6 +928,7 @@ class EngineStateMachine:
                 # Record step in SQLite before execution
                 step_id = self.store.record_step(phase.id, "implement", active_runner_name)
                 self.scheduler.record_invocation()
+                self.store.increment_task_counter(task_id, "attempt_count")
                 self.store.record_task_contributing_provider(
                     str(pipeline_task["id"]),
                     provider_for_engine(active_runner_name),
