@@ -206,53 +206,63 @@ async def run_triage_stage(
     job_name: str = "CI",
     timeout_seconds: int = 120,
 ) -> TriageSummary:
-    """Execute Stage 4 TRIAGE on ``small_job_ladder`` and persist attempt + ledger metrics."""
+    """Execute Stage 4 TRIAGE on ``small_job_ladder`` with strict routing safeguards.
+
+    Every candidate (including fallbacks) MUST pass ``Router.route_pipeline_task``
+    safeguards (enabled, cooldown, free_only_mode, hard budgets, high_risk/governance
+    strong-tier rule, and Economy benchmark graduation). When no eligible runner
+    remains, falls back deterministically without running any ineligible engine.
+    """
     prompt = build_triage_prompt(failing_log, job_name=job_name)
     ladder = get_small_job_ladder(store)
     economics = PipelineEconomics(store) if store is not None else None
+    norm_risk = (risk_class or "business_logic").strip().lower()
 
-    # Prefer router selection if available and eligible on small_job_ladder
-    ordered_candidates: list[str] = []
-    if router is not None and hasattr(router, "route_pipeline_task"):
-        route = router.route_pipeline_task(
+    effective_router = router
+    if effective_router is None and store is not None:
+        from nightshift.engine.router import Router
+        from nightshift.quota.ledger import QuotaLedger
+
+        effective_router = Router(store, QuotaLedger(store), runners=runners)
+
+    if effective_router is None or not hasattr(effective_router, "route_pipeline_task"):
+        return deterministic_triage_fallback(failing_log, job_name=job_name)
+
+    remaining_allowed: set[str] = set(ladder)
+    excluded_candidates: set[str] = set()
+
+    while remaining_allowed:
+        route = effective_router.route_pipeline_task(
             task_id=task_id,
             role="triage",
-            risk_class=risk_class,
+            risk_class=norm_risk,
             contributing_providers=set(),
-            allowed_engines=set(ladder),
+            allowed_engines=remaining_allowed,
+            exclude_engines=excluded_candidates,
         )
-        if not route.blocked and route.chosen_id:
-            ordered_candidates.append(route.chosen_id)
-    for eng in ladder:
-        if eng not in ordered_candidates:
-            ordered_candidates.append(eng)
+        if route.blocked or not route.chosen_id:
+            break
 
-    for candidate in ordered_candidates:
-        runner = runners.get(candidate)
-        if runner is None:
-            # Match prefix e.g. agy-gemini-4-neon -> agy
-            base = candidate.split("-")[0]
-            runner = runners.get(base)
+        candidate = route.chosen_id
+        candidate_runner_name = route.runner or candidate
+        excluded_candidates.add(candidate)
+        excluded_candidates.add(candidate_runner_name)
+        remaining_allowed.discard(candidate)
+        remaining_allowed.discard(candidate_runner_name)
+
+        runner = (
+            runners.get(candidate)
+            or runners.get(candidate_runner_name)
+            or runners.get(candidate.split("-")[0])
+        )
         if runner is None:
             continue
-
-        if economics is not None:
-            eng_row = store.get_engine(candidate) if store is not None else None
-            bcheck = economics.check_hard_budgets(
-                task_id=task_id,
-                role="triage",
-                engine_id=candidate,
-                runner=str(eng_row.get("runner") or candidate) if eng_row else candidate,
-                cost_tier=str(eng_row.get("cost_tier") or "") if eng_row else "",
-            )
-            if not bcheck.allowed:
-                continue
 
         t0 = time.monotonic()
         res = await runner.run(prompt, workdir, timeout_seconds=timeout_seconds)
         elapsed = round(time.monotonic() - t0, 3)
         parsed = parse_triage_output(res.stdout) if res.rc == 0 else None
-        model_name = getattr(runner, "model", "") or candidate
+        model_name = route.model or getattr(runner, "model", "") or candidate
 
         attempt_id: int | None = None
         if store is not None and task_id:
@@ -261,27 +271,29 @@ async def run_triage_stage(
                 stage="TRIAGE",
                 role="triage",
                 engine_id=candidate,
-                provider=provider_for_engine(candidate),
+                provider=route.provider or provider_for_engine(candidate),
                 model=model_name,
                 input_ref="redacted:ci_log_tail",
                 output_ref="redacted:triage_summary",
-                decision_reason=f"small_job_ladder triage ({candidate})",
+                decision_reason=route.reason or f"small_job_ladder triage ({candidate})",
                 rc=res.rc,
                 outcome="ok" if parsed is not None else "failed",
                 wall_seconds=elapsed,
             )
         if economics is not None and task_id:
+            # Record attempt-level success ("ok") or retry; task acceptance ("accepted")
+            # is reserved strictly for verified delivery outcomes.
             economics.record_ledger_event(
                 task_id=task_id,
                 attempt_id=attempt_id,
                 role="triage",
                 engine_id=candidate,
                 model=model_name,
-                risk_class=risk_class,
+                risk_class=norm_risk,
                 tokens_in=len(prompt) // 4,
                 tokens_out=len(res.stdout or "") // 4,
                 wall_seconds=elapsed,
-                outcome="accepted" if parsed is not None else "retry",
+                outcome="ok" if parsed is not None else "retry",
             )
 
         if parsed is not None:

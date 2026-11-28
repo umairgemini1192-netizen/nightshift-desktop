@@ -630,6 +630,7 @@ class ReleaseManager:
             rolled_back_at=_utc_now(),
         )
         linked_task_id = str(faulty.get("task_id") or "").strip()
+        linked_task = None
         if linked_task_id and hasattr(store, "get_task") and hasattr(store, "update_task_fields"):
             linked_task = store.get_task(linked_task_id)
             if (
@@ -644,6 +645,14 @@ class ReleaseManager:
                     block_detail=f"Release {faulty_tag} was rolled back to verified release {prev_tag}.",
                     next_step=f"Ship a new fix and release tag (previous good release {prev_tag} restored).",
                 )
+        if linked_task_id and hasattr(store, "record_pipeline_ledger"):
+            from nightshift.engine.pipeline_economics import PipelineEconomics
+
+            PipelineEconomics(store).record_task_terminal_outcome(
+                task_id=linked_task_id,
+                outcome="reverted",
+                risk_class=str((linked_task or {}).get("risk_class") or "business_logic"),
+            )
 
         revert_note = " Revert PR opened for review." if revert_created else ""
         return RollbackResult(

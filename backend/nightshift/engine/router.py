@@ -255,6 +255,7 @@ class Router:
         login_checker: Any | None = None,
         cred_store: Any | None = None,
         events: EventBus | None = None,
+        runners: dict[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.quota_ledger = quota_ledger
@@ -262,10 +263,24 @@ class Router:
         self.cred_store = cred_store or get_credential_store()
         self.events = events
         self.economics = PipelineEconomics(store, events)
+        self._fake_runners: set[str] = set()
+        if runners:
+            self.register_runners(runners)
         seed_default_engines(store)
+
+    def register_runners(self, runners: dict[str, Any]) -> None:
+        """Register injected FakeRunner instances so offline tests do not depend on host PATH."""
+        for key, runner_obj in (runners or {}).items():
+            if type(runner_obj).__name__ == "FakeRunner":
+                self._fake_runners.add(str(key))
+                r_name = getattr(runner_obj, "name", "")
+                if r_name:
+                    self._fake_runners.add(str(r_name))
 
     def is_engine_installed(self, runner: str) -> bool:
         """Check if runner CLI executable is present in PATH or tools folder."""
+        if runner in self._fake_runners or any(k.split("-")[0] == runner for k in self._fake_runners):
+            return True
         if runner in ("claude-compatible", "claude"):
             return shutil.which("claude") is not None or shutil.which("claude.cmd") is not None
         if runner == "agy":
@@ -661,6 +676,7 @@ class Router:
         free_only_mode: bool | None = None,
         task_id: str | None = None,
         allowed_engines: set[str] | None = None,
+        exclude_engines: set[str] | None = None,
         step_id: int | None = None,
     ) -> PipelineRouteDecision:
         """Risk-based, safeguard-first, deadlock-free router (AGENT_PIPELINE §6.2).
@@ -677,7 +693,10 @@ class Router:
 
         engines = self.store.list_engines()
         priority_rows = self.store.get_priority_list()
-        priority_order = {str(r["engine"]).lower(): int(r["position"]) for r in priority_rows}
+        if priority_rows:
+            priority_order = {str(r["engine"]).lower(): int(r["position"]) for r in priority_rows}
+        else:
+            priority_order = {"agy": 1, "gemini": 2, "codex": 3, "claude": 4}
 
         role_skill_key = {
             "coder": "backend",
@@ -700,6 +719,10 @@ class Router:
 
             if allowed_engines is not None and eng_id not in allowed_engines and runner not in allowed_engines:
                 excluded_reasons[eng_id] = "not in allowed ladder"
+                continue
+
+            if exclude_engines and (eng_id in exclude_engines or runner in exclude_engines):
+                excluded_reasons[eng_id] = "excluded for this step"
                 continue
 
             if not int(eng.get("enabled", 1)):
