@@ -19,6 +19,7 @@ import {
   Tabs,
 } from "../../design";
 import { useAppStore } from "../../app/store";
+import type { NeedAttentionItem } from "../../bridge/types";
 import { TokenSavingsCard } from "../token-optimizer/TokenSavingsCard";
 
 const TOOL_DISPLAY_NAMES: Record<string, string> = {
@@ -45,6 +46,9 @@ export default function MissionControlPage() {
   const [showFirstRunImport, setShowFirstRunImport] = useState(false);
   const [firstRunQueueJson, setFirstRunQueueJson] = useState("");
   const [importingQueue, setImportingQueue] = useState(false);
+  const [pendingApproval, setPendingApproval] = useState<NeedAttentionItem | null>(null);
+  const [pendingRollback, setPendingRollback] = useState<NeedAttentionItem | null>(null);
+  const [governanceBusy, setGovernanceBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -222,6 +226,123 @@ export default function MissionControlPage() {
         description: err instanceof Error ? err.message : "Engine failed to start.",
         tone: "danger",
       });
+    }
+  };
+
+  // Handle Needs Attention governance & navigation actions (Phase 8e)
+  const handleNeedsAttentionAction = (item: NeedAttentionItem) => {
+    const kind = item.action_kind;
+    const actionLower = item.action.toLowerCase();
+
+    if (kind === "approve_task" || (item.task_id && item.head_sha && actionLower.includes("approve"))) {
+      if (!item.task_id || !item.head_sha) {
+        pushToast({
+          title: "Cannot approve task",
+          description: "Task identifier or commit SHA is missing. Inspect run logs first.",
+          tone: "danger",
+        });
+        return;
+      }
+      setPendingApproval(item);
+      return;
+    }
+
+    if (kind === "rollback_release" || (item.release_tag && actionLower.includes("roll back"))) {
+      if (!item.release_tag) {
+        pushToast({
+          title: "Cannot roll back release",
+          description: "Release tag is missing. Open Settings or Runs to inspect release history.",
+          tone: "danger",
+        });
+        return;
+      }
+      setPendingRollback(item);
+      return;
+    }
+
+    if (
+      kind === "configure_smoke_test" ||
+      kind === "open_settings" ||
+      actionLower.includes("smoke test") ||
+      actionLower.includes("settings")
+    ) {
+      navigate("/settings");
+      return;
+    }
+
+    if (kind === "fix_login" || actionLower.includes("fix")) {
+      const tool = unreadyLogins[0]?.[0];
+      if (tool) {
+        void handleFixTool(tool);
+        return;
+      }
+      navigate("/settings");
+      return;
+    }
+
+    if (kind === "open_runs" || actionLower.includes("inspect")) {
+      navigate("/runs");
+      return;
+    }
+
+    navigate("/runs");
+  };
+
+  const handleConfirmApproval = async () => {
+    if (!pendingApproval?.task_id || !pendingApproval?.head_sha) return;
+    setGovernanceBusy(true);
+    try {
+      await bridge.call("pipeline.approveTask", {
+        taskId: pendingApproval.task_id,
+        headSha: pendingApproval.head_sha,
+        projectId: pendingApproval.project_id ?? snapshot.activeProjectId ?? undefined,
+        approvedBy: "owner",
+        resume: true,
+      });
+      pushToast({
+        title: "Task approved",
+        description: `Approved commit ${pendingApproval.head_sha.slice(0, 7)} and resumed the merge gate.`,
+        tone: "success",
+      });
+      setPendingApproval(null);
+      await refreshSnapshot();
+    } catch (err) {
+      pushToast({
+        title: "Could not approve task",
+        description: err instanceof Error ? err.message : String(err),
+        tone: "danger",
+      });
+    } finally {
+      setGovernanceBusy(false);
+    }
+  };
+
+  const handleConfirmRollback = async () => {
+    if (!pendingRollback?.release_tag) return;
+    setGovernanceBusy(true);
+    try {
+      const res = await bridge.call<{ restored_tag?: string; detail?: string }>("pipeline.rollbackRelease", {
+        tag: pendingRollback.release_tag,
+        repo: pendingRollback.repo,
+        projectId: pendingRollback.project_id ?? snapshot.activeProjectId ?? undefined,
+      });
+      pushToast({
+        title: "Release rolled back",
+        description:
+          res?.detail ??
+          `Marked ${pendingRollback.release_tag} as superseded and restored ${res?.restored_tag ?? pendingRollback.previous_good_tag ?? "previous good release"}.`,
+        tone: "warning",
+      });
+      setPendingRollback(null);
+      await refreshSnapshot();
+    } catch (err) {
+      pushToast({
+        title: "Could not roll back release",
+        description: err instanceof Error ? err.message : String(err),
+        tone: "danger",
+      });
+    } finally {
+      setGovernanceBusy(false);
     }
   };
 
@@ -524,18 +645,7 @@ export default function MissionControlPage() {
                 <Button
                   size="sm"
                   variant="secondary"
-                  onClick={() => {
-                    if (item.action.toLowerCase().includes("fix")) {
-                      const tool = unreadyLogins[0]?.[0];
-                      if (tool) handleFixTool(tool);
-                    } else {
-                      pushToast({
-                        title: item.headline,
-                        description: item.detail,
-                        tone: "warning",
-                      });
-                    }
-                  }}
+                  onClick={() => handleNeedsAttentionAction(item)}
                 >
                   {item.action}
                 </Button>
@@ -861,6 +971,42 @@ export default function MissionControlPage() {
           }
         }}
         onCancel={() => setReadinessModalOpen(false)}
+      />
+
+      {/* Governance owner approval confirmation dialog (Phase 8e) */}
+      <ConfirmDialog
+        open={pendingApproval !== null}
+        title="Approve change for merge"
+        description={pendingApproval?.headline ?? "Confirm owner approval for this blocked change."}
+        consequence={
+          pendingApproval
+            ? `This records explicit owner approval for commit ${pendingApproval.head_sha?.slice(0, 7) ?? "unknown"} and resumes the merge gate.`
+            : undefined
+        }
+        confirmLabel="Approve and resume"
+        confirmVariant="primary"
+        cancelLabel="Cancel"
+        loading={governanceBusy}
+        onConfirm={() => void handleConfirmApproval()}
+        onCancel={() => setPendingApproval(null)}
+      />
+
+      {/* Release rollback confirmation dialog (Phase 8e) */}
+      <ConfirmDialog
+        open={pendingRollback !== null}
+        title="Roll back release"
+        description={pendingRollback?.headline ?? "Confirm rollback of this failed release."}
+        consequence={
+          pendingRollback
+            ? `This appends a superseded warning to ${pendingRollback.release_tag ?? "the failed release"} and restores ${pendingRollback.previous_good_tag ?? "the previous verified release"} with its SHA256SUMS into your output folder.`
+            : undefined
+        }
+        confirmLabel="Roll back release"
+        confirmVariant="danger"
+        cancelLabel="Cancel"
+        loading={governanceBusy}
+        onConfirm={() => void handleConfirmRollback()}
+        onCancel={() => setPendingRollback(null)}
       />
     </div>
   );

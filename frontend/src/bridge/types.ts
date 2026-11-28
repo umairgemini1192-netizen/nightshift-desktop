@@ -9,6 +9,7 @@ export type ScenarioName =
   | "handoff"
   | "ci-healing"
   | "finished"
+  | "governance"
   | "council-drafting"
   | "council-critique"
   | "council-final-ready"
@@ -27,11 +28,28 @@ export interface ModuleBadgeState {
   tone: "neutral" | "info" | "success" | "warning" | "danger";
 }
 
+export type NeedAttentionActionKind =
+  | "approve_task"
+  | "rollback_release"
+  | "configure_smoke_test"
+  | "open_settings"
+  | "open_runs"
+  | "fix_login";
+
 export interface NeedAttentionItem {
   phase_id?: string;
+  task_id?: string;
+  head_sha?: string;
+  risk_class?: string;
+  pr_number?: number;
+  project_id?: string;
+  repo?: string;
+  release_tag?: string;
+  previous_good_tag?: string;
   headline: string;
   detail: string;
   action: string;
+  action_kind?: NeedAttentionActionKind;
 }
 
 export interface DoneTonightItem {
@@ -197,6 +215,7 @@ export interface ProjectConfigItem {
   build_rules?: string;
   artifact_glob?: string;
   output_dir?: string;
+  smoke_command?: string;
 }
 
 export interface CouncilRoleState {

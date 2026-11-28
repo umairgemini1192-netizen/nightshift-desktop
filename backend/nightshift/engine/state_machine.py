@@ -32,9 +32,14 @@ from nightshift.engine.pipeline_evidence import (
     validate_ci_evidence,
     validate_screenshot_manifest,
 )
-from nightshift.engine.pipeline_orchestrator import LeaseHeartbeat, TaskOrchestrator, is_process_alive
+from nightshift.engine.pipeline_orchestrator import (
+    InvalidTransitionError,
+    LeaseHeartbeat,
+    TaskOrchestrator,
+    is_process_alive,
+)
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
-from nightshift.engine.release import ReleaseManager
+from nightshift.engine.release import ReleaseManager, SmokeRunnerFn
 from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient, SubprocessGitGh
 from nightshift.engine.verify import assess_diff_risk, check_diff_guards, redact_secrets, verify_deliverable
@@ -88,6 +93,8 @@ class ProjectConfig:
     min_build_duration_seconds: float = DEFAULT_MIN_BUILD_DURATION_S
     screenshot_manifest_path: str = ""
     screenshot_job_name: str = ""
+    smoke_command: str = ""
+    smoke_timeout_seconds: int = 120
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ProjectConfig:
@@ -157,6 +164,8 @@ class ProjectConfig:
             min_build_duration_seconds=min_build,
             screenshot_manifest_path=str(data.get("screenshot_manifest_path") or ""),
             screenshot_job_name=str(data.get("screenshot_job_name") or ""),
+            smoke_command=str(data.get("smoke_command") or ""),
+            smoke_timeout_seconds=int(data.get("smoke_timeout_seconds") or 120),
         )
 
 
@@ -225,6 +234,7 @@ class EngineStateMachine:
         merge_gate: MergeGate | None = None,
         lease_seconds: int = 1800,
         lease_heartbeat_interval: float | None = None,
+        smoke_runner: SmokeRunnerFn | None = None,
     ) -> None:
         self.store = store
         self.events = event_bus
@@ -236,8 +246,12 @@ class EngineStateMachine:
         self._lease_seconds = lease_seconds
         self._lease_heartbeat_interval = lease_heartbeat_interval
         # Single mandatory merge-gate chokepoint (AGENT_PIPELINE §1).
-        # Autonomous merge stays OFF by default until Phases 8b-8e reach Integration-tested.
-        self.merge_gate = merge_gate or MergeGate(autonomous_merge_enabled=False)
+        # Conditional auto-merge for eligible classes unlocks when pipeline.conditionalAutoMerge is enabled.
+        if merge_gate is not None:
+            self.merge_gate = merge_gate
+        else:
+            auto_flag = str(store.get_setting("pipeline.conditionalAutoMerge", "0") or "0").strip().lower()
+            self.merge_gate = MergeGate(autonomous_merge_enabled=auto_flag in ("1", "true", "yes"))
         self.task_orchestrator = TaskOrchestrator(store=store)
 
         self.scheduler = Scheduler(
@@ -251,7 +265,7 @@ class EngineStateMachine:
             scheduler=self.scheduler,
             runners=self.runners,
         )
-        self.release_mgr = ReleaseManager(vcs=self.vcs)
+        self.release_mgr = ReleaseManager(vcs=self.vcs, smoke_runner=smoke_runner)
 
         self._stop_requested = False
         self._is_running = False
@@ -1119,6 +1133,13 @@ class EngineStateMachine:
         def on_ci_status(s: str) -> None:
             self.store.update_phase(phase.id, status=s)
 
+        cur_task_before_ci = self.store.get_task(task_id) or pipeline_task
+        existing_contrib_providers = {
+            provider_for_engine(p)
+            for p in json.loads(str(cur_task_before_ci.get("contributing_providers_json") or "[]"))
+            if p
+        }
+
         ci_res: CiWatchResult = await self.ci_pipeline.watch_and_heal(
             repo=project.repo,
             local_repo=project.local_path,
@@ -1131,6 +1152,11 @@ class EngineStateMachine:
             risk=risk,
             guardrail_header=guardrail_header,
             on_status_change=on_ci_status,
+            task_contract=pipeline_contract,
+            contributing_providers=existing_contrib_providers,
+            risk_class=str(cur_task_before_ci.get("risk_class") or pipeline_contract.get("risk_class") or "business_logic"),
+            critical_paths=project.critical_paths,
+            require_independent_reviewer=self.merge_gate.require_independent_reviewer,
         )
 
         for fixer_engine in ci_res.contributing_engines:
@@ -1139,8 +1165,52 @@ class EngineStateMachine:
                 provider_for_engine(fixer_engine),
             )
 
+        if ci_res.effective_risk_class:
+            cur_t = self.store.get_task(task_id)
+            if cur_t and cur_t.get("risk_class") != ci_res.effective_risk_class:
+                self.store.update_task_fields(task_id, risk_class=ci_res.effective_risk_class)
+
+        if ci_res.review_result is not None and ci_res.checked_sha:
+            rev = ci_res.review_result
+            self.store.record_evidence(
+                task_id=task_id,
+                contract_sha256=str(pipeline_contract["contract_sha256"]),
+                commit_sha=ci_res.checked_sha,
+                kind="review",
+                source=f"review:{rev.reviewer_engine or ci_res.reviewer_engine}",
+                metadata={
+                    "reviewer_engine": rev.reviewer_engine or ci_res.reviewer_engine,
+                    "reviewer_provider": rev.reviewer_provider or ci_res.reviewer_provider,
+                    "reviewer_tier": rev.reviewer_tier or ci_res.reviewer_tier,
+                    "verdict": rev.verdict,
+                    "summary": rev.summary,
+                    "p1_count": len(rev.p1_findings),
+                    "p2_count": len(rev.p2_findings),
+                    "errors": list(rev.errors),
+                },
+                verified=bool(rev.valid and rev.verdict == "APPROVE" and not rev.p1_findings),
+                rejection_reason="" if (rev.valid and rev.verdict == "APPROVE") else (ci_res.block_reason or "review_rejected"),
+            )
+
         if not ci_res.passed:
-            self._park_phase(project.id, phase, reason=ci_res.detail, next_step="Fix remaining CI failure")
+            if ci_res.block_reason:
+                cur_t = self.store.get_task(task_id)
+                if cur_t and cur_t["status"] != "BLOCKED":
+                    self._safe_task_transition(
+                        task_id,
+                        "BLOCKED",
+                        idempotency_key=f"review-blocked:{task_id}:{ci_res.checked_sha or 'none'}:{ci_res.block_reason}",
+                        reason=ci_res.detail,
+                        updates={
+                            "blocked_from_status": "REVIEWING" if cur_t["status"] == "REVIEWING" else "VERIFYING",
+                            "head_sha": ci_res.checked_sha,
+                            "block_reason": ci_res.block_reason,
+                            "block_detail": ci_res.detail,
+                            "next_step": "Provide an eligible independent reviewer or resolve review findings",
+                        },
+                        lease_token=lease_token,
+                    )
+            self._park_phase(project.id, phase, reason=ci_res.detail, next_step="Fix remaining CI or review failure")
             return {"phase_id": phase.id, "title": phase.title, "runner": ci_res.last_engine, "status": "PARKED", "detail": ci_res.detail}
 
         # Step 3b: Authoritative CI & screenshot evidence integrity check (Amendment F / Phase 8d)
@@ -1392,8 +1462,14 @@ class EngineStateMachine:
                 evidence_records=self.store.list_evidence_records(task_id, commit_sha=ci_res.checked_sha),
                 required_ci_jobs=project.required_ci_jobs,
                 require_screenshot_evidence=bool(project.screenshot_manifest_path),
+                require_review_evidence=True,
                 reviewer_provider=ci_res.reviewer_provider or None,
+                reviewer_engine=ci_res.reviewer_engine or None,
+                reviewer_tier=ci_res.reviewer_tier or None,
+                critical_paths=project.critical_paths,
             )
+            if auth.effective_risk_class and fresh_task.get("risk_class") != auth.effective_risk_class:
+                self.store.update_task_fields(task_id, risk_class=auth.effective_risk_class)
             if not auth.allowed:
                 self.store.record_guard_result(
                     phase.id,
@@ -1644,6 +1720,26 @@ class EngineStateMachine:
             if ok is False:
                 reverted, revert_msg = self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
                 if reverted:
+                    if task is not None and effective_lease:
+                        post_fail_updates = {
+                            "blocked_from_status": "MERGED",
+                            "merge_sha": str(merge_sha),
+                            "block_reason": "post_merge_failed",
+                            "block_detail": revert_msg,
+                            "next_step": "Review and merge the opened revert PR via MergeGate, then ship a new fix",
+                        }
+                        cur_pm = self.store.get_task(str(task["id"]))
+                        if cur_pm and cur_pm["status"] == "BLOCKED":
+                            self.store.update_task_fields(str(task["id"]), **post_fail_updates)
+                        else:
+                            self._safe_task_transition(
+                                str(task["id"]),
+                                "BLOCKED",
+                                idempotency_key=f"post-merge-failed:{task['id']}:{merge_sha}",
+                                reason=revert_msg,
+                                updates=post_fail_updates,
+                                lease_token=effective_lease,
+                            )
                     return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": revert_msg}
                 raise RuntimeError(f"Main build failed: {msg}")
             if ok is not True or run_id is None:
@@ -1752,6 +1848,190 @@ class EngineStateMachine:
                 if rel_reconcile.action == "adopted_release":
                     adopted_tag = str(rel_reconcile.data.get("tag") or "")
                     self.store.update_task_fields(t_id, release_tag=adopted_tag)
+                    primary_artifact = next(
+                        (p for p in (prepared_artifacts or []) if p.name != "SHA256SUMS.txt"),
+                        None,
+                    )
+                    existing_ver = self.store.get_release_verification(project.repo, adopted_tag)
+                    if existing_ver and str(existing_ver.get("smoke_status") or "") == "rolled_back":
+                        prev_good_tag = str(existing_ver.get("previous_good_tag") or "").strip()
+                        rb_detail = (
+                            f"Release {adopted_tag} was already rolled back"
+                            + (f" to {prev_good_tag}" if prev_good_tag else "")
+                            + "; preserving rollback decision without re-verifying or marking RELEASED."
+                        )
+                        rb_next_step = "Ship a new fix and release tag rather than re-verifying a rolled-back release"
+                        rb_updates = {
+                            "blocked_from_status": "MERGED",
+                            "release_tag": adopted_tag,
+                            "block_reason": "release_rolled_back",
+                            "block_detail": rb_detail,
+                            "next_step": rb_next_step,
+                        }
+                        cur_before_rb = self.store.get_task(t_id)
+                        if cur_before_rb and cur_before_rb["status"] == "BLOCKED":
+                            self.store.update_task_fields(t_id, **rb_updates)
+                        else:
+                            self._safe_task_transition(
+                                t_id,
+                                "BLOCKED",
+                                idempotency_key=f"release-rolled-back:{t_id}:{adopted_tag}",
+                                reason=rb_detail,
+                                updates=rb_updates,
+                                lease_token=effective_lease,
+                            )
+                        self.events.emit(Event(
+                            kind="release.rolled_back_preserved",
+                            plain_text=rb_detail,
+                            level="warn",
+                            phase_id=phase.id,
+                            payload={"project_id": project.id, "tag": adopted_tag},
+                        ))
+                        self._park_phase(
+                            project.id,
+                            phase,
+                            reason=rb_detail,
+                            next_step=rb_next_step,
+                        )
+                        return {
+                            "phase_id": phase.id,
+                            "title": phase.title,
+                            "runner": runner,
+                            "status": "PARKED",
+                            "detail": rb_detail,
+                        }
+                    expected_art_sha = (
+                        expected_checksums.get(primary_artifact.name, "")
+                        if primary_artifact is not None
+                        else ""
+                    )
+                    already_smoke_passed = bool(
+                        existing_ver
+                        and existing_ver.get("smoke_status") == "passed"
+                        and existing_ver.get("merge_sha") == str(merge_sha)
+                        and (not expected_art_sha or existing_ver.get("artifact_sha256") == expected_art_sha)
+                    )
+                    if not already_smoke_passed:
+                        smoke_res = self.release_mgr.verify_and_record_release(
+                            store=self.store,
+                            repo=project.repo,
+                            tag=adopted_tag,
+                            merge_sha=str(merge_sha),
+                            artifact_path=primary_artifact or (project.output_dir / "missing-artifact"),
+                            smoke_command=project.smoke_command,
+                            task_id=t_id,
+                            contract_sha256=str(task["contract_sha256"]),
+                            timeout_seconds=project.smoke_timeout_seconds,
+                        )
+                        if not smoke_res.passed:
+                            smoke_block = (
+                                "smoke_test_unavailable"
+                                if smoke_res.status == "unavailable"
+                                else "smoke_test_failed"
+                            )
+                            smoke_updates = {
+                                "blocked_from_status": "MERGED",
+                                "release_tag": adopted_tag,
+                                "block_reason": smoke_block,
+                                "block_detail": smoke_res.detail,
+                                "next_step": (
+                                    "Configure project smoke_command and re-verify release"
+                                    if smoke_block == "smoke_test_unavailable"
+                                    else "Roll back release to previous good tag and investigate smoke failure"
+                                ),
+                            }
+                            cur_before_block = self.store.get_task(t_id)
+                            if cur_before_block and cur_before_block["status"] == "BLOCKED":
+                                self.store.update_task_fields(t_id, **smoke_updates)
+                            else:
+                                self._safe_task_transition(
+                                    t_id,
+                                    "BLOCKED",
+                                    idempotency_key=f"smoke-blocked:{t_id}:{adopted_tag}:{smoke_block}",
+                                    reason=smoke_res.detail,
+                                    updates=smoke_updates,
+                                    lease_token=effective_lease,
+                                )
+                            self.events.emit(Event(
+                                kind=f"release.{smoke_block}",
+                                plain_text=f"Release {adopted_tag} blocked: {smoke_res.detail}",
+                                level="error",
+                                phase_id=phase.id,
+                                payload={"project_id": project.id, "tag": adopted_tag},
+                            ))
+                            self._park_phase(
+                                project.id,
+                                phase,
+                                reason=smoke_res.detail,
+                                next_step="Roll back release or fix smoke verification",
+                            )
+                            return {
+                                "phase_id": phase.id,
+                                "title": phase.title,
+                                "runner": runner,
+                                "status": "PARKED",
+                                "detail": smoke_res.detail,
+                            }
+                    cur_t = self.store.get_task(t_id)
+                    verified_ts = (
+                        str(existing_ver.get("verified_at"))
+                        if already_smoke_passed and existing_ver and existing_ver.get("verified_at")
+                        else datetime.now(timezone.utc).isoformat()
+                    )
+                    if (
+                        cur_t
+                        and cur_t["status"] == "BLOCKED"
+                        and cur_t.get("blocked_from_status") == "MERGED"
+                        and cur_t.get("block_reason") in ("smoke_test_unavailable", "smoke_test_failed")
+                    ):
+                        try:
+                            cur_t = self.task_orchestrator.resume_from_blocked(
+                                t_id,
+                                current_merge_sha=str(merge_sha),
+                                actor="engine",
+                                idempotency_key=f"resume-smoke:{t_id}:{adopted_tag}:{merge_sha}",
+                            )
+                        except InvalidTransitionError as exc:
+                            self._park_phase(
+                                project.id,
+                                phase,
+                                reason=str(exc),
+                                next_step="Revalidate task contract and merge SHA before completing release",
+                            )
+                            return {
+                                "phase_id": phase.id,
+                                "title": phase.title,
+                                "runner": runner,
+                                "status": "PARKED",
+                                "detail": str(exc),
+                            }
+                    if cur_t and cur_t["status"] == "MERGED":
+                        cur_t = self._safe_task_transition(
+                            t_id,
+                            "RELEASED",
+                            idempotency_key=f"released:{t_id}:{adopted_tag}",
+                            reason=f"Adopted verified release {adopted_tag} passed smoke test",
+                            updates={"release_tag": adopted_tag, "smoke_verified_at": verified_ts},
+                            lease_token=effective_lease,
+                        )
+                    if cur_t is None or cur_t["status"] != "RELEASED":
+                        block_msg = (
+                            f"Cannot complete adopted release {adopted_tag}: "
+                            f"task {t_id} is {cur_t['status'] if cur_t else 'missing'}, not RELEASED."
+                        )
+                        self._park_phase(
+                            project.id,
+                            phase,
+                            reason=block_msg,
+                            next_step="Resolve blocking task state before completing release",
+                        )
+                        return {
+                            "phase_id": phase.id,
+                            "title": phase.title,
+                            "runner": runner,
+                            "status": "PARKED",
+                            "detail": block_msg,
+                        }
                     self.store.unpark_phase(phase.id)
                     self.store.update_phase(phase.id, status="completed")
                     self.events.emit(Event(
@@ -1804,15 +2084,96 @@ class EngineStateMachine:
                     lease_token=effective_lease,
                 )
                 self.store.update_task_fields(str(task["id"]), release_tag=tag)
+
+            # Mandatory post-release launch/smoke verification (Amendment H / AGENT_PIPELINE §9.3)
+            primary_published = next(
+                (f for f in files if not f.name.endswith("SHA256SUMS.txt")),
+                project.output_dir / "missing-artifact",
+            )
+            smoke_res = self.release_mgr.verify_and_record_release(
+                store=self.store,
+                repo=project.repo,
+                tag=tag,
+                merge_sha=str(merge_sha),
+                artifact_path=primary_published,
+                smoke_command=project.smoke_command,
+                task_id=str(task["id"]) if task is not None else None,
+                contract_sha256=str(task["contract_sha256"]) if task is not None else None,
+                timeout_seconds=project.smoke_timeout_seconds,
+            )
+            if not smoke_res.passed:
+                smoke_block = (
+                    "smoke_test_unavailable"
+                    if smoke_res.status == "unavailable"
+                    else "smoke_test_failed"
+                )
+                if task is not None and effective_lease:
+                    self._safe_task_transition(
+                        str(task["id"]),
+                        "BLOCKED",
+                        idempotency_key=f"smoke-blocked:{task['id']}:{tag}:{smoke_block}",
+                        reason=smoke_res.detail,
+                        updates={
+                            "blocked_from_status": "MERGED",
+                            "release_tag": tag,
+                            "block_reason": smoke_block,
+                            "block_detail": smoke_res.detail,
+                            "next_step": (
+                                "Configure project smoke_command and re-verify release"
+                                if smoke_block == "smoke_test_unavailable"
+                                else "Roll back release to previous good tag and investigate smoke failure"
+                            ),
+                        },
+                        lease_token=effective_lease,
+                    )
+                self.events.emit(Event(
+                    kind=f"release.{smoke_block}",
+                    plain_text=f"Release {tag} blocked: {smoke_res.detail}",
+                    level="error",
+                    phase_id=phase.id,
+                    payload={"project_id": project.id, "tag": tag},
+                ))
+                self._park_phase(
+                    project.id,
+                    phase,
+                    reason=smoke_res.detail,
+                    next_step=(
+                        "Configure project smoke_command and re-verify release"
+                        if smoke_block == "smoke_test_unavailable"
+                        else "Roll back release to previous good tag"
+                    ),
+                )
+                return {
+                    "phase_id": phase.id,
+                    "title": phase.title,
+                    "runner": runner,
+                    "status": "PARKED",
+                    "detail": f"Release {tag} blocked ({smoke_block}): {smoke_res.detail}",
+                }
+
+            if task is not None and effective_lease:
+                cur_t = self.store.get_task(str(task["id"]))
+                if cur_t and cur_t["status"] == "MERGED":
+                    self._safe_task_transition(
+                        str(task["id"]),
+                        "RELEASED",
+                        idempotency_key=f"released:{task['id']}:{tag}",
+                        reason=f"Published release {tag} passed mandatory launch/smoke test",
+                        updates={
+                            "release_tag": tag,
+                            "smoke_verified_at": smoke_res.verified_at or datetime.now(timezone.utc).isoformat(),
+                        },
+                        lease_token=effective_lease,
+                    )
             self.store.unpark_phase(phase.id)
             self.store.update_phase(phase.id, status="completed")
             self.events.emit(Event(
                 kind="release.published",
-                plain_text=f"Published verified release {tag} with SHA-256 checksums.",
+                plain_text=f"Published verified release {tag} with SHA-256 checksums and passed launch smoke test.",
                 phase_id=phase.id,
                 payload={"project_id": project.id},
             ))
-            return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')} ? Released {tag} ({len(files)} files)"}
+            return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')} -> Released {tag} ({len(files)} files)"}
         except Exception as rel_err:
             logger.error("Post-merge release failed: %s", rel_err)
             self._park_phase(project.id, phase, reason=str(rel_err), next_step="Inspect the main build or release and resume")

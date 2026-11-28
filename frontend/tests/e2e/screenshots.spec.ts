@@ -36,6 +36,7 @@ const MISSION_CONTROL_SCENARIOS = [
   "handoff",
   "ci-healing",
   "finished",
+  "governance",
 ] as const;
 
 const VIEWPORTS = [
@@ -403,3 +404,197 @@ test("token optimizer savings card and tool settings screenshots", async ({ page
   );
   expect(blockingSettings).toEqual([]);
 });
+
+// Phase 8e governance dialogs & smoke-config link/Settings field across all viewports and both themes
+for (const vp of VIEWPORTS) {
+  for (const theme of THEMES) {
+    test(`governance approval dialog @ ${vp.name} (${theme})`, async ({ page }) => {
+      await page.setViewportSize({ width: vp.width, height: vp.height });
+      await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme });
+
+      await page.goto("/?scenario=governance", { waitUntil: "networkidle" });
+      await page.locator("main h1").waitFor({ state: "visible" });
+
+      await page.evaluate((th) => {
+        localStorage.setItem("nightshift.theme", th);
+        document.documentElement.dataset.theme = th;
+      }, theme);
+
+      if (vp.fontScalePct !== 100) {
+        await page.evaluate((pct) => {
+          document.documentElement.style.fontSize = `${pct}%`;
+        }, vp.fontScalePct);
+      }
+
+      await page.getByRole("button", { name: "Review & Approve" }).click();
+      const dialog = page.getByRole("alertdialog");
+      await expect(dialog).toBeVisible();
+      await expect(dialog).toContainText("Approve change for merge");
+      await expect(dialog).toContainText("abc1234");
+
+      await page.evaluate(() => document.fonts.ready);
+
+      const overflow = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+      }));
+      expect(
+        overflow.scrollWidth,
+        `Horizontal overflow on governance approval dialog (${theme}, ${vp.name}): scrollWidth=${overflow.scrollWidth} > clientWidth=${overflow.clientWidth}`,
+      ).toBeLessThanOrEqual(overflow.clientWidth);
+
+      const axeResults = await new AxeBuilder({ page }).analyze();
+      const blocking = axeResults.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(
+        blocking,
+        `Accessibility violations on governance approval dialog (${theme}, ${vp.name}): ${JSON.stringify(
+          blocking.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.length })),
+        )}`,
+      ).toEqual([]);
+
+      const filename =
+        theme === "dark"
+          ? `mission-control-governance-approval-dialog-${vp.name}.png`
+          : `mission-control-governance-approval-dialog-light-${vp.name}.png`;
+      const outPath = path.join(SCREENSHOTS_DIR, filename);
+      await page.screenshot({ path: outPath, fullPage: true });
+      recordScreenshotManifestEntry({
+        screenshotsDir: SCREENSHOTS_DIR,
+        filename,
+        viewportOrDevice: vp.name,
+        scale: `${vp.fontScalePct}%`,
+        axeViolations: blocking.length,
+        overflow: overflow.scrollWidth > overflow.clientWidth,
+      });
+    });
+
+    test(`governance rollback dialog @ ${vp.name} (${theme})`, async ({ page }) => {
+      await page.setViewportSize({ width: vp.width, height: vp.height });
+      await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme });
+
+      await page.goto("/?scenario=governance", { waitUntil: "networkidle" });
+      await page.locator("main h1").waitFor({ state: "visible" });
+
+      await page.evaluate((th) => {
+        localStorage.setItem("nightshift.theme", th);
+        document.documentElement.dataset.theme = th;
+      }, theme);
+
+      if (vp.fontScalePct !== 100) {
+        await page.evaluate((pct) => {
+          document.documentElement.style.fontSize = `${pct}%`;
+        }, vp.fontScalePct);
+      }
+
+      await page.getByRole("button", { name: "Roll back release" }).click();
+      const dialog = page.getByRole("alertdialog");
+      await expect(dialog).toBeVisible();
+      await expect(dialog).toContainText("Roll back release");
+      await expect(dialog).toContainText("v1.0.0-preview.1");
+
+      await page.evaluate(() => document.fonts.ready);
+
+      const overflow = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+      }));
+      expect(
+        overflow.scrollWidth,
+        `Horizontal overflow on governance rollback dialog (${theme}, ${vp.name}): scrollWidth=${overflow.scrollWidth} > clientWidth=${overflow.clientWidth}`,
+      ).toBeLessThanOrEqual(overflow.clientWidth);
+
+      const axeResults = await new AxeBuilder({ page }).analyze();
+      const blocking = axeResults.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(
+        blocking,
+        `Accessibility violations on governance rollback dialog (${theme}, ${vp.name}): ${JSON.stringify(
+          blocking.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.length })),
+        )}`,
+      ).toEqual([]);
+
+      const filename =
+        theme === "dark"
+          ? `mission-control-governance-rollback-dialog-${vp.name}.png`
+          : `mission-control-governance-rollback-dialog-light-${vp.name}.png`;
+      const outPath = path.join(SCREENSHOTS_DIR, filename);
+      await page.screenshot({ path: outPath, fullPage: true });
+      recordScreenshotManifestEntry({
+        screenshotsDir: SCREENSHOTS_DIR,
+        filename,
+        viewportOrDevice: vp.name,
+        scale: `${vp.fontScalePct}%`,
+        axeViolations: blocking.length,
+        overflow: overflow.scrollWidth > overflow.clientWidth,
+      });
+    });
+
+    test(`governance smoke-config link and settings field @ ${vp.name} (${theme})`, async ({ page }) => {
+      await page.setViewportSize({ width: vp.width, height: vp.height });
+      await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme });
+
+      await page.goto("/?scenario=governance", { waitUntil: "networkidle" });
+      await page.locator("main h1").waitFor({ state: "visible" });
+
+      await page.evaluate((th) => {
+        localStorage.setItem("nightshift.theme", th);
+        document.documentElement.dataset.theme = th;
+      }, theme);
+
+      if (vp.fontScalePct !== 100) {
+        await page.evaluate((pct) => {
+          document.documentElement.style.fontSize = `${pct}%`;
+        }, vp.fontScalePct);
+      }
+
+      await page.getByRole("button", { name: "Configure smoke test" }).click();
+      await expect(page).toHaveURL(/\/settings/);
+      await page.locator("main h1").waitFor({ state: "visible" });
+
+      await page.getByRole("button", { name: "Edit" }).first().click();
+      const dialog = page.getByRole("dialog");
+      await expect(dialog).toBeVisible();
+      await expect(page.getByLabel("Post-release smoke command")).toBeVisible();
+
+      await page.evaluate(() => document.fonts.ready);
+
+      const overflow = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+      }));
+      expect(
+        overflow.scrollWidth,
+        `Horizontal overflow on governance smoke-config settings modal (${theme}, ${vp.name}): scrollWidth=${overflow.scrollWidth} > clientWidth=${overflow.clientWidth}`,
+      ).toBeLessThanOrEqual(overflow.clientWidth);
+
+      const axeResults = await new AxeBuilder({ page }).analyze();
+      const blocking = axeResults.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(
+        blocking,
+        `Accessibility violations on governance smoke-config settings modal (${theme}, ${vp.name}): ${JSON.stringify(
+          blocking.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.length })),
+        )}`,
+      ).toEqual([]);
+
+      const filename =
+        theme === "dark"
+          ? `settings-governance-smoke-config-${vp.name}.png`
+          : `settings-governance-smoke-config-light-${vp.name}.png`;
+      const outPath = path.join(SCREENSHOTS_DIR, filename);
+      await page.screenshot({ path: outPath, fullPage: true });
+      recordScreenshotManifestEntry({
+        screenshotsDir: SCREENSHOTS_DIR,
+        filename,
+        viewportOrDevice: vp.name,
+        scale: `${vp.fontScalePct}%`,
+        axeViolations: blocking.length,
+        overflow: overflow.scrollWidth > overflow.clientWidth,
+      });
+    });
+  }
+}

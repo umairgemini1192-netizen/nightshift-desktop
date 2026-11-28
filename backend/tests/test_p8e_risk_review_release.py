@@ -1,0 +1,2330 @@
+"""Phase 8e tests: Risk-based review & release governance (Amendments C, G, H).
+
+Covers docs/AGENT_PIPELINE.md sections 1, 2, 6.1, 9.2, 9.3, and 12.1 Phase 8e:
+- Mechanical 5-factor risk classifier with upward-only path/content escalation
+- Provider-independent reviewer excluding ALL contributing providers (coders + fixers + handoffs)
+- Strict input isolation (raw diff + frozen contract only, never PR narrative)
+- Validated citations (changed diff lines, unchanged repo callers, structured omission findings)
+- Single schema/citation retry and fail-closed invalid review handling
+- Owner-approval gates for high_risk/governance vs conditional auto-merge for eligible classes
+- Mandatory post-release launch/smoke test (fail-closed when unavailable or failing)
+- One-click rollback preserving tag history, restoring verified artifacts/checksums, optional revert PR
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import zipfile
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+
+from nightshift.bridge import BridgeAPI
+from nightshift.engine.ci import CiPipelineManager
+from nightshift.engine.deck import generate_deck_data
+from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.pipeline_contracts import (
+    DiffPathEntry,
+    MergeGate,
+    canonical_contract_json,
+    provider_for_engine,
+)
+from nightshift.engine.pipeline_evidence import CiArtifact, CiJobCheck
+from nightshift.engine.pipeline_review import (
+    build_isolated_review_prompt,
+    classify_task_risk,
+    compute_risk_score,
+    pack_raw_diff_for_review,
+    parse_and_validate_review_output,
+    select_independent_reviewer,
+)
+from nightshift.engine.planner import PhaseDefinition
+from nightshift.engine.release import (
+    DESKTOP_SELFTEST_SMOKE,
+    ReleaseManager,
+    SmokeTestResult,
+    compute_sha256,
+)
+from nightshift.engine.scheduler import Scheduler
+from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig
+from nightshift.engine.vcs import FakeGitGh
+from nightshift.engine.verify import RiskAssessment
+from nightshift.events import EventBus
+from nightshift.modules.registry import ModuleRegistry
+from nightshift.quota.ledger import QuotaLedger
+from nightshift.runners.base import RunnerResult
+from nightshift.runners.fake import FakeRunner
+from nightshift.store import Store
+
+
+def _ok_login_runner(cmd: list[str], timeout: int) -> tuple[int, str, str, bool]:
+    return (0, '{"loggedIn": true}\nLogged in to github.com\nOK', "", False)
+
+
+def _approve_json(summary: str = "All checks and contract criteria satisfied.") -> str:
+    return json.dumps({"verdict": "APPROVE", "summary": summary, "findings": []})
+
+
+def _make_valid_jobs(commit_sha: str, *, branch: str = "feat/p8e") -> list[CiJobCheck]:
+    return [
+        CiJobCheck(
+            name="desktop-gates",
+            status="success",
+            commit_sha=commit_sha,
+            build_id="b-1",
+            duration_seconds=8.0,
+            is_gate_job=True,
+            branch=branch,
+        ),
+        CiJobCheck(
+            name="desktop-backend",
+            status="success",
+            commit_sha=commit_sha,
+            build_id="b-2",
+            duration_seconds=25.0,
+            branch=branch,
+        ),
+        CiJobCheck(
+            name="desktop-frontend",
+            status="success",
+            commit_sha=commit_sha,
+            build_id="b-3",
+            duration_seconds=45.0,
+            artifacts=[CiArtifact(path="ui-screenshots/screenshot-manifest.json", size_bytes=512, build_id="b-3")],
+            branch=branch,
+        ),
+        CiJobCheck(
+            name="desktop-package",
+            status="success",
+            commit_sha=commit_sha,
+            build_id="b-4",
+            duration_seconds=90.0,
+            artifacts=[CiArtifact(path="nightshift-windows/NightShift-windows.zip", size_bytes=1024, build_id="b-4")],
+            branch=branch,
+        ),
+    ]
+
+
+def _seed_task(
+    store: Store,
+    *,
+    task_id: str = "t-8e",
+    branch: str = "feat/p8e",
+    risk_class: str = "business_logic",
+    allowed_globs: list[str] | None = None,
+    acceptance_criteria: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    store.create_project("proj-1", "NightShift", "owner/repo", "/tmp/repo")
+    store.create_plan("plan-1", "proj-1", "Plan 8e")
+    store.upsert_phase("p1", "plan-1", "Phase 8e", branch)
+    return store.create_task_with_contract(
+        task_id=task_id,
+        phase_id="p1",
+        plan_id="plan-1",
+        title="Phase 8e Task",
+        branch=branch,
+        risk_class=risk_class,
+        allowed_globs=allowed_globs or ["src/**", "docs/**", "frontend/**", "backend/**"],
+        acceptance_criteria=acceptance_criteria
+        or [
+            {"id": "ac-1", "description": "Implements risk classification"},
+            {"id": "ac-2", "description": "Enforces provider independence"},
+        ],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. Risk Classifier (Amendment C)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_risk_score_weighted_formula_and_clamping() -> None:
+    low = compute_risk_score(
+        {"impact": 1, "data_sensitivity": 1, "reversibility": 5, "test_coverage": 5, "uncertainty": 1}
+    )
+    assert low == 1.0
+
+    high = compute_risk_score(
+        {"impact": 5, "data_sensitivity": 5, "reversibility": 1, "test_coverage": 1, "uncertainty": 5}
+    )
+    assert high == 5.0
+
+    # Clamping out-of-range values
+    clamped = compute_risk_score(
+        {"impact": 99, "data_sensitivity": -5, "reversibility": 3, "test_coverage": 3, "uncertainty": 2}
+    )
+    expected = round(0.30 * 5 + 0.25 * 1 + 0.20 * 3 + 0.15 * 3 + 0.10 * 2, 3)
+    assert clamped == expected
+
+
+def test_classify_task_risk_all_five_classes_and_upward_only_escalation() -> None:
+    # 1. docs_format
+    docs_res = classify_task_risk([DiffPathEntry("M", "docs/README.md")], "+Updated docs", base_risk_class="docs_format")
+    assert docs_res.risk_class == "docs_format"
+    assert docs_res.auto_merge_eligible is True
+    assert docs_res.requires_independent_review is False
+
+    # 2. ui_cosmetic
+    ui_res = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+        "+<GlassCard />",
+        base_risk_class="docs_format",
+    )
+    assert ui_res.risk_class == "ui_cosmetic"
+    assert ui_res.escalated_from == "docs_format"
+    assert ui_res.requires_screenshots is True
+    assert ui_res.auto_merge_eligible is True
+
+    # 3. business_logic
+    logic_res = classify_task_risk(
+        [DiffPathEntry("M", "backend/nightshift/engine/planner.py")],
+        "+def sort_dag(): pass",
+        base_risk_class="docs_format",
+    )
+    assert logic_res.risk_class == "business_logic"
+    assert logic_res.requires_independent_review is True
+    assert logic_res.requires_owner_approval is False
+
+    # 4. high_risk via path signal (auth/credentials) and via diff content (ALTER TABLE)
+    auth_res = classify_task_risk(
+        [DiffPathEntry("M", "backend/nightshift/engine/credentials.py")],
+        "+def store_token(): pass",
+        base_risk_class="business_logic",
+    )
+    assert auth_res.risk_class == "high_risk"
+    assert auth_res.requires_strong_reviewer is True
+    assert auth_res.requires_owner_approval is True
+    assert auth_res.auto_merge_eligible is False
+
+    sql_res = classify_task_risk(
+        [DiffPathEntry("M", "backend/nightshift/store.py")],
+        "+ALTER TABLE projects ADD COLUMN secret_flag TEXT",
+        base_risk_class="business_logic",
+    )
+    assert sql_res.risk_class == "high_risk"
+
+    # 5. governance via rename/delete/case-variant protected path
+    gov_res = classify_task_risk(
+        [DiffPathEntry("R", old_path="backend/tests/CONFTEST.PY", path="src/moved.py")],
+        "+pass",
+        base_risk_class="docs_format",
+        case_fold=True,
+    )
+    assert gov_res.risk_class == "governance"
+    assert gov_res.requires_owner_approval is True
+    assert gov_res.auto_merge_eligible is False
+
+    # 6. Never downgrades below base_risk_class
+    no_downgrade = classify_task_risk(
+        [DiffPathEntry("M", "docs/notes.md")],
+        "+typo fix",
+        base_risk_class="high_risk",
+    )
+    assert no_downgrade.risk_class == "high_risk"
+    assert no_downgrade.escalated_from is None
+
+
+# ---------------------------------------------------------------------------
+# 2. Provider-Independent Reviewer & Citation Validation (Amendment G)
+# ---------------------------------------------------------------------------
+
+
+def test_provider_independence_excludes_all_contributing_providers_and_never_self_fallbacks() -> None:
+    runners = {
+        "agy": FakeRunner.success("agy"),
+        "gemini": FakeRunner.success("gemini"),
+        "codex": FakeRunner.success("codex"),
+        "claude": FakeRunner.success("claude"),
+        "qwen": FakeRunner.success("qwen"),
+    }
+
+    # agy (google) contributed -> gemini (also google) MUST be excluded; codex (openai) chosen
+    chosen, _, _ = select_independent_reviewer(
+        contributing_providers={"google"},
+        risk_class="business_logic",
+        runners={"agy": runners["agy"], "gemini": runners["gemini"]},
+        is_available=lambda _: True,
+    )
+    assert chosen is None  # NEVER falls back to agy or gemini!
+
+    # Coder (google) + fixer (openai) both contributed -> claude (anthropic) chosen
+    chosen2, _, _ = select_independent_reviewer(
+        contributing_providers={"google", "openai"},
+        risk_class="business_logic",
+        runners=runners,
+        is_available=lambda _: True,
+    )
+    assert chosen2 == "claude"
+    assert provider_for_engine(chosen2) == "anthropic"
+
+    # High-risk rejects economy reviewer even if graduated
+    chosen3, _, reason3 = select_independent_reviewer(
+        contributing_providers={"google", "openai", "anthropic"},
+        risk_class="high_risk",
+        runners=runners,
+        is_available=lambda _: True,
+        graduated_economy_engines={"qwen"},
+    )
+    assert chosen3 is None
+    assert "not allowed for high_risk" in reason3
+
+    # Business logic allows economy reviewer ONLY when benchmark-graduated
+    chosen4_ungrad, _, _ = select_independent_reviewer(
+        contributing_providers={"google", "openai", "anthropic"},
+        risk_class="business_logic",
+        runners=runners,
+        is_available=lambda _: True,
+        graduated_economy_engines=set(),
+    )
+    assert chosen4_ungrad is None
+
+    chosen4_grad, _, _ = select_independent_reviewer(
+        contributing_providers={"google", "openai", "anthropic"},
+        risk_class="business_logic",
+        runners=runners,
+        is_available=lambda _: True,
+        graduated_economy_engines={"qwen"},
+    )
+    assert chosen4_grad == "qwen"
+
+
+def test_isolated_review_prompt_excludes_pr_narrative_and_packs_whole_hunks() -> None:
+    app_diff = "diff --git a/src/app.py b/src/app.py\n@@ -1,2 +1,3 @@\n def run():\n+    return 1\n"
+    test_diff = "diff --git a/tests/test_app.py b/tests/test_app.py\n@@ -1,2 +1,3 @@\n def test_run():\n+    assert True\n"
+    packed = pack_raw_diff_for_review(test_diff + "\n" + app_diff, max_chars=len(app_diff) + 40)
+    # App code prioritized before tests; whole hunk preserved
+    assert "src/app.py" in packed
+    assert "@@ -1,2 +1,3 @@" in packed
+
+    contract_json = canonical_contract_json(
+        {
+            "task_id": "t1",
+            "title": "Add widget",
+            "acceptance_criteria": [{"id": "ac-1", "description": "Works"}],
+        }
+    )
+    prompt = build_isolated_review_prompt(
+        contract_canonical_json=contract_json,
+        raw_diff=app_diff,
+        head_sha="abc1234",
+    )
+    assert "FROZEN TASK CONTRACT (JSON):" in prompt
+    assert "RAW GIT DIFF:" in prompt
+    assert "Do NOT modify files, run git mutations, or rely on any PR description" in prompt
+    assert "src/app.py" in prompt
+
+
+def test_parse_and_validate_review_output_citations_and_omissions(tmp_path: Path) -> None:
+    wt = tmp_path / "wt"
+    (wt / "src").mkdir(parents=True)
+    (wt / "src" / "feature.py").write_text("line1\nline2\nline3\n", encoding="utf-8")
+    (wt / "src" / "caller.py").write_text("import feature\nfeature.run()\n", encoding="utf-8")
+
+    contract = {
+        "acceptance_criteria_json": json.dumps(
+            [{"id": "ac-1", "description": "Handle empty input"}, {"id": "ac-2", "description": "Log audit event"}]
+        )
+    }
+
+    # 1. Valid defect on changed file + valid defect on unchanged caller + valid omission
+    valid_payload = json.dumps(
+        {
+            "verdict": "CHANGES",
+            "summary": "Found one P1 defect and one omission.",
+            "findings": [
+                {
+                    "priority": "P1",
+                    "kind": "defect",
+                    "file": "src/caller.py",
+                    "line": 2,
+                    "message": "Unchanged caller breaks with new signature.",
+                },
+                {
+                    "priority": "P2",
+                    "kind": "omission",
+                    "file": "src/feature.py",
+                    "line": 1,
+                    "acceptance_criteria_id": "ac-2",
+                    "message": "Audit logging requirement not yet wired.",
+                },
+            ],
+        }
+    )
+    res_ok = parse_and_validate_review_output(valid_payload, worktree_dir=wt, contract=contract)
+    assert res_ok.valid is True
+    assert res_ok.verdict == "CHANGES"
+    assert len(res_ok.p1_findings) == 1
+    assert len(res_ok.p2_findings) == 1
+
+    # 2. Invalid line out of bounds
+    bad_line = json.dumps(
+        {
+            "verdict": "CHANGES",
+            "summary": "Bad line",
+            "findings": [{"priority": "P1", "kind": "defect", "file": "src/feature.py", "line": 999, "message": "Boom"}],
+        }
+    )
+    res_bad_line = parse_and_validate_review_output(bad_line, worktree_dir=wt, contract=contract)
+    assert res_bad_line.valid is False
+    assert any("only 3 line(s)" in e for e in res_bad_line.errors)
+
+    # 3. Unknown acceptance_criteria_id in omission
+    bad_ac = json.dumps(
+        {
+            "verdict": "CHANGES",
+            "summary": "Bad AC",
+            "findings": [
+                {
+                    "priority": "P1",
+                    "kind": "omission",
+                    "file": "src/feature.py",
+                    "acceptance_criteria_id": "ac-99",
+                    "message": "Missing",
+                }
+            ],
+        }
+    )
+    res_bad_ac = parse_and_validate_review_output(bad_ac, worktree_dir=wt, contract=contract)
+    assert res_bad_ac.valid is False
+    assert any("unknown acceptance_criteria_id" in e for e in res_bad_ac.errors)
+
+    # 4. APPROVE with P1 finding is rejected
+    inconsistent = json.dumps(
+        {
+            "verdict": "APPROVE",
+            "summary": "Approve with P1",
+            "findings": [{"priority": "P1", "kind": "defect", "file": "src/feature.py", "line": 1, "message": "Bug"}],
+        }
+    )
+    res_inc = parse_and_validate_review_output(inconsistent, worktree_dir=wt, contract=contract)
+    assert res_inc.valid is False
+
+
+@pytest.mark.asyncio
+async def test_ci_review_retries_once_on_invalid_citations_and_blocks_if_still_invalid(tmp_path: Path) -> None:
+    with Store(tmp_path / "rev_retry.db") as store:
+        store.migrate()
+        _, contract = _seed_task(store, task_id="t-retry", branch="feat/retry")
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/retry", number=201, head_sha="sha_201")
+        wt = tmp_path / "wt"
+        (wt / "src").mkdir(parents=True)
+        (wt / "src" / "main.ts").write_text("export const x = 1;\n", encoding="utf-8")
+        vcs.worktrees["feat/retry"] = wt
+        vcs.changed_files["feat/retry"] = ["src/main.ts"]
+
+        # First call returns invalid citation, second returns valid APPROVE JSON -> succeeds after 1 retry
+        codex_retry_ok = FakeRunner(
+            name="codex",
+            responses=[
+                RunnerResult(rc=0, stdout='{"verdict":"CHANGES","findings":[{"priority":"P1","file":"nope.py","line":1,"message":"bad"}]}', stderr=""),
+                RunnerResult(rc=0, stdout=_approve_json(), stderr=""),
+            ],
+        )
+        ci_mgr = CiPipelineManager(vcs, store, Scheduler(store, QuotaLedger(store)), {"agy": FakeRunner.success("agy"), "codex": codex_retry_ok})
+        res = await ci_mgr.watch_and_heal(
+            repo="owner/repo",
+            local_repo=tmp_path,
+            worktree_dir=wt,
+            phase_id="p1",
+            phase_title="P1",
+            branch="feat/retry",
+            pr_number=201,
+            initial_engine="agy",
+            risk=RiskAssessment(level="low"),
+            task_contract=contract,
+            contributing_providers={"google"},
+        )
+        assert res.passed is True
+        assert res.reviewer_engine == "codex"
+        assert res.reviewer_provider == "openai"
+        assert len(codex_retry_ok.calls) == 2
+
+        # Both calls return malformed output -> fail-closed invalid_review_output
+        codex_always_bad = FakeRunner(
+            name="codex",
+            responses=[
+                RunnerResult(rc=0, stdout="not json", stderr=""),
+                RunnerResult(rc=0, stdout="still not json", stderr=""),
+            ],
+        )
+        ci_mgr2 = CiPipelineManager(vcs, store, Scheduler(store, QuotaLedger(store)), {"agy": FakeRunner.success("agy"), "codex": codex_always_bad})
+        res2 = await ci_mgr2.watch_and_heal(
+            repo="owner/repo",
+            local_repo=tmp_path,
+            worktree_dir=wt,
+            phase_id="p1",
+            phase_title="P1",
+            branch="feat/retry",
+            pr_number=201,
+            initial_engine="agy",
+            risk=RiskAssessment(level="low"),
+            task_contract=contract,
+            contributing_providers={"google"},
+        )
+        assert res2.passed is False
+        assert res2.block_reason == "invalid_review_output"
+
+
+@pytest.mark.asyncio
+async def test_ci_review_fixer_provider_excluded_from_re_review(tmp_path: Path) -> None:
+    """If agy (google) coded and codex (openai) fixed a P1, re-review MUST exclude both google and openai."""
+    with Store(tmp_path / "rev_fixer.db") as store:
+        store.migrate()
+        _, contract = _seed_task(store, task_id="t-fixer", branch="feat/fixer")
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/fixer", number=202, head_sha="sha_202")
+        wt = tmp_path / "wt"
+        (wt / "src").mkdir(parents=True)
+        (wt / "src" / "main.ts").write_text("const a = 1;\nconst b = 2;\n", encoding="utf-8")
+        vcs.worktrees["feat/fixer"] = wt
+        vcs.changed_files["feat/fixer"] = ["src/main.ts"]
+
+        # Priority list puts codex first for fixes so codex becomes a contributing provider during fix round
+        store.set_priority_list([{"position": 1, "engine": "codex", "model": "o3-mini", "effort": "medium"}])
+
+        p1_json = json.dumps(
+            {
+                "verdict": "CHANGES",
+                "summary": "Null guard missing",
+                "findings": [{"priority": "P1", "kind": "defect", "file": "src/main.ts", "line": 1, "message": "Fix a"}],
+            }
+        )
+        codex_runner = FakeRunner(
+            name="codex",
+            responses=[
+                RunnerResult(rc=0, stdout=p1_json, stderr=""),  # round 1 review
+                RunnerResult(rc=0, stdout="fixed", stderr=""),  # fix round
+            ],
+        )
+        claude_runner = FakeRunner(name="claude", responses=[RunnerResult(rc=0, stdout=_approve_json(), stderr="")])
+        runners = {"agy": FakeRunner.success("agy"), "codex": codex_runner, "claude": claude_runner}
+
+        ci_mgr = CiPipelineManager(vcs, store, Scheduler(store, QuotaLedger(store)), runners)
+        res = await ci_mgr.watch_and_heal(
+            repo="owner/repo",
+            local_repo=tmp_path,
+            worktree_dir=wt,
+            phase_id="p1",
+            phase_title="P1",
+            branch="feat/fixer",
+            pr_number=202,
+            initial_engine="agy",
+            risk=RiskAssessment(level="low"),
+            task_contract=contract,
+            contributing_providers={"google"},
+        )
+        assert res.passed is True
+        # Re-review was performed by claude (anthropic), NOT codex (openai) or agy (google)
+        assert res.reviewer_engine == "claude"
+        assert res.reviewer_provider == "anthropic"
+        assert "codex" in res.contributing_engines
+
+
+# ---------------------------------------------------------------------------
+# 3. MergeGate Risk Policies, Owner Approval & Conditional Auto-Merge
+# ---------------------------------------------------------------------------
+
+
+def test_merge_gate_conditional_auto_merge_and_owner_approval_policies(tmp_path: Path) -> None:
+    with Store(tmp_path / "gate_8e.db") as store:
+        store.migrate()
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=True)
+
+        # 1. docs_format: auto-merges without independent reviewer or owner approval
+        t_docs, c_docs = _seed_task(store, task_id="t-docs", branch="feat/docs", risk_class="docs_format")
+        res_docs = gate.authorize_merge(
+            task=t_docs,
+            contract=c_docs,
+            head_sha="sha_docs",
+            diff_entries=[DiffPathEntry("M", "docs/GUIDE.md")],
+            diff_content="+New docs line",
+        )
+        assert res_docs.allowed is True
+        assert res_docs.effective_risk_class == "docs_format"
+
+        # 2. ui_cosmetic: blocks without verified screenshots, allows with verified screenshots
+        t_ui, c_ui = store.create_task_with_contract(
+            task_id="t-ui",
+            phase_id="p1",
+            plan_id="plan-1",
+            title="UI tweak",
+            branch="feat/ui",
+            risk_class="ui_cosmetic",
+            allowed_globs=["frontend/**"],
+        )
+        store.record_evidence(
+            task_id="t-ui",
+            contract_sha256=c_ui["contract_sha256"],
+            commit_sha="sha_ui",
+            kind="ci_check",
+            source="circleci:desktop-frontend",
+            build_id="b-10",
+            duration_seconds=30.0,
+            metadata={"job_name": "desktop-frontend"},
+            verified=True,
+        )
+        cosmetic_diff = (
+            "diff --git a/frontend/src/modules/mission-control/Page.tsx b/frontend/src/modules/mission-control/Page.tsx\n"
+            "@@ -1,2 +1,2 @@\n"
+            '-<GlassCard className="p-4">\n'
+            '+<GlassCard className="p-6">\n'
+        )
+        res_ui_no_shot = gate.authorize_merge(
+            task=t_ui,
+            contract=c_ui,
+            head_sha="sha_ui",
+            diff_entries=[DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+            diff_content=cosmetic_diff,
+            evidence_records=store.list_evidence_records("t-ui", commit_sha="sha_ui"),
+        )
+        assert res_ui_no_shot.allowed is False
+        assert res_ui_no_shot.block_reason == "missing_verified_screenshots"
+
+        store.record_evidence(
+            task_id="t-ui",
+            contract_sha256=c_ui["contract_sha256"],
+            commit_sha="sha_ui",
+            kind="screenshot",
+            source="playwright:manifest",
+            build_id="b-10",
+            metadata={"renderer": "playwright-mockbridge"},
+            verified=True,
+        )
+        res_ui_ok = gate.authorize_merge(
+            task=t_ui,
+            contract=c_ui,
+            head_sha="sha_ui",
+            diff_entries=[DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+            diff_content=cosmetic_diff,
+            evidence_records=store.list_evidence_records("t-ui", commit_sha="sha_ui"),
+        )
+        assert res_ui_ok.allowed is True
+
+        # 3. high_risk escalated from docs_format via diff -> requires strong reviewer AND owner approval
+        t_hr, c_hr = store.create_task_with_contract(
+            task_id="t-hr",
+            phase_id="p1",
+            plan_id="plan-1",
+            title="Sneaky auth edit",
+            branch="feat/hr",
+            risk_class="docs_format",
+            allowed_globs=["backend/**"],
+        )
+        store.record_task_contributing_provider("t-hr", "google")
+        t_hr = store.get_task("t-hr")
+        assert t_hr is not None
+
+        # Economy reviewer rejected for high_risk
+        res_hr_econ = gate.authorize_merge(
+            task=t_hr,
+            contract=c_hr,
+            head_sha="sha_hr",
+            diff_entries=[DiffPathEntry("M", "backend/nightshift/engine/credentials.py")],
+            reviewer_provider="alibaba",
+            reviewer_engine="qwen",
+            reviewer_tier="economy",
+        )
+        assert res_hr_econ.allowed is False
+        assert res_hr_econ.block_reason == "reviewer_tier_insufficient"
+        assert res_hr_econ.effective_risk_class == "high_risk"
+
+        # Strong reviewer passes review check, but still blocks for owner approval even with autonomous_merge_enabled=True!
+        res_hr_owner = gate.authorize_merge(
+            task=t_hr,
+            contract=c_hr,
+            head_sha="sha_hr",
+            diff_entries=[DiffPathEntry("M", "backend/nightshift/engine/credentials.py")],
+            reviewer_provider="openai",
+            reviewer_engine="codex",
+            reviewer_tier="standard",
+        )
+        assert res_hr_owner.allowed is False
+        assert res_hr_owner.block_reason == "awaiting_owner_approval"
+
+        # Stale SHA owner approval still blocked
+        store.record_task_owner_approval("t-hr", "owner", "sha_old")
+        res_hr_stale = gate.authorize_merge(
+            task=store.get_task("t-hr") or t_hr,
+            contract=c_hr,
+            head_sha="sha_hr",
+            diff_entries=[DiffPathEntry("M", "backend/nightshift/engine/credentials.py")],
+            reviewer_provider="openai",
+            reviewer_engine="codex",
+            reviewer_tier="standard",
+        )
+        assert res_hr_stale.allowed is False
+        assert res_hr_stale.block_reason == "awaiting_owner_approval"
+
+        # Exact-SHA owner approval succeeds
+        store.record_task_owner_approval("t-hr", "owner", "sha_hr")
+        res_hr_ok = gate.authorize_merge(
+            task=store.get_task("t-hr") or t_hr,
+            contract=c_hr,
+            head_sha="sha_hr",
+            diff_entries=[DiffPathEntry("M", "backend/nightshift/engine/credentials.py")],
+            reviewer_provider="openai",
+            reviewer_engine="codex",
+            reviewer_tier="standard",
+        )
+        assert res_hr_ok.allowed is True
+
+
+# ---------------------------------------------------------------------------
+# 4. Mandatory Release Smoke Test & One-Click Rollback (Amendment H)
+# ---------------------------------------------------------------------------
+
+
+def test_release_smoke_test_fail_closed_and_rollback(tmp_path: Path) -> None:
+    with Store(tmp_path / "rel_8e.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+
+        # 1. Publish v1 (good release) with passing smoke test
+        def pass_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            return SmokeTestResult(passed=True, status="passed", detail=f"Smoke OK for {tag}", command=cmd, verified_at="2026-11-28T01:00:00Z")
+
+        rel_mgr_ok = ReleaseManager(vcs, smoke_runner=pass_smoke)
+        vcs.artifacts_to_create = ["NightShift-windows.zip"]
+        tag1, files1 = rel_mgr_ok.publish_verified_release(
+            "owner/repo",
+            out_dir,
+            "Good release",
+            merge_sha="sha_merge_good",
+            artifact_glob="*.zip",
+            run_id=10,
+        )
+        art1 = next(f for f in files1 if f.name == "NightShift-windows.zip")
+        good_sha = compute_sha256(art1)
+        s1 = rel_mgr_ok.verify_and_record_release(
+            store=store,
+            repo="owner/repo",
+            tag=tag1,
+            merge_sha="sha_merge_good",
+            artifact_path=art1,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        assert s1.passed is True
+        rec1 = store.get_release_verification("owner/repo", tag1)
+        assert rec1 is not None and rec1["smoke_status"] == "passed"
+
+        # 2. Unconfigured smoke_command fails closed as unavailable
+        s_unavail = ReleaseManager(vcs).run_launch_smoke_test(
+            artifact_path=art1,
+            tag="v1.0.0-preview.unavail",
+            smoke_command="",
+        )
+        assert s_unavail.passed is False
+        assert s_unavail.status == "unavailable"
+
+        # 3. Publish v2 (faulty release with different bytes) whose smoke test fails
+        def fail_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            return SmokeTestResult(passed=False, status="failed", detail="Crash on startup (rc=1)", command=cmd)
+
+        rel_mgr_bad = ReleaseManager(vcs, smoke_runner=fail_smoke)
+        bad_tmp = tmp_path / "bad_tmp"
+        bad_tmp.mkdir()
+        bad_zip = bad_tmp / "NightShift-windows.zip"
+        bad_zip.write_bytes(b"PK\x03\x04broken_v2_payload")
+        tag2, files2 = rel_mgr_bad.publish_verified_release(
+            "owner/repo",
+            out_dir,
+            "Faulty release",
+            merge_sha="sha_merge_bad",
+            artifact_glob="*.zip",
+            run_id=11,
+            prepared_artifacts=[bad_zip],
+            temp_dir=bad_tmp,
+        )
+        art2 = next(f for f in files2 if f.name == "NightShift-windows.zip")
+        assert compute_sha256(art2) != good_sha
+
+        s2 = rel_mgr_bad.verify_and_record_release(
+            store=store,
+            repo="owner/repo",
+            tag=tag2,
+            merge_sha="sha_merge_bad",
+            artifact_path=art2,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        assert s2.passed is False
+        rec2 = store.get_release_verification("owner/repo", tag2)
+        assert rec2 is not None
+        assert rec2["smoke_status"] == "failed"
+        assert rec2["previous_good_tag"] == tag1
+
+        # 4. One-click rollback restores tag1's verified artifact + checksums, appends warning to tag2, opens revert PR
+        rb = rel_mgr_bad.rollback_release(
+            store=store,
+            repo="owner/repo",
+            faulty_tag=tag2,
+            output_dir=out_dir,
+            open_revert_pr=True,
+            local_repo=tmp_path,
+        )
+        assert rb.ok is True
+        assert rb.restored_tag == tag1
+        assert rb.revert_pr_created is True
+        # Output dir now contains tag1's verified bytes again!
+        assert compute_sha256(out_dir / "NightShift-windows.zip") == good_sha
+        assert (out_dir / f"{tag1}-SHA256SUMS.txt").exists()
+        # Faulty release tag still exists (never deleted), with superseded warning appended
+        faulty_gh = next(r for r in vcs.releases if r["tag"] == tag2)
+        assert "SUPERSEDED / ROLLED BACK" in faulty_gh["body"]
+        assert tag1 in faulty_gh["body"]
+        # DB marks tag2 as rolled_back
+        rec2_after = store.get_release_verification("owner/repo", tag2)
+        assert rec2_after is not None and rec2_after["smoke_status"] == "rolled_back"
+        assert rec2_after["rolled_back_at"] is not None
+        # Revert PR was created on main for sha_merge_bad
+        assert any(r["commit_sha"] == "sha_merge_bad" for r in vcs.reverts)
+
+
+def test_desktop_zip_selftest_fails_closed_when_exe_missing(tmp_path: Path) -> None:
+    bad_zip = tmp_path / "NightShift-windows.zip"
+    with zipfile.ZipFile(bad_zip, "w") as zf:
+        zf.writestr("README.txt", "no exe here")
+    res = ReleaseManager(FakeGitGh()).run_launch_smoke_test(
+        artifact_path=bad_zip,
+        tag="v1.0.0-preview.1",
+        smoke_command=DESKTOP_SELFTEST_SMOKE,
+    )
+    assert res.passed is False
+    assert res.status == "failed"
+    assert "NightShift.exe not found" in res.detail
+
+
+# ---------------------------------------------------------------------------
+# 5. End-to-End EngineStateMachine + Bridge + Deck Integration (Phase 8e)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_e2e_engine_conditional_auto_merge_and_mandatory_smoke_gate(tmp_path: Path) -> None:
+    """End-to-end Phase 8e flow:
+    1. Conditional auto-merge enabled via setting -> business_logic merges with independent reviewer.
+    2. Missing smoke_command blocks MERGED -> BLOCKED (smoke_test_unavailable), NEVER RELEASED.
+    3. Configuring smoke_command + passing smoke_runner completes MERGED -> RELEASED.
+    """
+    with Store(tmp_path / "e2e_8e.db") as store:
+        store.migrate()
+        store.set_setting("pipeline.conditionalAutoMerge", "1")
+        events = EventBus(store)
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.artifacts_to_create = ["NightShift-windows.zip"]
+
+        def on_code(prompt: str, wd: Path, model: str | None, effort: str) -> None:
+            (wd / "src").mkdir(parents=True, exist_ok=True)
+            (wd / "src" / "feature.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+            vcs.add_pr("feat/p8e-e2e", number=808, head_sha="sha_808")
+            vcs.changed_files["feat/p8e-e2e"] = ["src/feature.py"]
+            vcs.diffs["feat/p8e-e2e"] = "diff --git a/src/feature.py b/src/feature.py\n@@ -0,0 +1,2 @@\n+def ok():\n+    return True\n"
+            vcs.commit_ci_checks["sha_808"] = _make_valid_jobs("sha_808", branch="feat/p8e-e2e")
+            vcs.commit_ci_checks["sha_merge_123"] = _make_valid_jobs("sha_merge_123", branch="main")
+
+        runners = {
+            "agy": FakeRunner(name="agy", on_call=on_code),
+            "codex": FakeRunner(name="codex", responses=[RunnerResult(rc=0, stdout=_approve_json(), stderr="")]),
+        }
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+
+        # Phase 1: smoke_command NOT configured -> merges cleanly, publishes release, then BLOCKS on smoke_test_unavailable
+        engine_no_smoke = EngineStateMachine(store, events, quota, vcs=vcs, runners=runners, login_checker=logins)
+        assert engine_no_smoke.merge_gate.autonomous_merge_enabled is True
+
+        project_no_smoke = ProjectConfig(
+            id="proj_8e",
+            name="NightShift 8e",
+            repo="owner/repo",
+            local_path=tmp_path / "repo",
+            output_dir=tmp_path / "out",
+            artifact_glob="*.zip",
+            smoke_command="",
+        )
+        project_no_smoke.local_path.mkdir()
+        phases = [
+            PhaseDefinition(
+                id="p1",
+                title="Logic Feature",
+                branch="feat/p8e-e2e",
+                prompt="Implement logic",
+                allowed_globs=["src/**"],
+                auto_merge=True,
+                release_after_merge=True,
+            )
+        ]
+
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            rows1 = await engine_no_smoke.execute_plan(project_no_smoke, phases, plan_id="plan_8e")
+
+        assert "feat/p8e-e2e" in vcs.merged_prs
+        assert rows1[0]["status"] == "PARKED"
+        task_after_1 = store.get_task_by_branch("feat/p8e-e2e")
+        assert task_after_1 is not None
+        assert task_after_1["status"] == "BLOCKED"
+        assert task_after_1["block_reason"] == "smoke_test_unavailable"
+        assert task_after_1["blocked_from_status"] == "MERGED"
+        assert task_after_1["smoke_verified_at"] is None
+
+        # Deck surfaces the blocked smoke item in needs_you
+        deck = generate_deck_data(store, "proj_8e")
+        assert any("smoke test" in item["headline"].lower() for item in deck["needs_you"])
+
+        # Phase 2: Resume with smoke_command configured & passing smoke_runner -> transitions MERGED -> RELEASED
+        from nightshift.engine.pipeline_orchestrator import TaskOrchestrator
+
+        TaskOrchestrator(store).resume_from_blocked(task_after_1["id"], current_merge_sha="sha_merge_123")
+        assert store.get_task(task_after_1["id"])["status"] == "MERGED"
+
+        def pass_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            return SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T02:00:00Z")
+
+        engine_with_smoke = EngineStateMachine(
+            store,
+            events,
+            quota,
+            vcs=vcs,
+            runners=runners,
+            login_checker=logins,
+            smoke_runner=pass_smoke,
+        )
+        project_with_smoke = ProjectConfig(
+            id="proj_8e",
+            name="NightShift 8e",
+            repo="owner/repo",
+            local_path=project_no_smoke.local_path,
+            output_dir=project_no_smoke.output_dir,
+            artifact_glob="*.zip",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            rows2 = await engine_with_smoke.execute_plan(project_with_smoke, phases, plan_id="plan_8e")
+
+        assert rows2[0]["status"] == "COMPLETED"
+        task_after_2 = store.get_task(task_after_1["id"])
+        assert task_after_2 is not None
+        assert task_after_2["status"] == "RELEASED"
+        assert task_after_2["smoke_verified_at"] is not None
+
+
+def test_bridge_pipeline_approve_task_and_rollback_release(tmp_path: Path) -> None:
+    with Store(tmp_path / "bridge_8e.db") as store:
+        store.migrate()
+        events = EventBus(store)
+        vcs = FakeGitGh()
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+        store.create_project("proj-1", "NightShift", "owner/repo", str(tmp_path), output_dir=str(out_dir))
+        store.create_plan("plan-1", "proj-1", "Plan")
+        store.upsert_phase("p1", "plan-1", "Gov Phase", "feat/gov")
+        task, contract = store.create_task_with_contract(
+            task_id="t-gov",
+            phase_id="p1",
+            plan_id="plan-1",
+            title="Gov Task",
+            branch="feat/gov",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-gov",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_gov_1",
+            review_sha="sha_gov_1",
+            block_reason="awaiting_owner_approval",
+        )
+        store.record_evidence(
+            task_id="t-gov",
+            contract_sha256=contract["contract_sha256"],
+            commit_sha="sha_gov_1",
+            kind="ci_check",
+            source="circleci:desktop-gates",
+            build_id="b-1",
+            duration_seconds=10.0,
+            verified=True,
+        )
+
+        # Deck surfaces governance approval in needs_you
+        deck = generate_deck_data(store, "proj-1")
+        assert any("approval" in item["headline"].lower() for item in deck["needs_you"])
+
+        class _StubEngine:
+            def __init__(self, vcs_obj: FakeGitGh) -> None:
+                self.vcs = vcs_obj
+                self.release_mgr = ReleaseManager(vcs_obj)
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_StubEngine(vcs))
+
+        # Mismatched SHA rejected
+        bad_approve = bridge.call("pipeline.approveTask", {"taskId": "t-gov", "headSha": "sha_wrong"})
+        assert bad_approve["ok"] is False
+
+        # Exact SHA approved and resumed to APPROVED
+        ok_approve = bridge.call("pipeline.approveTask", {"taskId": "t-gov", "headSha": "sha_gov_1", "approvedBy": "owner"})
+        assert ok_approve["ok"] is True
+        assert ok_approve["data"]["status"] == "APPROVED"
+        assert ok_approve["data"]["owner_approved_sha"] == "sha_gov_1"
+
+        # Assertion waiver via bridge
+        waiver = bridge.call("pipeline.recordAssertionWaiver", {"taskId": "t-gov", "headSha": "sha_gov_1", "reason": "Consolidated duplicate test"})
+        assert waiver["ok"] is True
+        assert waiver["data"]["assertion_waiver_sha"] == "sha_gov_1"
+
+        # Rollback via bridge
+        good_file = tmp_path / "app.zip"
+        good_file.write_bytes(b"good-zip-v1")
+        good_sums = tmp_path / "SHA256SUMS.txt"
+        good_sha = compute_sha256(good_file)
+        good_sums.write_text(f"{good_sha}  app.zip\n", encoding="utf-8")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.1", "v1", "Good", [good_file, good_sums])
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.2", "v2", "Bad", [good_file, good_sums])
+        store.record_release_verification(
+            tag="v1.0.0-preview.1",
+            repo="owner/repo",
+            merge_sha="sha_1",
+            artifact_sha256=good_sha,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            tag="v1.0.0-preview.2",
+            repo="owner/repo",
+            merge_sha="sha_2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="deadbeef",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        rb_res = bridge.call("pipeline.rollbackRelease", {"tag": "v1.0.0-preview.2", "projectId": "proj-1"})
+        assert rb_res["ok"] is True
+        assert rb_res["data"]["restored_tag"] == "v1.0.0-preview.1"
+        assert (out_dir / "app.zip").read_bytes() == b"good-zip-v1"
+
+
+# ---------------------------------------------------------------------------
+# 6. Regression tests for Codex review findings (P1/P2) & fail-closed hardening
+# ---------------------------------------------------------------------------
+
+
+def test_release_verifications_scoped_by_repo_and_tag(tmp_path: Path) -> None:
+    """Two repos publishing the same tag must never overwrite, satisfy, or roll back each other."""
+    with Store(tmp_path / "repo_scoped_rel.db") as store:
+        store.migrate()
+        events = EventBus(store)
+        vcs = FakeGitGh()
+        out_a = tmp_path / "dist_a"
+        out_b = tmp_path / "dist_b"
+        out_a.mkdir()
+        out_b.mkdir()
+        store.create_project("proj-a", "Repo A", "owner/repo-a", str(tmp_path), output_dir=str(out_a))
+        store.create_project("proj-b", "Repo B", "owner/repo-b", str(tmp_path), output_dir=str(out_b))
+
+        art_a = tmp_path / "a.zip"
+        art_a.write_bytes(b"repo-a-good-v1")
+        sha_a = compute_sha256(art_a)
+        sums_a = tmp_path / "SHA256SUMS.txt"
+        sums_a.write_text(f"{sha_a}  a.zip\n", encoding="utf-8")
+
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.1", "A v1", "Good A", [art_a, sums_a])
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.2", "A v2", "Bad A", [art_a, sums_a])
+
+        # Record passing v1 and failing v2 for repo-a
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_a1",
+            artifact_sha256=sha_a,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_a2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="deadbeef",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        # Record same tags for repo-b with completely different statuses/SHAs
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_b1",
+            artifact_sha256="1111" * 16,
+            smoke_command="smoke-b",
+            smoke_status="failed",
+            smoke_detail="Repo B failed",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_b2",
+            artifact_sha256="2222" * 16,
+            smoke_command="smoke-b",
+            smoke_status="passed",
+            verified_at="2026-11-28T02:00:00Z",
+        )
+
+        # Verify repo-a and repo-b records remain isolated
+        rec_a1 = store.get_release_verification("owner/repo-a", "v1.0.0-preview.1")
+        rec_b1 = store.get_release_verification("owner/repo-b", "v1.0.0-preview.1")
+        assert rec_a1 is not None and rec_a1["smoke_status"] == "passed" and rec_a1["merge_sha"] == "sha_a1"
+        assert rec_b1 is not None and rec_b1["smoke_status"] == "failed" and rec_b1["merge_sha"] == "sha_b1"
+
+        # Deck for proj-a only surfaces owner/repo-a's failed release, not owner/repo-b's
+        deck_a = generate_deck_data(store, "proj-a")
+        release_items = [item for item in deck_a["needs_you"] if item.get("release_tag")]
+        assert all(item.get("repo") == "owner/repo-a" for item in release_items)
+
+        class _StubEngine:
+            def __init__(self, vcs_obj: FakeGitGh) -> None:
+                self.vcs = vcs_obj
+                self.release_mgr = ReleaseManager(vcs_obj)
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_StubEngine(vcs))
+
+        # Rollback without repo/projectId fails closed
+        no_repo_res = bridge.call("pipeline.rollbackRelease", {"tag": "v1.0.0-preview.2"})
+        assert no_repo_res["ok"] is False
+
+        # Rollback for proj-a updates ONLY owner/repo-a's v1.0.0-preview.2, leaving owner/repo-b untouched
+        rb_a = bridge.call("pipeline.rollbackRelease", {"tag": "v1.0.0-preview.2", "projectId": "proj-a"})
+        assert rb_a["ok"] is True
+        rec_a2_after = store.get_release_verification("owner/repo-a", "v1.0.0-preview.2")
+        rec_b2_after = store.get_release_verification("owner/repo-b", "v1.0.0-preview.2")
+        assert rec_a2_after is not None and rec_a2_after["smoke_status"] == "rolled_back"
+        assert rec_b2_after is not None and rec_b2_after["smoke_status"] == "passed"
+
+
+def test_ui_files_escalate_to_business_logic_unless_diff_verified_cosmetic(tmp_path: Path) -> None:
+    """Executable logic or unverifiable diffs in UI directories must escalate to business_logic."""
+    # 1. Event handler / bridge call in Page.tsx -> escalates to business_logic
+    exec_diff = (
+        "diff --git a/frontend/src/modules/mission-control/Page.tsx b/frontend/src/modules/mission-control/Page.tsx\n"
+        "@@ -10,3 +10,4 @@\n"
+        " const Page = () => {\n"
+        '+  const res = await bridge.call("engine.start", {});\n'
+        '+  return <Button onClick={handleStart}>Start</Button>;\n'
+    )
+    res_exec = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+        exec_diff,
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_exec.risk_class == "business_logic"
+    assert res_exec.requires_independent_review is True
+
+    # 2. Empty diff content on UI file -> fail closed to business_logic
+    res_empty = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+        "",
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_empty.risk_class == "business_logic"
+    assert res_empty.requires_independent_review is True
+
+    # 3. Non-JSX .ts file under frontend/src/modules -> escalates to business_logic
+    res_ts = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/api.ts")],
+        "+export const POLL_MS = 500;\n",
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_ts.risk_class == "business_logic"
+
+    # 4. Structural deletion of UI component -> escalates to business_logic
+    res_del = classify_task_risk(
+        [DiffPathEntry("D", "frontend/src/modules/mission-control/Page.tsx")],
+        "-<GlassCard />\n",
+        base_risk_class="ui_cosmetic",
+    )
+    assert res_del.risk_class == "business_logic"
+
+    # 5. Verified cosmetic styling/copy diff -> remains ui_cosmetic
+    cosmetic_diff = (
+        "diff --git a/frontend/src/modules/mission-control/Page.tsx b/frontend/src/modules/mission-control/Page.tsx\n"
+        "@@ -1,3 +1,3 @@\n"
+        '-<GlassCard className="p-4" style={{ padding: "var(--space-4)" }}>\n'
+        '+<GlassCard className="p-6" style={{ padding: "var(--space-6)" }}>\n'
+        "-  Old title\n"
+        "+  New title\n"
+    )
+    res_cosmetic = classify_task_risk(
+        [DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+        cosmetic_diff,
+        base_risk_class="docs_format",
+    )
+    assert res_cosmetic.risk_class == "ui_cosmetic"
+    assert res_cosmetic.requires_independent_review is False
+
+    # 6. MergeGate blocks executable Page.tsx edit without independent review even with verified screenshots
+    with Store(tmp_path / "ui_gate.db") as store:
+        store.migrate()
+        t_ui, c_ui = _seed_task(
+            store,
+            task_id="t-ui-logic",
+            branch="feat/ui-logic",
+            risk_class="ui_cosmetic",
+            allowed_globs=["frontend/**"],
+        )
+        store.record_evidence(
+            task_id="t-ui-logic",
+            contract_sha256=c_ui["contract_sha256"],
+            commit_sha="sha_uilogic",
+            kind="ci_check",
+            source="circleci:desktop-frontend",
+            build_id="b-1",
+            duration_seconds=30.0,
+            verified=True,
+        )
+        store.record_evidence(
+            task_id="t-ui-logic",
+            contract_sha256=c_ui["contract_sha256"],
+            commit_sha="sha_uilogic",
+            kind="screenshot",
+            source="playwright:manifest",
+            build_id="b-1",
+            metadata={"renderer": "playwright-mockbridge"},
+            verified=True,
+        )
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=True)
+        auth = gate.authorize_merge(
+            task=t_ui,
+            contract=c_ui,
+            head_sha="sha_uilogic",
+            diff_entries=[DiffPathEntry("M", "frontend/src/modules/mission-control/Page.tsx")],
+            diff_content=exec_diff,
+            evidence_records=store.list_evidence_records("t-ui-logic", commit_sha="sha_uilogic"),
+        )
+        assert auth.allowed is False
+        assert auth.effective_risk_class == "business_logic"
+        assert auth.block_reason == "no_independent_reviewer"
+
+
+@pytest.mark.asyncio
+async def test_review_rejects_omitted_or_null_findings_array(tmp_path: Path) -> None:
+    """APPROVE without an explicit findings array (or with findings: null) is malformed and never approves."""
+    wt = tmp_path / "wt"
+    (wt / "src").mkdir(parents=True)
+    (wt / "src" / "main.py").write_text("x = 1\n", encoding="utf-8")
+    contract = {"acceptance_criteria": [{"id": "ac-1", "description": "Works"}]}
+
+    # 1. Missing findings key
+    res_missing = parse_and_validate_review_output(
+        '{"verdict": "APPROVE", "summary": "LGTM"}',
+        worktree_dir=wt,
+        contract=contract,
+    )
+    assert res_missing.valid is False
+    assert res_missing.verdict == "INVALID"
+    assert any("findings" in e for e in res_missing.errors)
+
+    # 2. Explicit findings: null
+    res_null = parse_and_validate_review_output(
+        '{"verdict": "APPROVE", "summary": "LGTM", "findings": null}',
+        worktree_dir=wt,
+        contract=contract,
+    )
+    assert res_null.valid is False
+    assert res_null.verdict == "INVALID"
+    assert any("findings" in e for e in res_null.errors)
+
+    # 3. End-to-end in CiPipelineManager: missing findings triggers retry and blocks if still omitted
+    with Store(tmp_path / "missing_findings.db") as store:
+        store.migrate()
+        _, db_contract = _seed_task(store, task_id="t-mf", branch="feat/mf")
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/mf", number=303, head_sha="sha_303")
+        vcs.worktrees["feat/mf"] = wt
+        vcs.changed_files["feat/mf"] = ["src/main.py"]
+
+        codex_bad = FakeRunner(
+            name="codex",
+            responses=[
+                RunnerResult(rc=0, stdout='{"verdict": "APPROVE", "summary": "LGTM"}', stderr=""),
+                RunnerResult(rc=0, stdout='{"verdict": "APPROVE", "findings": null}', stderr=""),
+            ],
+        )
+        ci_mgr = CiPipelineManager(
+            vcs,
+            store,
+            Scheduler(store, QuotaLedger(store)),
+            {"agy": FakeRunner.success("agy"), "codex": codex_bad},
+        )
+        ci_res = await ci_mgr.watch_and_heal(
+            repo="owner/repo",
+            local_repo=tmp_path,
+            worktree_dir=wt,
+            phase_id="p1",
+            phase_title="P1",
+            branch="feat/mf",
+            pr_number=303,
+            initial_engine="agy",
+            risk=RiskAssessment(level="low"),
+            task_contract=db_contract,
+            contributing_providers={"google"},
+        )
+        assert ci_res.passed is False
+        assert ci_res.block_reason == "invalid_review_output"
+        assert len(codex_bad.calls) == 2
+
+
+def test_merge_gate_review_evidence_tier_and_unverified_rollback_fail_closed(tmp_path: Path) -> None:
+    """MergeGate rejects economy review evidence for high_risk; rollback refuses unverified target."""
+    with Store(tmp_path / "hardening.db") as store:
+        store.migrate()
+        t_hr, c_hr = _seed_task(
+            store,
+            task_id="t-hr-ev",
+            branch="feat/hr-ev",
+            risk_class="high_risk",
+            allowed_globs=["backend/**"],
+        )
+        store.record_task_contributing_provider("t-hr-ev", "google")
+        store.record_task_owner_approval("t-hr-ev", "owner", "sha_hr_ev")
+        store.record_evidence(
+            task_id="t-hr-ev",
+            contract_sha256=c_hr["contract_sha256"],
+            commit_sha="sha_hr_ev",
+            kind="ci_check",
+            source="circleci:desktop-backend",
+            build_id="b-1",
+            duration_seconds=20.0,
+            verified=True,
+        )
+        # Persist an economy-tier review evidence record for a high_risk task
+        store.record_evidence(
+            task_id="t-hr-ev",
+            contract_sha256=c_hr["contract_sha256"],
+            commit_sha="sha_hr_ev",
+            kind="review",
+            source="review:qwen",
+            metadata={
+                "reviewer_engine": "qwen",
+                "reviewer_provider": "alibaba",
+                "reviewer_tier": "economy",
+                "verdict": "APPROVE",
+                "p1_count": 0,
+            },
+            verified=True,
+        )
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=True)
+        auth = gate.authorize_merge(
+            task=store.get_task("t-hr-ev") or t_hr,
+            contract=c_hr,
+            head_sha="sha_hr_ev",
+            diff_entries=[DiffPathEntry("M", "backend/nightshift/engine/credentials.py")],
+            evidence_records=store.list_evidence_records("t-hr-ev", commit_sha="sha_hr_ev"),
+            require_review_evidence=True,
+            reviewer_provider="openai",
+            reviewer_engine="codex",
+            reviewer_tier="standard",
+        )
+        assert auth.allowed is False
+        assert auth.block_reason == "missing_verified_review"
+
+        # Rollback refuses if previous_good_tag is not a verified passed release
+        vcs = FakeGitGh()
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_1",
+            artifact_sha256="a" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="b" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        rb = ReleaseManager(vcs).rollback_release(
+            store=store,
+            repo="owner/repo",
+            faulty_tag="v1.0.0-preview.2",
+            output_dir=tmp_path / "dist",
+        )
+        assert rb.ok is False
+        assert "not a verified passed release" in rb.detail
+
+
+def test_smoke_test_missing_executable_exit_code_127_is_unavailable(tmp_path: Path) -> None:
+    """Missing smoke executable returning rc=127 from run_subprocess_with_timeout must be 'unavailable', not 'failed'."""
+    vcs = FakeGitGh()
+    rel_mgr = ReleaseManager(vcs)
+    art = tmp_path / "app.apk"
+    art.write_bytes(b"fake-apk")
+
+    res = rel_mgr.run_launch_smoke_test(
+        artifact_path=art,
+        tag="v1.0.0-preview.9",
+        smoke_command="definitely_missing_smoke_runner_xyz_999 --apk {artifact}",
+        timeout_seconds=10,
+    )
+    assert res.passed is False
+    assert res.status == "unavailable"
+    assert "not found" in res.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_e2e_adopted_release_resumes_smoke_blocked_task_without_manual_resume(tmp_path: Path) -> None:
+    """Rerunning a plan after configuring smoke_command must resume the smoke-blocked task to RELEASED automatically."""
+    with Store(tmp_path / "e2e_adopt_resume.db") as store:
+        store.migrate()
+        store.set_setting("pipeline.conditionalAutoMerge", "1")
+        events = EventBus(store)
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.artifacts_to_create = ["NightShift-windows.zip"]
+
+        def on_code(prompt: str, wd: Path, model: str | None, effort: str) -> None:
+            (wd / "src").mkdir(parents=True, exist_ok=True)
+            (wd / "src" / "feature.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+            vcs.add_pr("feat/p8e-adopt-resume", number=909, head_sha="sha_909")
+            vcs.changed_files["feat/p8e-adopt-resume"] = ["src/feature.py"]
+            vcs.diffs["feat/p8e-adopt-resume"] = (
+                "diff --git a/src/feature.py b/src/feature.py\n@@ -0,0 +1,2 @@\n+def ok():\n+    return True\n"
+            )
+            vcs.commit_ci_checks["sha_909"] = _make_valid_jobs("sha_909", branch="feat/p8e-adopt-resume")
+            vcs.commit_ci_checks["sha_merge_123"] = _make_valid_jobs("sha_merge_123", branch="main")
+
+        runners = {
+            "agy": FakeRunner(name="agy", on_call=on_code),
+            "codex": FakeRunner(name="codex", responses=[RunnerResult(rc=0, stdout=_approve_json(), stderr="")]),
+        }
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+
+        project_no_smoke = ProjectConfig(
+            id="proj_adopt",
+            name="NightShift Adopt",
+            repo="owner/repo",
+            local_path=tmp_path / "repo",
+            output_dir=tmp_path / "out",
+            artifact_glob="*.zip",
+            smoke_command="",
+        )
+        project_no_smoke.local_path.mkdir()
+        phases = [
+            PhaseDefinition(
+                id="p1",
+                title="Adopt Resume Feature",
+                branch="feat/p8e-adopt-resume",
+                prompt="Implement logic",
+                allowed_globs=["src/**"],
+                auto_merge=True,
+                release_after_merge=True,
+            )
+        ]
+
+        engine_no_smoke = EngineStateMachine(store, events, quota, vcs=vcs, runners=runners, login_checker=logins)
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            rows1 = await engine_no_smoke.execute_plan(project_no_smoke, phases, plan_id="plan_adopt")
+
+        assert rows1[0]["status"] == "PARKED"
+        task_blocked = store.get_task_by_branch("feat/p8e-adopt-resume")
+        assert task_blocked is not None
+        assert task_blocked["status"] == "BLOCKED"
+        assert task_blocked["blocked_from_status"] == "MERGED"
+        assert task_blocked["block_reason"] == "smoke_test_unavailable"
+        assert task_blocked["smoke_verified_at"] is None
+
+        # Rerun directly WITHOUT calling TaskOrchestrator.resume_from_blocked manually
+        def pass_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            return SmokeTestResult(
+                passed=True,
+                status="passed",
+                detail="OK",
+                command=cmd,
+                verified_at="2026-11-28T03:00:00Z",
+            )
+
+        engine_with_smoke = EngineStateMachine(
+            store,
+            events,
+            quota,
+            vcs=vcs,
+            runners=runners,
+            login_checker=logins,
+            smoke_runner=pass_smoke,
+        )
+        project_with_smoke = ProjectConfig(
+            id="proj_adopt",
+            name="NightShift Adopt",
+            repo="owner/repo",
+            local_path=project_no_smoke.local_path,
+            output_dir=project_no_smoke.output_dir,
+            artifact_glob="*.zip",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            rows2 = await engine_with_smoke.execute_plan(project_with_smoke, phases, plan_id="plan_adopt")
+
+        assert rows2[0]["status"] == "COMPLETED"
+        task_released = store.get_task(task_blocked["id"])
+        assert task_released is not None
+        assert task_released["status"] == "RELEASED"
+        assert task_released["block_reason"] == ""
+        assert task_released["smoke_verified_at"] is not None
+        assert store.list_parked() == []
+
+
+def test_deck_governance_actions_map_to_working_bridge_methods(tmp_path: Path) -> None:
+    """Every governance action advertised by generate_deck_data must include valid bridge parameters and work end-to-end."""
+    with Store(tmp_path / "deck_gov.db") as store:
+        store.migrate()
+        events = EventBus(store)
+        vcs = FakeGitGh()
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+        store.create_project("proj-gov", "NightShift", "owner/repo", str(tmp_path), output_dir=str(out_dir))
+        store.create_plan("plan-gov", "proj-gov", "Plan")
+        store.upsert_phase("p-gov", "plan-gov", "Gov Phase", "feat/gov-deck")
+        store.park_phase("p-gov", "Awaiting owner approval", "Approve PR")
+
+        _, contract = store.create_task_with_contract(
+            task_id="t-gov-deck",
+            phase_id="p-gov",
+            plan_id="plan-gov",
+            title="Gov Task",
+            branch="feat/gov-deck",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-gov-deck",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_gov_deck_1",
+            review_sha="sha_gov_deck_1",
+            pr_number=42,
+            block_reason="awaiting_owner_approval",
+        )
+        store.record_evidence(
+            task_id="t-gov-deck",
+            contract_sha256=contract["contract_sha256"],
+            commit_sha="sha_gov_deck_1",
+            kind="ci_check",
+            source="circleci:desktop-gates",
+            build_id="b-1",
+            duration_seconds=12.0,
+            verified=True,
+        )
+
+        # Release with verified previous_good_tag -> advertises rollback_release
+        good_file = tmp_path / "app.zip"
+        good_file.write_bytes(b"good-zip-v1")
+        good_sums = tmp_path / "SHA256SUMS.txt"
+        good_sha = compute_sha256(good_file)
+        good_sums.write_text(f"{good_sha}  app.zip\n", encoding="utf-8")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.1", "v1", "Good", [good_file, good_sums])
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.2", "v2", "Bad", [good_file, good_sums])
+        store.record_release_verification(
+            tag="v1.0.0-preview.1",
+            repo="owner/repo",
+            merge_sha="sha_1",
+            artifact_sha256=good_sha,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            tag="v1.0.0-preview.2",
+            repo="owner/repo",
+            merge_sha="sha_2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="deadbeef",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        # Release without previous_good_tag -> must NOT advertise rollback_release
+        store.record_release_verification(
+            tag="v1.0.0-preview.3",
+            repo="owner/repo",
+            merge_sha="sha_3",
+            previous_good_tag=None,
+            artifact_sha256="cafebabe",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        deck = generate_deck_data(store, "proj-gov")
+        approve_item = next(i for i in deck["needs_you"] if i.get("action_kind") == "approve_task")
+        assert approve_item["action"] == "Review & Approve"
+        assert approve_item["task_id"] == "t-gov-deck"
+        assert approve_item["head_sha"] == "sha_gov_deck_1"
+        assert approve_item["pr_number"] == 42
+
+        rb_item = next(i for i in deck["needs_you"] if i.get("release_tag") == "v1.0.0-preview.2")
+        assert rb_item["action"] == "Roll back release"
+        assert rb_item["action_kind"] == "rollback_release"
+        assert rb_item["repo"] == "owner/repo"
+        assert rb_item["previous_good_tag"] == "v1.0.0-preview.1"
+
+        no_prev_item = next(i for i in deck["needs_you"] if i.get("release_tag") == "v1.0.0-preview.3")
+        assert no_prev_item["action_kind"] == "configure_smoke_test"
+        assert no_prev_item["action"] != "Roll back release"
+
+        class _StubEngine:
+            def __init__(self, vcs_obj: FakeGitGh) -> None:
+                self.vcs = vcs_obj
+                self.release_mgr = ReleaseManager(vcs_obj)
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_StubEngine(vcs))
+
+        # Execute advertised approve action through bridge using deck payload fields
+        approve_res = bridge.call(
+            "pipeline.approveTask",
+            {"taskId": approve_item["task_id"], "headSha": approve_item["head_sha"], "approvedBy": "owner"},
+        )
+        assert approve_res["ok"] is True
+        assert approve_res["data"]["status"] == "APPROVED"
+        assert store.list_parked() == []
+
+        # Execute advertised rollback action through bridge using deck payload fields
+        rb_res = bridge.call(
+            "pipeline.rollbackRelease",
+            {
+                "tag": rb_item["release_tag"],
+                "repo": rb_item["repo"],
+                "projectId": rb_item["project_id"],
+            },
+        )
+        assert rb_res["ok"] is True
+        assert rb_res["data"]["restored_tag"] == "v1.0.0-preview.1"
+
+        # After both actions succeed, neither item remains in needs_you
+        deck_after = generate_deck_data(store, "proj-gov")
+        assert not any(i.get("task_id") == "t-gov-deck" for i in deck_after["needs_you"])
+        assert not any(i.get("release_tag") == "v1.0.0-preview.2" for i in deck_after["needs_you"])
+
+
+def test_two_projects_deck_and_store_isolation(tmp_path: Path) -> None:
+    """Blocked tasks, parked phases, and releases from project A must never leak into project B's deck."""
+    with Store(tmp_path / "two_proj_deck.db") as store:
+        store.migrate()
+        store.create_project("proj-a", "Project A", "owner/repo-a", str(tmp_path / "a"), output_dir=str(tmp_path / "dist-a"))
+        store.create_project("proj-b", "Project B", "owner/repo-b", str(tmp_path / "b"), output_dir=str(tmp_path / "dist-b"))
+
+        store.create_plan("plan-a", "proj-a", "Plan A")
+        store.create_plan("plan-b", "proj-b", "Plan B")
+
+        store.upsert_phase("phase-a-smoke", "plan-a", "Phase A Smoke", "feat/a-smoke", status="parked")
+        store.upsert_phase("phase-a-gov", "plan-a", "Phase A Gov", "feat/a-gov", status="parked")
+        store.upsert_phase("phase-b-done", "plan-b", "Phase B Done", "feat/b-done", status="merged")
+        store.park_phase("phase-a-smoke", "Smoke test failed", "Roll back")
+
+        # Project A: failed smoke test task for tag v1.0.0-preview.2 and governance task awaiting approval
+        store.create_task_with_contract(
+            task_id="t-a-smoke",
+            phase_id="phase-a-smoke",
+            plan_id="plan-a",
+            title="A Smoke Task",
+            branch="feat/a-smoke",
+            risk_class="business_logic",
+        )
+        store.update_task_fields(
+            "t-a-smoke",
+            status="BLOCKED",
+            blocked_from_status="MERGED",
+            block_reason="smoke_test_failed",
+            block_detail="Project A smoke test crashed.",
+            release_tag="v1.0.0-preview.2",
+        )
+        store.create_task_with_contract(
+            task_id="t-a-gov",
+            phase_id="phase-a-gov",
+            plan_id="plan-a",
+            title="A Gov Task",
+            branch="feat/a-gov",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-a-gov",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_a_gov",
+            block_reason="awaiting_owner_approval",
+        )
+
+        # Project A releases: v1 passed, v2 failed
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_a1",
+            artifact_sha256="a" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.2",
+            task_id="t-a-smoke",
+            merge_sha="sha_a2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="b" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        # Project B releases: SAME tags v1 and v2, BOTH healthy/passing!
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_b1",
+            artifact_sha256="c" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_b2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="d" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T02:00:00Z",
+        )
+
+        # Project B deck must have ZERO needs_you items (no leakage of A's failed task or rollback of B's passing v2!)
+        deck_b = generate_deck_data(store, "proj-b")
+        assert deck_b["needs_you"] == []
+        assert deck_b["state"] == "good"
+        assert [p["phase_id"] for p in deck_b["done_tonight"]] == ["phase-b-done"]
+
+        # Project A deck surfaces ONLY Project A's items with proj-a / owner/repo-a metadata
+        deck_a = generate_deck_data(store, "proj-a")
+        assert len(deck_a["needs_you"]) == 2
+        assert all(item.get("project_id") == "proj-a" for item in deck_a["needs_you"])
+        assert all(item.get("repo") == "owner/repo-a" for item in deck_a["needs_you"])
+        assert deck_a["done_tonight"] == []
+
+        # Unknown project fails closed: zero tasks, zero releases, zero parked phases
+        deck_unknown = generate_deck_data(store, "proj-nonexistent")
+        assert deck_unknown["needs_you"] == []
+        assert deck_unknown["done_tonight"] == []
+
+        # Store queries scoped by project_id stay strictly isolated
+        assert {t["id"] for t in store.list_tasks(project_id="proj-a")} == {"t-a-smoke", "t-a-gov"}
+        assert store.list_tasks(project_id="proj-b") == []
+        assert [p["phase_id"] for p in store.list_parked(project_id="proj-a")] == ["phase-a-smoke"]
+        assert store.list_parked(project_id="proj-b") == []
+        assert [r["repo"] for r in store.list_release_verifications(project_id="proj-b")] == ["owner/repo-b", "owner/repo-b"]
+        assert store.list_release_verifications(project_id="proj-a", repo="owner/repo-b") == []
+
+
+def test_two_projects_governance_bridge_methods_fail_closed(tmp_path: Path) -> None:
+    """Every governance bridge method must verify task/release project ownership and fail closed on mismatch."""
+    with Store(tmp_path / "two_proj_bridge.db") as store:
+        store.migrate()
+        events = EventBus(store)
+        vcs = FakeGitGh()
+        out_a = tmp_path / "dist-a"
+        out_b = tmp_path / "dist-b"
+        out_a.mkdir()
+        out_b.mkdir()
+
+        store.create_project("proj-a", "Project A", "owner/repo-a", str(tmp_path / "a"), output_dir=str(out_a))
+        store.create_project("proj-b", "Project B", "owner/repo-b", str(tmp_path / "b"), output_dir=str(out_b))
+        store.create_plan("plan-a", "proj-a", "Plan A")
+        store.create_plan("plan-b", "proj-b", "Plan B")
+        store.upsert_phase("p-a", "plan-a", "Phase A", "feat/a")
+        store.upsert_phase("p-b", "plan-b", "Phase B", "feat/b")
+
+        _, contract_a = store.create_task_with_contract(
+            task_id="t-a",
+            phase_id="p-a",
+            plan_id="plan-a",
+            title="Task A",
+            branch="feat/a",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-a",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_a",
+            review_sha="sha_a",
+            block_reason="awaiting_owner_approval",
+        )
+        store.record_evidence(
+            task_id="t-a",
+            contract_sha256=contract_a["contract_sha256"],
+            commit_sha="sha_a",
+            kind="ci_check",
+            source="circleci:desktop-gates",
+            build_id="b-a1",
+            duration_seconds=12.0,
+            verified=True,
+        )
+
+        _, contract_b = store.create_task_with_contract(
+            task_id="t-b",
+            phase_id="p-b",
+            plan_id="plan-b",
+            title="Task B",
+            branch="feat/b",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-b",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_b",
+            review_sha="sha_b",
+            block_reason="awaiting_owner_approval",
+        )
+        store.record_evidence(
+            task_id="t-b",
+            contract_sha256=contract_b["contract_sha256"],
+            commit_sha="sha_b",
+            kind="ci_check",
+            source="circleci:desktop-gates",
+            build_id="b-b1",
+            duration_seconds=12.0,
+            verified=True,
+        )
+
+        # Releases with identical tags on BOTH repos
+        art_a = tmp_path / "app-a.zip"
+        art_a.write_bytes(b"repo-a-good-v1")
+        sha_a = compute_sha256(art_a)
+        sums_a = tmp_path / "a_sums" / "SHA256SUMS.txt"
+        sums_a.parent.mkdir()
+        sums_a.write_text(f"{sha_a}  app-a.zip\n", encoding="utf-8")
+
+        art_b = tmp_path / "app-b.zip"
+        art_b.write_bytes(b"repo-b-good-v1")
+        sha_b = compute_sha256(art_b)
+        sums_b = tmp_path / "b_sums" / "SHA256SUMS.txt"
+        sums_b.parent.mkdir()
+        sums_b.write_text(f"{sha_b}  app-b.zip\n", encoding="utf-8")
+
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.1", "A v1", "Good A", [art_a, sums_a])
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.2", "A v2", "Bad A", [art_a, sums_a])
+        vcs.create_github_release("owner/repo-b", "v1.0.0-preview.1", "B v1", "Good B", [art_b, sums_b])
+        vcs.create_github_release("owner/repo-b", "v1.0.0-preview.2", "B v2", "Good B2", [art_b, sums_b])
+
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_a1",
+            artifact_sha256=sha_a,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.2",
+            task_id="t-a",
+            merge_sha="sha_a2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="deadbeef",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_b1",
+            artifact_sha256=sha_b,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.2",
+            task_id="t-b",
+            merge_sha="sha_b2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256=sha_b,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T02:00:00Z",
+        )
+
+        class _StubEngine:
+            def __init__(self, vcs_obj: FakeGitGh) -> None:
+                self.vcs = vcs_obj
+                self.release_mgr = ReleaseManager(vcs_obj)
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_StubEngine(vcs))
+
+        # 1. pipeline.listTasks scoped by projectId and fails closed on plan/project mismatch
+        list_b = bridge.call("pipeline.listTasks", {"projectId": "proj-b"})
+        assert list_b["ok"] is True
+        assert [t["id"] for t in list_b["data"]] == ["t-b"]
+        bad_list = bridge.call("pipeline.listTasks", {"projectId": "proj-b", "planId": "plan-a"})
+        assert bad_list["ok"] is False
+
+        # 2. pipeline.approveTask fails closed on cross-project / cross-repo / active-project mismatch
+        cross_approve = bridge.call("pipeline.approveTask", {"taskId": "t-a", "headSha": "sha_a", "projectId": "proj-b"})
+        assert cross_approve["ok"] is False
+        assert store.get_task("t-a")["status"] == "BLOCKED"
+
+        cross_repo_approve = bridge.call("pipeline.approveTask", {"taskId": "t-a", "headSha": "sha_a", "repo": "owner/repo-b"})
+        assert cross_repo_approve["ok"] is False
+
+        # Active project is proj-b -> approving t-a without projectId also fails closed
+        bridge._active_project_id = "proj-b"
+        active_mismatch_approve = bridge.call("pipeline.approveTask", {"taskId": "t-a", "headSha": "sha_a"})
+        assert active_mismatch_approve["ok"] is False
+
+        # 3. pipeline.recordAssertionWaiver fails closed on cross-project / cross-repo mismatch
+        cross_waiver = bridge.call(
+            "pipeline.recordAssertionWaiver",
+            {"taskId": "t-a", "headSha": "sha_a", "reason": "Refactor", "projectId": "proj-b"},
+        )
+        assert cross_waiver["ok"] is False
+        assert store.get_task("t-a")["assertion_waiver_sha"] is None
+
+        # 4. pipeline.listReleaseVerifications fails closed on repo/project mismatch
+        bad_rel_list = bridge.call("pipeline.listReleaseVerifications", {"projectId": "proj-a", "repo": "owner/repo-b"})
+        assert bad_rel_list["ok"] is False
+        good_rel_list = bridge.call("pipeline.listReleaseVerifications", {"projectId": "proj-a"})
+        assert good_rel_list["ok"] is True
+        assert all(r["repo"] == "owner/repo-a" for r in good_rel_list["data"])
+
+        # 5. pipeline.rollbackRelease fails closed on projectId/repo mismatch and unknown projectId
+        cross_rb = bridge.call(
+            "pipeline.rollbackRelease",
+            {"tag": "v1.0.0-preview.2", "projectId": "proj-a", "repo": "owner/repo-b"},
+        )
+        assert cross_rb["ok"] is False
+        unknown_proj_rb = bridge.call(
+            "pipeline.rollbackRelease",
+            {"tag": "v1.0.0-preview.2", "projectId": "proj-unknown", "repo": "owner/repo-a"},
+        )
+        assert unknown_proj_rb["ok"] is False
+        assert store.get_release_verification("owner/repo-a", "v1.0.0-preview.2")["smoke_status"] == "failed"
+        assert store.get_release_verification("owner/repo-b", "v1.0.0-preview.2")["smoke_status"] == "passed"
+
+        # 6. Legitimate scoped calls succeed and never affect the other project
+        ok_approve_a = bridge.call(
+            "pipeline.approveTask",
+            {"taskId": "t-a", "headSha": "sha_a", "projectId": "proj-a", "approvedBy": "owner"},
+        )
+        assert ok_approve_a["ok"] is True
+        assert store.get_task("t-a")["status"] == "APPROVED"
+        assert store.get_task("t-b")["status"] == "BLOCKED"
+
+        ok_rb_a = bridge.call(
+            "pipeline.rollbackRelease",
+            {"tag": "v1.0.0-preview.2", "projectId": "proj-a", "repo": "owner/repo-a"},
+        )
+        assert ok_rb_a["ok"] is True
+        assert (out_a / "app-a.zip").read_bytes() == b"repo-a-good-v1"
+        assert not (out_b / "app-a.zip").exists()
+        assert store.get_release_verification("owner/repo-a", "v1.0.0-preview.2")["smoke_status"] == "rolled_back"
+        assert store.get_release_verification("owner/repo-b", "v1.0.0-preview.2")["smoke_status"] == "passed"
+
+
+def test_smoke_test_resolves_relative_artifact_path_and_supports_builtin_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relative {artifact} paths must be resolved before cwd changes to temp dir, and builtin alias must work."""
+    import sys
+
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    art = dist_dir / "app.apk"
+    art.write_text("artifact-ok", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    rel_mgr = ReleaseManager(FakeGitGh())
+    cmd = (
+        f'"{sys.executable}" -c '
+        '"import pathlib, sys; p = pathlib.Path(sys.argv[1]); '
+        'assert p.is_absolute() and p.is_file(), p; print(p.read_text())" '
+        '"{artifact}"'
+    )
+    res = rel_mgr.run_launch_smoke_test(
+        artifact_path=Path("dist/app.apk"),
+        tag="v1.0.0-preview.1",
+        smoke_command=cmd,
+        timeout_seconds=15,
+    )
+    assert res.passed is True
+    assert res.status == "passed"
+    assert "artifact-ok" in res.detail
+
+    # Both canonical built-in command and legacy alias route to desktop zip selftest (not custom subprocess)
+    bad_zip = tmp_path / "NightShift-windows.zip"
+    with zipfile.ZipFile(bad_zip, "w") as zf:
+        zf.writestr("README.txt", "no exe here")
+    for cmd_name in (DESKTOP_SELFTEST_SMOKE, "builtin:desktop-zip-selftest"):
+        r = rel_mgr.run_launch_smoke_test(
+            artifact_path=bad_zip,
+            tag="v1.0.0-preview.1",
+            smoke_command=cmd_name,
+        )
+        assert r.passed is False
+        assert r.status == "failed"
+        assert "NightShift.exe not found" in r.detail
+
+
+def test_open_revert_pr_leaves_pr_open_and_never_auto_merges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 regression: SubprocessGitGh.open_revert_pr and rollback_release(open_revert_pr=True)
+    must leave the revert PR open for review and MergeGate, never calling merge_pr or watch_pr_checks.
+    """
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    # 1. SubprocessGitGh.open_revert_pr must create PR on isolated branch and NEVER merge or watch checks
+    sub_vcs = SubprocessGitGh()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str, str, bool]:
+        calls.append(list(cmd))
+        return 0, "ok", "", False
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+    monkeypatch.setattr(sub_vcs, "prepare_worktree", lambda *args, **kwargs: tmp_path)
+    monkeypatch.setattr(sub_vcs, "find_merged_pr", lambda *args, **kwargs: None)
+    open_snapshots = iter([None, {"number": 77, "headRefOid": "sha_rev_1"}])
+    monkeypatch.setattr(sub_vcs, "find_open_pr", lambda *args, **kwargs: next(open_snapshots))
+    monkeypatch.setattr(sub_vcs, "watch_pr_checks", lambda *args, **kwargs: pytest.fail("must not watch/auto-merge"))
+    monkeypatch.setattr(sub_vcs, "merge_pr", lambda *args, **kwargs: pytest.fail("must not auto-merge revert PR"))
+    monkeypatch.setattr(sub_vcs, "remove_worktree", lambda *args, **kwargs: None)
+
+    ok, msg = sub_vcs.open_revert_pr("owner/repo", tmp_path, "deadbeef1234")
+    assert ok is True
+    assert "#77" in msg
+    assert calls[0] == ["git", "revert", "-m", "1", "deadbeef1234", "--no-edit"]
+    assert calls[1] == ["git", "push", "-u", "origin", "nightshift/revert-deadbeef1234"]
+    assert calls[2][:3] == ["gh", "pr", "create"]
+    assert not any("merge" in c for c in calls)
+
+    # 2. ReleaseManager.rollback_release(open_revert_pr=True) and pipeline.rollbackRelease(openRevertPr=True)
+    with Store(tmp_path / "rb_open_pr.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        monkeypatch.setattr(vcs, "merge_pr", lambda *args, **kwargs: pytest.fail("rollback must NEVER auto-merge"))
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+        store.create_project("proj-1", "App", "owner/repo", str(tmp_path), output_dir=str(out_dir))
+
+        good_bytes = b"good-v1-bytes"
+        good_sha = hashlib.sha256(good_bytes).hexdigest()
+        v1_tmp = tmp_path / "v1"
+        v1_tmp.mkdir()
+        v1_art = v1_tmp / "app.zip"
+        v1_art.write_bytes(good_bytes)
+        v1_sums = v1_tmp / "SHA256SUMS.txt"
+        v1_sums.write_text(f"{good_sha}  app.zip\n", encoding="utf-8")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.1", "v1", "ok", [v1_art, v1_sums])
+
+        bad_tmp = tmp_path / "v2"
+        bad_tmp.mkdir()
+        bad_art = bad_tmp / "app.zip"
+        bad_art.write_bytes(b"bad-v2-bytes")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.2", "v2", "bad", [bad_art])
+
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_v1",
+            artifact_sha256=good_sha,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_v2_bad",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256=hashlib.sha256(b"bad-v2-bytes").hexdigest(),
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        class _DummyEngine:
+            def __init__(self, v: FakeGitGh) -> None:
+                self.vcs = v
+                self.release_mgr = ReleaseManager(v)
+                self.is_running = False
+                self.stop_requested = False
+
+        bridge = BridgeAPI(store, EventBus(store), ModuleRegistry(), engine=_DummyEngine(vcs))
+        res = bridge.call(
+            "pipeline.rollbackRelease",
+            {
+                "projectId": "proj-1",
+                "tag": "v1.0.0-preview.2",
+                "openRevertPr": True,
+            },
+        )
+        assert res["ok"] is True
+        assert res["data"]["revert_pr_created"] is True
+        revert_branch = "nightshift/revert-sha_v2_bad"
+        # Revert PR MUST remain OPEN and MUST NOT be merged
+        assert revert_branch in vcs.prs
+        assert revert_branch not in vcs.merged_prs
+        assert (out_dir / "app.zip").read_bytes() == good_bytes
+
+        # Second rollback attempt on an already rolled_back release must fail closed
+        second = bridge.call(
+            "pipeline.rollbackRelease",
+            {
+                "projectId": "proj-1",
+                "tag": "v1.0.0-preview.2",
+                "openRevertPr": True,
+            },
+        )
+        assert second["ok"] is False
+        assert "already rolled back" in second["error"].lower()
+
+
+def test_post_merge_failure_opens_revert_pr_without_auto_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit regression: handle_post_merge_failure must open a revert PR for review and NEVER auto-merge."""
+    with Store(tmp_path / "pm_revert.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        monkeypatch.setattr(vcs, "merge_pr", lambda *args, **kwargs: pytest.fail("post-merge revert must NEVER auto-merge"))
+        quota = QuotaLedger(store)
+        sched = Scheduler(store, quota)
+
+        store.create_project("proj-1", "Test", "owner/repo", str(tmp_path))
+        store.create_plan("plan-1", "proj-1", "Plan")
+        store.upsert_phase("p1", "plan-1", "Phase 1", "feat/p1")
+
+        ci_mgr = CiPipelineManager(vcs, store, sched, {})
+        ok, msg = ci_mgr.handle_post_merge_failure(
+            local_repo=tmp_path,
+            merge_commit_sha="sha_merge_broken",
+            phase_id="p1",
+            failure_log="Main CI failed",
+            repo="owner/repo",
+        )
+        assert ok is True
+        assert "open revert PR" in msg
+        revert_branch = "nightshift/revert-sha_merge_broken"
+        assert revert_branch in vcs.prs
+        assert revert_branch not in vcs.merged_prs
+
+
+@pytest.mark.asyncio
+async def test_e2e_delivery_reconciliation_preserves_rolled_back_release(tmp_path: Path) -> None:
+    """P2 regression: rerunning a plan after rolling back a smoke-failed release must preserve
+    smoke_status='rolled_back' (never reverifying, never overwriting to failed/passed, never
+    marking the task RELEASED, never re-advertising rollback, and preserving the restored artifact).
+    """
+    with Store(tmp_path / "e2e_preserve_rb.db") as store:
+        store.migrate()
+        store.set_setting("pipeline.conditionalAutoMerge", "1")
+        events = EventBus(store)
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+
+        # 1. Seed a verified previous good release v1
+        good_bytes = b"PK\x03\x04verified_good_v1"
+        good_sha = hashlib.sha256(good_bytes).hexdigest()
+        v1_tmp = tmp_path / "v1_seed"
+        v1_tmp.mkdir()
+        v1_art = v1_tmp / "NightShift-windows.zip"
+        v1_art.write_bytes(good_bytes)
+        v1_sums = v1_tmp / "SHA256SUMS.txt"
+        v1_sums.write_text(f"{good_sha}  NightShift-windows.zip\n", encoding="utf-8")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.1", "v1", "good v1", [v1_art, v1_sums])
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_good_v1",
+            artifact_sha256=good_sha,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+
+        # 2. Set up project, plan, phase, and merged PR whose v2 release fails smoke test
+        store.create_project(
+            "proj-rb",
+            "RollbackTest",
+            "owner/repo",
+            str(tmp_path),
+            artifact_glob="*.zip",
+            output_dir=str(out_dir),
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        store.create_plan("plan-rb", "proj-rb", "Rollback Plan")
+        phase = PhaseDefinition(
+            id="p-rb",
+            title="Release v2",
+            branch="feat/p-rb",
+            prompt="Implement feature",
+            auto_merge=True,
+            release_after_merge=True,
+        )
+        store.upsert_phase(
+            phase.id,
+            "plan-rb",
+            phase.title,
+            phase.branch,
+            prompt=phase.prompt,
+            status="merged",
+            auto_merge=True,
+            release_after_merge=True,
+        )
+        vcs.artifacts_to_create = ["NightShift-windows.zip"]
+        vcs.commit_ci_checks["sha_merge_v2"] = _make_valid_jobs("sha_merge_v2", branch="main")
+        vcs.merged_prs[phase.branch] = {
+            "number": 202,
+            "url": "https://github.com/owner/repo/pull/202",
+            "state": "MERGED",
+            "headRefOid": "sha_head_v2",
+            "mergeCommit": {"oid": "sha_merge_v2"},
+        }
+        store.create_task_with_contract(
+            task_id="task-p-rb",
+            phase_id=phase.id,
+            plan_id="plan-rb",
+            title=phase.title,
+            branch=phase.branch,
+            risk_class="business_logic",
+        )
+        store.update_task_fields(
+            "task-p-rb",
+            status="MERGED",
+            head_sha="sha_head_v2",
+            merge_sha="sha_merge_v2",
+            pr_number=202,
+        )
+
+        proj_cfg = ProjectConfig.from_dict(store.get_project("proj-rb") or {})
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+
+        def failing_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            return SmokeTestResult(passed=False, status="failed", detail="v2 crashed on startup", command=cmd)
+
+        sm_fail = EngineStateMachine(store, events, quota, vcs=vcs, runners={}, login_checker=logins)
+        sm_fail.release_mgr = ReleaseManager(vcs, smoke_runner=failing_smoke)
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            res1 = await sm_fail.execute_plan(proj_cfg, [phase], plan_id="plan-rb")
+        assert res1[0]["status"] == "PARKED"
+        v2_tag = store.get_task("task-p-rb")["release_tag"]
+        assert v2_tag == "v1.0.0-preview.2"
+        assert store.get_release_verification("owner/repo", v2_tag)["smoke_status"] == "failed"
+
+        # 3. Roll back v2 via bridge -> restores v1 artifact and marks v2 rolled_back
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=sm_fail)
+        rb_res = bridge.call(
+            "pipeline.rollbackRelease",
+            {"projectId": "proj-rb", "tag": v2_tag, "openRevertPr": False},
+        )
+        assert rb_res["ok"] is True
+        assert compute_sha256(out_dir / "NightShift-windows.zip") == good_sha
+        rb_row = store.get_release_verification("owner/repo", v2_tag)
+        assert rb_row is not None and rb_row["smoke_status"] == "rolled_back"
+        original_rb_at = rb_row["rolled_back_at"]
+        assert original_rb_at is not None
+
+        # 4. Rerun the plan even with a PASSING smoke runner: must NOT re-verify, overwrite, or mark RELEASED
+        smoke_invocations: list[str] = []
+
+        def passing_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            smoke_invocations.append(tag)
+            return SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T09:00:00Z")
+
+        sm_retry = EngineStateMachine(store, events, quota, vcs=vcs, runners={}, login_checker=logins)
+        sm_retry.release_mgr = ReleaseManager(vcs, smoke_runner=passing_smoke)
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            res2 = await sm_retry.execute_plan(proj_cfg, [phase], plan_id="plan-rb")
+        assert res2[0]["status"] == "PARKED"
+        assert "rolled back" in res2[0]["detail"].lower()
+        assert smoke_invocations == []
+
+        # Verification row MUST still be rolled_back with original timestamp
+        rb_row_after = store.get_release_verification("owner/repo", v2_tag)
+        assert rb_row_after is not None
+        assert rb_row_after["smoke_status"] == "rolled_back"
+        assert rb_row_after["rolled_back_at"] == original_rb_at
+
+        # Task MUST stay BLOCKED (never RELEASED) and output_dir MUST still hold restored v1 artifact
+        task_after = store.get_task("task-p-rb")
+        assert task_after is not None
+        assert task_after["status"] == "BLOCKED"
+        assert task_after["block_reason"] == "release_rolled_back"
+        assert compute_sha256(out_dir / "NightShift-windows.zip") == good_sha
+
+        # Deck must NOT advertise rollback_release again
+        deck = generate_deck_data(store, project_id="proj-rb")
+        assert not any(item.get("action_kind") == "rollback_release" for item in deck["needs_you"])
+
+        # Defense-in-depth: direct verify_and_record_release and store.record_release_verification refuse overwrite
+        direct_res = ReleaseManager(vcs, smoke_runner=passing_smoke).verify_and_record_release(
+            store=store,
+            repo="owner/repo",
+            tag=v2_tag,
+            merge_sha="sha_merge_v2",
+            artifact_path=out_dir / "NightShift-windows.zip",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        assert direct_res.passed is False
+        assert direct_res.status == "rolled_back"
+        assert smoke_invocations == []
+
+        with pytest.raises(ValueError, match="already rolled_back"):
+            store.record_release_verification(
+                repo="owner/repo",
+                tag=v2_tag,
+                merge_sha="sha_merge_v2",
+                artifact_sha256=good_sha,
+                smoke_command=DESKTOP_SELFTEST_SMOKE,
+                smoke_status="passed",
+            )
+
+
+

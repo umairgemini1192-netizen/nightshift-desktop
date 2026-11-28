@@ -560,6 +560,55 @@ def _migration_006_project_evidence_columns(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
 
 
+def _migration_007_project_release_smoke_columns(conn: sqlite3.Connection) -> None:
+    """Persist per-project post-release launch/smoke verification settings (Phase 8e)."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
+    for name, definition in (
+        ("smoke_command", "TEXT NOT NULL DEFAULT ''"),
+        ("smoke_timeout_seconds", "INTEGER NOT NULL DEFAULT 120"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE projects ADD COLUMN {name} {definition}")
+
+
+def _migration_008_release_verifications_repo_tag_pk(conn: sqlite3.Connection) -> None:
+    """Scope release_verifications primary key by (repo, tag) so repositories never collide."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS release_verifications_v8 (
+            repo TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            task_id TEXT,
+            merge_sha TEXT NOT NULL,
+            previous_good_tag TEXT,
+            artifact_sha256 TEXT NOT NULL,
+            smoke_command TEXT NOT NULL,
+            smoke_status TEXT NOT NULL,
+            smoke_detail TEXT NOT NULL DEFAULT '',
+            verified_at TEXT,
+            rolled_back_at TEXT,
+            PRIMARY KEY (repo, tag)
+        );
+
+        INSERT OR REPLACE INTO release_verifications_v8 (
+            repo, tag, task_id, merge_sha, previous_good_tag,
+            artifact_sha256, smoke_command, smoke_status, smoke_detail,
+            verified_at, rolled_back_at
+        )
+        SELECT repo, tag, task_id, merge_sha, previous_good_tag,
+               artifact_sha256, smoke_command, smoke_status, smoke_detail,
+               verified_at, rolled_back_at
+        FROM release_verifications;
+
+        DROP TABLE release_verifications;
+        ALTER TABLE release_verifications_v8 RENAME TO release_verifications;
+
+        CREATE INDEX IF NOT EXISTS idx_release_verifications_repo_status
+            ON release_verifications(repo, smoke_status);
+        """
+    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
@@ -567,6 +616,8 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (4, "004_token_optimizer_tables", _migration_004_token_optimizer_tables),
     (5, "005_agent_pipeline", _migration_005_agent_pipeline),
     (6, "006_project_evidence_columns", _migration_006_project_evidence_columns),
+    (7, "007_project_release_smoke_columns", _migration_007_project_release_smoke_columns),
+    (8, "008_release_verifications_repo_tag_pk", _migration_008_release_verifications_repo_tag_pk),
 ]
 
 
@@ -674,6 +725,8 @@ class Store:
         min_build_duration_seconds: float = 15.0,
         screenshot_manifest_path: str = "",
         screenshot_job_name: str = "",
+        smoke_command: str = "",
+        smoke_timeout_seconds: int = 120,
     ) -> dict[str, Any]:
         now = _utc_now()
         effective_output = output_dir or output_folder
@@ -686,8 +739,9 @@ class Store:
                     output_folder, output_dir, critical_paths_json,
                     required_ci_jobs_json, required_artifacts_by_job_json,
                     min_gate_duration_seconds, min_build_duration_seconds,
-                    screenshot_manifest_path, screenshot_job_name, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    screenshot_manifest_path, screenshot_job_name,
+                    smoke_command, smoke_timeout_seconds, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -709,6 +763,8 @@ class Store:
                     float(min_build_duration_seconds),
                     screenshot_manifest_path,
                     screenshot_job_name,
+                    smoke_command,
+                    int(smoke_timeout_seconds),
                     now,
                     now,
                 ),
@@ -839,8 +895,34 @@ class Store:
         row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()
         return dict(row) if row is not None else None
 
-    def list_phases(self, plan_id: str | None = None) -> list[dict[str, Any]]:
-        if plan_id:
+    def list_phases(
+        self,
+        plan_id: str | None = None,
+        *,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if project_id is not None:
+            if plan_id:
+                rows = self._conn.execute(
+                    """
+                    SELECT ph.* FROM phases ph
+                    INNER JOIN plans pl ON ph.plan_id = pl.id
+                    WHERE pl.project_id = ? AND ph.plan_id = ?
+                    ORDER BY ph.position ASC, ph.id ASC
+                    """,
+                    (project_id, plan_id),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT ph.* FROM phases ph
+                    INNER JOIN plans pl ON ph.plan_id = pl.id
+                    WHERE pl.project_id = ?
+                    ORDER BY ph.position ASC, ph.id ASC
+                    """,
+                    (project_id,),
+                ).fetchall()
+        elif plan_id:
             rows = self._conn.execute(
                 "SELECT * FROM phases WHERE plan_id = ? ORDER BY position ASC, id ASC", (plan_id,)
             ).fetchall()
@@ -1000,8 +1082,20 @@ class Store:
         row = self._conn.execute("SELECT * FROM parked WHERE phase_id = ?", (phase_id,)).fetchone()
         return dict(row) if row is not None else None
 
-    def list_parked(self) -> list[dict[str, Any]]:
-        rows = self._conn.execute("SELECT * FROM parked ORDER BY parked_at ASC").fetchall()
+    def list_parked(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        if project_id is not None:
+            rows = self._conn.execute(
+                """
+                SELECT pk.* FROM parked pk
+                INNER JOIN phases ph ON pk.phase_id = ph.id
+                INNER JOIN plans pl ON ph.plan_id = pl.id
+                WHERE pl.project_id = ?
+                ORDER BY pk.parked_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM parked ORDER BY parked_at ASC").fetchall()
         return [dict(r) for r in rows]
 
     def record_login_check(
@@ -1640,25 +1734,52 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_task_project_id(self, task_id: str) -> str | None:
+        """Return the owning ``project_id`` for ``task_id`` via its plan, or None if not found."""
+        row = self._conn.execute(
+            """
+            SELECT pl.project_id FROM tasks t
+            INNER JOIN plans pl ON t.plan_id = pl.id
+            WHERE t.id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        return str(row["project_id"]) if row is not None and row["project_id"] is not None else None
+
     def list_tasks(
         self,
         *,
         status: str | None = None,
         plan_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if status is not None:
-            clauses.append("status = ?")
+            clauses.append("t.status = ?")
             params.append(status)
         if plan_id is not None:
-            clauses.append("plan_id = ?")
+            clauses.append("t.plan_id = ?")
             params.append(plan_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM tasks {where} ORDER BY created_at ASC",
-            params,
-        ).fetchall()
+        if project_id is not None:
+            clauses.append("pl.project_id = ?")
+            params.append(project_id)
+            where = f"WHERE {' AND '.join(clauses)}"
+            rows = self._conn.execute(
+                f"""
+                SELECT t.* FROM tasks t
+                INNER JOIN plans pl ON t.plan_id = pl.id
+                {where}
+                ORDER BY t.created_at ASC
+                """,
+                params,
+            ).fetchall()
+        else:
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = self._conn.execute(
+                f"SELECT t.* FROM tasks t {where} ORDER BY t.created_at ASC",
+                params,
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def list_task_transitions(self, task_id: str) -> list[dict[str, Any]]:
@@ -1986,5 +2107,163 @@ class Store:
                 (task_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------
+    # Release verification & rollback registry (Amendment H / Phase 8e)
+    # ------------------------------------------------------------------
+
+    def record_release_verification(
+        self,
+        *,
+        tag: str,
+        repo: str,
+        merge_sha: str,
+        artifact_sha256: str,
+        smoke_command: str,
+        smoke_status: str,
+        task_id: str | None = None,
+        previous_good_tag: str | None = None,
+        smoke_detail: str = "",
+        verified_at: str | None = None,
+        rolled_back_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert or update a ``release_verifications`` row keyed by ``(repo, tag)``."""
+        norm_repo = str(repo or "").strip()
+        norm_tag = str(tag or "").strip()
+        if not norm_repo or not norm_tag:
+            raise ValueError("Both repo and tag are required for release_verifications.")
+        existing = self.get_release_verification(norm_repo, norm_tag)
+        if existing is not None and str(existing.get("smoke_status") or "") == "rolled_back":
+            raise ValueError(
+                f"Release verification for {norm_repo}@{norm_tag} is already rolled_back and cannot be overwritten."
+            )
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO release_verifications (
+                    repo, tag, task_id, merge_sha, previous_good_tag,
+                    artifact_sha256, smoke_command, smoke_status, smoke_detail,
+                    verified_at, rolled_back_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(repo, tag) DO UPDATE SET
+                    task_id = COALESCE(excluded.task_id, release_verifications.task_id),
+                    merge_sha = excluded.merge_sha,
+                    previous_good_tag = COALESCE(excluded.previous_good_tag, release_verifications.previous_good_tag),
+                    artifact_sha256 = excluded.artifact_sha256,
+                    smoke_command = excluded.smoke_command,
+                    smoke_status = excluded.smoke_status,
+                    smoke_detail = excluded.smoke_detail,
+                    verified_at = COALESCE(excluded.verified_at, release_verifications.verified_at),
+                    rolled_back_at = COALESCE(excluded.rolled_back_at, release_verifications.rolled_back_at)
+                """,
+                (
+                    norm_repo,
+                    norm_tag,
+                    task_id,
+                    merge_sha,
+                    previous_good_tag,
+                    artifact_sha256,
+                    smoke_command,
+                    smoke_status,
+                    smoke_detail,
+                    verified_at,
+                    rolled_back_at,
+                ),
+            )
+        row = self.get_release_verification(norm_repo, norm_tag)
+        assert row is not None
+        return row
+
+    def get_release_verification(self, repo: str, tag: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM release_verifications WHERE repo = ? AND tag = ?",
+            (repo, tag),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_latest_good_release(self, repo: str, *, exclude_tag: str | None = None) -> dict[str, Any] | None:
+        """Return the most recently verified ``passed`` release for ``repo``."""
+        if exclude_tag:
+            row = self._conn.execute(
+                """
+                SELECT * FROM release_verifications
+                WHERE repo = ? AND smoke_status = 'passed' AND tag != ?
+                ORDER BY COALESCE(verified_at, '') DESC, rowid DESC
+                LIMIT 1
+                """,
+                (repo, exclude_tag),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                """
+                SELECT * FROM release_verifications
+                WHERE repo = ? AND smoke_status = 'passed'
+                ORDER BY COALESCE(verified_at, '') DESC, rowid DESC
+                LIMIT 1
+                """,
+                (repo,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_release_verifications(
+        self,
+        *,
+        repo: str | None = None,
+        project_id: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        effective_repo = (repo or "").strip() if repo is not None else None
+        if project_id is not None:
+            proj = self.get_project(project_id)
+            proj_repo = str(proj.get("repo") or "").strip() if proj else ""
+            if not proj_repo:
+                return []
+            if effective_repo is not None and effective_repo != proj_repo:
+                return []
+            effective_repo = proj_repo
+        if effective_repo is not None:
+            if not effective_repo:
+                return []
+            rows = self._conn.execute(
+                "SELECT * FROM release_verifications WHERE repo = ? ORDER BY rowid DESC LIMIT ?",
+                (effective_repo, limit),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM release_verifications ORDER BY rowid DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_release_verification(self, repo: str, tag: str, **fields: Any) -> dict[str, Any]:
+        allowed_cols = {
+            "smoke_status",
+            "smoke_detail",
+            "verified_at",
+            "rolled_back_at",
+            "previous_good_tag",
+        }
+        updates: list[str] = []
+        values: list[Any] = []
+        for k, v in fields.items():
+            if k not in allowed_cols:
+                raise ValueError(f"Disallowed release_verifications column update: {k}")
+            updates.append(f"{k} = ?")
+            values.append(v)
+        if not updates:
+            row = self.get_release_verification(repo, tag)
+            if row is None:
+                raise KeyError(f"Unknown release tag '{tag}' for repository '{repo}'")
+            return row
+        values.extend([repo, tag])
+        with self._conn:
+            self._conn.execute(
+                f"UPDATE release_verifications SET {', '.join(updates)} WHERE repo = ? AND tag = ?",
+                values,
+            )
+        updated = self.get_release_verification(repo, tag)
+        if updated is None:
+            raise KeyError(f"Unknown release tag '{tag}' for repository '{repo}'")
+        return updated
 
 

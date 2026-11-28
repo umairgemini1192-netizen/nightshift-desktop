@@ -609,14 +609,17 @@ class MergeAuthorization:
     reason: str
     block_reason: str = ""
     findings: list[GuardFinding] = field(default_factory=list)
+    effective_risk_class: str = ""
 
 
 class MergeGate:
-    """Single mandatory merge-gate chokepoint (AGENT_PIPELINE §§1, 3, 9).
+    """Single mandatory merge-gate chokepoint (AGENT_PIPELINE §§1, 3, 6.1, 9).
 
     Every merge path in Night-Shift must pass through ``authorize_merge``.
-    Autonomous merging is disabled by default until Phases 8b-8e reach
-    ``Integration-tested`` maturity.
+    When ``autonomous_merge_enabled`` is True (unlocked in Phase 8e), conditional
+    auto-merge is permitted ONLY for eligible classes (``docs_format``, ``ui_cosmetic``,
+    ``business_logic``) after all required gates pass. ``high_risk`` and ``governance``
+    ALWAYS require explicit exact-SHA owner approval.
     """
 
     def __init__(
@@ -642,11 +645,22 @@ class MergeGate:
         evidence_records: list[dict[str, Any]] | None = None,
         required_ci_jobs: list[str] | None = None,
         require_screenshot_evidence: bool = False,
+        require_review_evidence: bool = False,
         reviewer_provider: str | None = None,
+        reviewer_engine: str | None = None,
+        reviewer_tier: str | None = None,
+        critical_paths: list[str] | None = None,
         extra_protected_paths: list[str] | None = None,
         case_fold: bool | None = None,
     ) -> MergeAuthorization:
         """Authorize or block merging ``head_sha`` for ``task``."""
+        from nightshift.engine.pipeline_review import (
+            STRONG_TIERS,
+            classify_task_risk,
+            policy_for_risk_class,
+            tier_for_engine,
+        )
+
         if not head_sha:
             return MergeAuthorization(
                 False,
@@ -686,11 +700,25 @@ class MergeGate:
             diff_content=diff_content,
             case_fold=case_fold,
         )
-        effective_risk = (
-            "governance"
-            if touches_governance
-            else str(task.get("risk_class") or contract.get("risk_class") or "business_logic")
+
+        # Mechanical risk classification (Amendment C: escalates upward only, never downgrades)
+        raw_factors = contract.get("risk_factors_json")
+        try:
+            risk_factors = json.loads(str(raw_factors)) if raw_factors else None
+        except Exception:
+            risk_factors = None
+        base_risk = str(task.get("risk_class") or contract.get("risk_class") or "business_logic")
+        classification = classify_task_risk(
+            entries,
+            diff_content,
+            base_risk_class=base_risk,
+            risk_factors=risk_factors,
+            critical_paths=critical_paths,
+            extra_protected_paths=extra_protected_paths,
+            case_fold=case_fold,
         )
+        effective_risk = "governance" if touches_governance else classification.risk_class
+        policy = policy_for_risk_class(effective_risk)
 
         # 4. Blocking assertion-relaxation check (applies unconditionally to feature AND governance PRs)
         relax_findings = detect_assertion_relaxation_for_files(test_file_snapshots or {}, case_fold=case_fold)
@@ -709,6 +737,7 @@ class MergeGate:
                     "(requires exact-SHA owner waiver in a dedicated governance PR).",
                     block_reason="assertion_relaxation",
                     findings=relax_findings,
+                    effective_risk_class=effective_risk,
                 )
 
         if path_findings:
@@ -717,30 +746,52 @@ class MergeGate:
                 "Path guard blocked merge: " + "; ".join(f.message for f in path_findings),
                 block_reason=path_findings[0].guard,
                 findings=path_findings,
+                effective_risk_class=effective_risk,
             )
 
-        # 5. Provider independence check (AGENT_PIPELINE §2 & §9.2)
+        # 5. Provider independence & tier check (AGENT_PIPELINE §§2, 6.1, 9.2)
+        contributing = {
+            provider_for_engine(p)
+            for p in json.loads(str(task.get("contributing_providers_json") or "[]"))
+            if p
+        }
+        norm_reviewer = provider_for_engine(reviewer_provider or reviewer_engine or "")
         if self.require_independent_reviewer:
-            contributing = {
-                provider_for_engine(p)
-                for p in json.loads(str(task.get("contributing_providers_json") or "[]"))
-                if p
-            }
-            norm_reviewer = provider_for_engine(reviewer_provider or "")
             if norm_reviewer and norm_reviewer in contributing:
                 return MergeAuthorization(
                     False,
                     f"Reviewer provider '{norm_reviewer}' is in contributing_providers {sorted(contributing)}; "
                     f"self-approval is forbidden.",
                     block_reason="reviewer_not_independent",
+                    effective_risk_class=effective_risk,
                 )
-            if effective_risk in ("business_logic", "high_risk", "governance"):
+            if policy.requires_independent_review:
                 if not norm_reviewer:
                     return MergeAuthorization(
                         False,
                         f"Risk class '{effective_risk}' requires an independent cross-provider review.",
                         block_reason="no_independent_reviewer",
+                        effective_risk_class=effective_risk,
                     )
+                if policy.requires_strong_reviewer:
+                    provider_default_tier = {
+                        "openai": "standard",
+                        "google": "standard",
+                        "anthropic": "gold",
+                    }.get(norm_reviewer, "economy")
+                    eff_tier = (
+                        tier_for_engine(reviewer_engine or "", explicit_tier=reviewer_tier)
+                        if (reviewer_tier or reviewer_engine)
+                        else provider_default_tier
+                    )
+                    if eff_tier not in STRONG_TIERS:
+                        return MergeAuthorization(
+                            False,
+                            f"Risk class '{effective_risk}' requires a Standard or Gold independent reviewer "
+                            f"(got tier '{eff_tier}').",
+                            block_reason="reviewer_tier_insufficient",
+                            effective_risk_class=effective_risk,
+                        )
 
         # 6. Exact-SHA verified evidence check (when evidence records are provided; PR body is NEVER evidence)
         if evidence_records is not None:
@@ -763,6 +814,7 @@ class MergeGate:
                     False,
                     f"No verified exact-SHA CI evidence found for commit {head_sha[:7]}.",
                     block_reason="missing_verified_evidence",
+                    effective_risk_class=effective_risk,
                 )
             if required_ci_jobs:
                 covered_jobs: set[str] = set()
@@ -785,8 +837,10 @@ class MergeGate:
                         False,
                         f"Missing verified CI evidence for required job(s): {', '.join(missing_jobs)} on {head_sha[:7]}.",
                         block_reason="missing_required_job_evidence",
+                        effective_risk_class=effective_risk,
                     )
-            if require_screenshot_evidence:
+            need_screenshots = bool(require_screenshot_evidence or policy.requires_screenshots)
+            if need_screenshots:
                 verified_ci_builds = {
                     str(r.get("build_id") or "").strip()
                     for r in valid_ci
@@ -811,11 +865,59 @@ class MergeGate:
                         False,
                         f"No verified screenshot manifest evidence found for commit {head_sha[:7]}.",
                         block_reason="missing_verified_screenshots",
+                        effective_risk_class=effective_risk,
+                    )
+            if require_review_evidence and self.require_independent_reviewer and policy.requires_independent_review:
+                valid_reviews: list[dict[str, Any]] = []
+                for rec in evidence_records:
+                    if (
+                        rec.get("kind") == "review"
+                        and rec.get("commit_sha") == head_sha
+                        and rec.get("contract_sha256") == contract.get("contract_sha256")
+                        and bool(rec.get("verified"))
+                    ):
+                        trusted, _ = validate_evidence_record_trust(rec)
+                        if not trusted:
+                            continue
+                        meta_raw = rec.get("metadata_json") or "{}"
+                        try:
+                            meta = json.loads(meta_raw) if isinstance(meta_raw, str) else dict(meta_raw)
+                        except Exception:
+                            meta = {}
+                        rev_prov = provider_for_engine(str(meta.get("reviewer_provider") or ""))
+                        rev_verdict = str(meta.get("verdict") or "").upper()
+                        try:
+                            p1_count = int(meta.get("p1_count") or 0)
+                        except (TypeError, ValueError):
+                            p1_count = 1
+                        tier_ok = True
+                        if policy.requires_strong_reviewer:
+                            rec_tier = str(meta.get("reviewer_tier") or "").strip().lower()
+                            rec_engine = str(meta.get("reviewer_engine") or "").strip()
+                            rec_default_tier = {
+                                "openai": "standard",
+                                "google": "standard",
+                                "anthropic": "gold",
+                            }.get(rev_prov, "economy")
+                            eff_rec_tier = (
+                                tier_for_engine(rec_engine, explicit_tier=rec_tier or None)
+                                if (rec_tier or rec_engine)
+                                else rec_default_tier
+                            )
+                            tier_ok = eff_rec_tier in STRONG_TIERS
+                        if rev_prov and rev_prov not in contributing and rev_verdict == "APPROVE" and p1_count == 0 and tier_ok:
+                            valid_reviews.append(rec)
+                if not valid_reviews:
+                    return MergeAuthorization(
+                        False,
+                        f"No verified independent review evidence found for commit {head_sha[:7]}.",
+                        block_reason="missing_verified_review",
+                        effective_risk_class=effective_risk,
                     )
 
         # 7. Governance and high_risk ALWAYS require explicit owner approval on exact head_sha
         owner_required = (
-            effective_risk in ("governance", "high_risk")
+            policy.requires_owner_approval
             or bool(contract.get("owner_approval_required"))
         )
         owner_approved_sha = str(task.get("owner_approved_sha") or "")
@@ -824,14 +926,20 @@ class MergeGate:
                 False,
                 f"Risk class '{effective_risk}' requires explicit owner approval for commit {head_sha[:7]}.",
                 block_reason="awaiting_owner_approval",
+                effective_risk_class=effective_risk,
             )
 
-        # 8. Staged rollout safety rule (AGENT_PIPELINE §1)
+        # 8. Staged rollout / conditional auto-merge gate (AGENT_PIPELINE §§1, 6.1)
         if not self.autonomous_merge_enabled and owner_approved_sha != head_sha:
             return MergeAuthorization(
                 False,
                 "Autonomous merge is disabled during staged rollout; awaiting explicit owner approval.",
                 block_reason="awaiting_owner_approval",
+                effective_risk_class=effective_risk,
             )
 
-        return MergeAuthorization(True, f"Merge authorized for {head_sha[:7]} ({effective_risk}).")
+        return MergeAuthorization(
+            True,
+            f"Merge authorized for {head_sha[:7]} ({effective_risk}).",
+            effective_risk_class=effective_risk,
+        )

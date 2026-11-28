@@ -979,6 +979,46 @@ export class MockBridge implements Bridge {
       case "token_optimizer.evaluateAb":
         return structuredClone(this.tokenOptimizerState) as T;
 
+      case "pipeline.approveTask": {
+        const taskId = String(args?.taskId ?? "").trim();
+        const headSha = String(args?.headSha ?? "").trim();
+        const approvedBy = String(args?.approvedBy ?? "owner").trim() || "owner";
+        if (!taskId || !headSha) {
+          throw new Error("taskId and exact headSha are required to approve a task.");
+        }
+        if (this.snapshot.deck?.needs_you) {
+          this.snapshot.deck.needs_you = this.snapshot.deck.needs_you.filter(
+            (item) => item.task_id !== taskId,
+          );
+        }
+        return {
+          id: taskId,
+          status: "APPROVED",
+          owner_approved_by: approvedBy,
+          owner_approved_sha: headSha,
+        } as T;
+      }
+
+      case "pipeline.rollbackRelease": {
+        const tag = String(args?.tag ?? args?.faultyTag ?? "").trim();
+        if (!tag) {
+          throw new Error("Release tag is required for rollback.");
+        }
+        const matched = this.snapshot.deck?.needs_you?.find((item) => item.release_tag === tag);
+        const restoredTag = matched?.previous_good_tag || "v1.0.0-preview.1";
+        if (this.snapshot.deck?.needs_you) {
+          this.snapshot.deck.needs_you = this.snapshot.deck.needs_you.filter(
+            (item) => item.release_tag !== tag,
+          );
+        }
+        return {
+          ok: true,
+          faulty_tag: tag,
+          restored_tag: restoredTag,
+          detail: `Rolled back ${tag} and restored ${restoredTag}.`,
+        } as T;
+      }
+
       case "window.minimize":
       case "window.toggleMaximize":
       case "window.close":

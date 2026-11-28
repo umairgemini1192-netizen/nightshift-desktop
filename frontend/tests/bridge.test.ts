@@ -23,6 +23,7 @@ describe("Bridge and MockBridge fixtures", () => {
     expect(parseScenarioParam("?scenario=handoff")).toBe("handoff");
     expect(parseScenarioParam("?scenario=ci-healing")).toBe("ci-healing");
     expect(parseScenarioParam("?scenario=finished")).toBe("finished");
+    expect(parseScenarioParam("?scenario=governance")).toBe("governance");
     expect(parseScenarioParam("?scenario=unknown")).toBe("idle");
   });
 
@@ -94,6 +95,15 @@ describe("Bridge and MockBridge fixtures", () => {
     const finishedSnap = SCENARIO_FIXTURES.finished;
     expect(finishedSnap.runState).toBe("done");
     expect(finishedSnap.deck?.done_tonight.length).toBe(5);
+
+    // 9. Governance approval, release rollback, and smoke-config actions
+    const governanceSnap = SCENARIO_FIXTURES.governance;
+    expect(governanceSnap.runState).toBe("failed");
+    expect(governanceSnap.deck?.needs_you.map((item) => item.action_kind)).toEqual([
+      "approve_task",
+      "rollback_release",
+      "configure_smoke_test",
+    ]);
   });
 
   it("handles engine stop, undoStop, and start RPC methods", async () => {

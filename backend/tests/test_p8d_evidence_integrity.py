@@ -823,7 +823,11 @@ async def test_e2e_happy_path_with_screenshot_manifest_and_post_merge_evidence(t
         artifact_prefix="ui-screenshots",
     )
 
+    from nightshift.engine.release import SmokeTestResult
     store, engine = _build_engine(tmp_path, vcs)
+    engine.release_mgr._smoke_runner = lambda cmd, art, tag, to: SmokeTestResult(
+        passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T00:00:00Z"
+    )
     try:
         project = ProjectConfig(
             id="proj-8d-happy",
@@ -838,6 +842,7 @@ async def test_e2e_happy_path_with_screenshot_manifest_and_post_merge_evidence(t
                 "desktop-package": ["nightshift-windows/NightShift-windows.zip"],
             },
             screenshot_manifest_path="ui-screenshots/screenshot-manifest.json",
+            smoke_command="nightshift-desktop-selftest",
         )
         phase = PhaseDefinition(
             id="p8d-happy",
