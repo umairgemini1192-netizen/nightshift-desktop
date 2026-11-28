@@ -19,7 +19,7 @@ from nightshift.engine.pipeline_review import (
 )
 from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient
-from nightshift.engine.verify import RiskAssessment
+from nightshift.engine.verify import RiskAssessment, check_diff_guards
 from nightshift.runners.base import Runner, RunnerResult
 from nightshift.store import Store
 
@@ -187,9 +187,44 @@ class CiPipelineManager:
                 effective_risk_class = str(risk_class or (task_contract or {}).get("risk_class") or "business_logic")
 
                 diff_text = self.vcs.get_diff(worktree_dir)
+                changed_files = self.vcs.list_changed_files(worktree_dir)
+                diff_entries = self.vcs.list_changed_entries(worktree_dir)
+                test_snapshots = self.vcs.get_test_file_snapshots(worktree_dir, diff_entries)
+                contract_allowed_globs = (
+                    json.loads(str(task_contract.get("allowed_globs_json") or "[]"))
+                    if task_contract is not None
+                    else None
+                )
+                contract_forbidden_globs = (
+                    json.loads(str(task_contract.get("forbidden_globs_json") or "[]"))
+                    if task_contract is not None
+                    else None
+                )
+                guard_findings = check_diff_guards(
+                    worktree_dir,
+                    changed_files,
+                    diff_text,
+                    diff_entries=diff_entries,
+                    allowed_globs=contract_allowed_globs,
+                    forbidden_globs=contract_forbidden_globs,
+                    test_file_snapshots=test_snapshots,
+                )
+                if guard_findings:
+                    for finding in guard_findings:
+                        self.store.record_guard_result(phase_id, finding.guard, passed=False, detail=finding.message)
+                    return CiWatchResult(
+                        passed=False,
+                        rounds_used=round_num,
+                        detail="Diff guard failed: " + "; ".join(f.message for f in guard_findings),
+                        last_engine=active_engine,
+                        checked_sha=checked_sha,
+                        expected_base_sha=expected_base_sha,
+                        contributing_engines=list(contributing_engines),
+                        effective_risk_class=effective_risk_class,
+                        block_reason="diff_guard_failed",
+                    )
 
                 if task_contract is not None:
-                    diff_entries = self.vcs.list_changed_entries(worktree_dir)
                     raw_factors = task_contract.get("risk_factors_json")
                     try:
                         risk_factors = json.loads(str(raw_factors)) if raw_factors else None

@@ -597,7 +597,49 @@ async def test_resumed_and_fixed_heads_obey_diff_guards(tmp_path: Path, after_ci
         vcs.prepare_worktree(tmp_path, wt_dir, "feat/p1")
         if after_ci:
             engine.ci_pipeline.watch_and_heal = introduce_bad_diff
-        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", wt_dir), patch("nightshift.engine.state_machine.SingleInstanceLock") as lock:
+        with (
+            patch("nightshift.engine.state_machine.WORKTREE_ROOT", wt_dir),
+            patch("nightshift.engine.logins.resolve_bin", return_value="tool.exe"),
+            patch("nightshift.engine.state_machine.SingleInstanceLock") as lock,
+        ):
+            lock.return_value.acquire.return_value = True
+            rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")], plan_id="plan")
+        assert rows[0]["status"] == "PARKED"
+        assert "Diff guard failed" in rows[0]["detail"]
+        assert not vcs.merged_prs
+
+
+@pytest.mark.asyncio
+async def test_ci_fix_diff_guard_runs_before_independent_review(tmp_path: Path) -> None:
+    """Hard diff guards must fail a CI-fixed head before independent risk review runs."""
+    with Store(tmp_path / "guard_before_review.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=2)
+        vcs.ci_results[2] = [False, False, True]
+        quota = QuotaLedger(store)
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+
+        def on_fix(prompt: str, wd: Path, model: str | None, effort: str) -> None:
+            vcs.diffs["feat/p1"] = "--- a/tests/t.py\n+++ b/tests/t.py\n+@pytest.mark.skip\n"
+            vcs.changed_files["feat/p1"] = ["tests/t.py"]
+
+        # Intentionally register only the fixer (no independent reviewer available)
+        # to prove hard diff guards report the diff-guard violation before review selection.
+        engine = EngineStateMachine(
+            store,
+            EventBus(store),
+            quota,
+            vcs=vcs,
+            runners={"agy": FakeRunner(name="agy", on_call=on_fix)},
+            login_checker=logins,
+        )
+        project = ProjectConfig(id="guard_rev", name="GuardRev", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
+        with (
+            patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"),
+            patch("nightshift.engine.logins.resolve_bin", return_value="tool.exe"),
+            patch("nightshift.engine.state_machine.SingleInstanceLock") as lock,
+        ):
             lock.return_value.acquire.return_value = True
             rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")], plan_id="plan")
         assert rows[0]["status"] == "PARKED"
