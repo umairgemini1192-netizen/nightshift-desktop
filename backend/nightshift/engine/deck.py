@@ -72,6 +72,31 @@ def generate_deck_data(
                     item["repo"] = proj_repo
             needs_you.append(item)
             seen_ids.add(phase_id)
+        elif block_reason == "awaiting_combined_governance_approval":
+            pr_num = task.get("pr_number")
+            pr_str = f"PR #{pr_num}" if pr_num else "This PR"
+            head_sha = str(task.get("head_sha") or "").strip()
+            item = {
+                "phase_id": phase_id,
+                "task_id": str(task["id"]),
+                "project_id": project_id,
+                "risk_class": str(task.get("risk_class") or "business_logic"),
+                "headline": f"{pr_str} changes feature code and tests together; approve once to merge",
+                "detail": str(
+                    task.get("block_detail")
+                    or "Existing tests were updated alongside feature code with equal-or-stricter assertions."
+                ),
+            }
+            if head_sha:
+                item.update({"head_sha": head_sha, "action": "Review & Approve", "action_kind": "approve_combined_governance"})
+            else:
+                item.update({"action": "Inspect runs", "action_kind": "open_runs"})
+            if pr_num is not None:
+                item["pr_number"] = int(pr_num)
+            if proj_repo:
+                item["repo"] = proj_repo
+            needs_you.append(item)
+            seen_ids.add(phase_id)
         elif block_reason in ("smoke_test_failed", "smoke_test_unavailable"):
             tag = str(task.get("release_tag") or "").strip()
             tag_str = f" ({tag})" if tag else ""

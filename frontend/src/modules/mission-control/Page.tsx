@@ -236,7 +236,7 @@ export default function MissionControlPage() {
     const kind = item.action_kind;
     const actionLower = item.action.toLowerCase();
 
-    if (kind === "approve_task" || (item.task_id && item.head_sha && actionLower.includes("approve"))) {
+    if (kind === "approve_task" || kind === "approve_combined_governance" || (item.task_id && item.head_sha && actionLower.includes("approve"))) {
       if (!item.task_id || !item.head_sha) {
         pushToast({
           title: "Cannot approve task",
@@ -294,6 +294,14 @@ export default function MissionControlPage() {
     if (!pendingApproval?.task_id || !pendingApproval?.head_sha) return;
     setGovernanceBusy(true);
     try {
+      const isCombined = pendingApproval.action_kind === "approve_combined_governance";
+      if (isCombined) {
+        await bridge.call("pipeline.approveCombinedGovernance", {
+          taskId: pendingApproval.task_id,
+          headSha: pendingApproval.head_sha,
+          reason: pendingApproval.detail || "Owner approved combined feature and test PR",
+        });
+      }
       await bridge.call("pipeline.approveTask", {
         taskId: pendingApproval.task_id,
         headSha: pendingApproval.head_sha,
@@ -302,7 +310,7 @@ export default function MissionControlPage() {
         resume: true,
       });
       pushToast({
-        title: "Task approved",
+        title: isCombined ? "Combined PR approved" : "Task approved",
         description: `Approved commit ${pendingApproval.head_sha.slice(0, 7)} and resumed the merge gate.`,
         tone: "success",
       });

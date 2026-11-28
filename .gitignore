@@ -14,3 +14,7 @@ test-results/
 *.db
 .env
 .agents/
+
+# local pytest temp dirs (never commit)
+backend/.pytest-tmp/
+.pytest-tmp/

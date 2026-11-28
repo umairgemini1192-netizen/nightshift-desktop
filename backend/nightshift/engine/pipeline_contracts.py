@@ -453,6 +453,40 @@ def detect_python_assertion_relaxation(
     before_counts, before_broad, before_skips = _analyze_python_tests(before_source or "")
     after_counts, after_broad, after_skips = _analyze_python_tests(after_source or "")
 
+    # A matching count does not prove that a replacement is as strict.  Only
+    # accept assertions whose AST is preserved; additional assertions may make
+    # the test stricter.  Unprovable replacements require a separate change.
+    def assertions(source: str) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return result
+        def visit(node: ast.AST, prefix: str = "") -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    visit(child, prefix + child.name + ".")
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = prefix + child.name
+                    if child.name.startswith("test_"):
+                        result[name] = [ast.dump(item.test, include_attributes=False)
+                                        for item in ast.walk(child) if isinstance(item, ast.Assert)]
+                    visit(child, name + ".")
+                else:
+                    visit(child, prefix)
+        visit(tree)
+        return result
+
+    before_assertions = assertions(before_source or "")
+    after_assertions = assertions(after_source or "")
+    for name, old in before_assertions.items():
+        remaining = list(after_assertions.get(name, []))
+        for assertion in old:
+            if assertion not in remaining:
+                findings.append(GuardFinding(guard="assertion_relaxation", message=f"Changed or removed assertion in '{name}' in '{path}'.", path=path))
+                break
+            remaining.remove(assertion)
+
     for fn_name, prev_n in before_counts.items():
         if fn_name not in after_counts:
             findings.append(
@@ -652,6 +686,7 @@ class MergeGate:
         critical_paths: list[str] | None = None,
         extra_protected_paths: list[str] | None = None,
         case_fold: bool | None = None,
+        require_codex_review: bool | None = None,
     ) -> MergeAuthorization:
         """Authorize or block merging ``head_sha`` for ``task``."""
         from nightshift.engine.pipeline_review import (
@@ -741,13 +776,32 @@ class MergeGate:
                 )
 
         if path_findings:
-            return MergeAuthorization(
-                False,
-                "Path guard blocked merge: " + "; ".join(f.message for f in path_findings),
-                block_reason=path_findings[0].guard,
-                findings=path_findings,
-                effective_risk_class=effective_risk,
-            )
+            split_only = all(f.guard == "governance_split_required" for f in path_findings)
+            if split_only and not relax_findings:
+                # Safe path for combined feature + test PRs when existing assertions must be updated
+                # alongside feature code: (a) equal-or-stricter AST assertions (no relaxations/skips)
+                # AND (b) explicit owner approval recorded on exact head_sha.
+                combined_sha = str(task.get("combined_governance_approved_sha") or "")
+                combined_reason = str(task.get("combined_governance_approved_reason") or "").strip()
+                if combined_sha == head_sha and combined_reason:
+                    path_findings = []
+                else:
+                    return MergeAuthorization(
+                        False,
+                        "Combined feature and test PR has equal-or-stricter assertions; "
+                        "approve once in Needs your attention for this exact head SHA to merge.",
+                        block_reason="awaiting_combined_governance_approval",
+                        findings=path_findings,
+                        effective_risk_class=effective_risk,
+                    )
+            else:
+                return MergeAuthorization(
+                    False,
+                    "Path guard blocked merge: " + "; ".join(f.message for f in path_findings),
+                    block_reason=path_findings[0].guard,
+                    findings=path_findings,
+                    effective_risk_class=effective_risk,
+                )
 
         # 5. Provider independence & tier check (AGENT_PIPELINE §§2, 6.1, 9.2)
         contributing = {
@@ -756,6 +810,26 @@ class MergeGate:
             if p
         }
         norm_reviewer = provider_for_engine(reviewer_provider or reviewer_engine or "")
+        effective_require_codex = (
+            bool(require_codex_review)
+            if require_codex_review is not None
+            else bool(task.get("require_codex_review", contract.get("require_codex_review", False)))
+        )
+        if effective_require_codex:
+            if not norm_reviewer or norm_reviewer != "openai":
+                return MergeAuthorization(
+                    False,
+                    "Owner merge rule requires an independent Codex (OpenAI) review with zero P1 on this exact head.",
+                    block_reason="codex_review_required",
+                    effective_risk_class=effective_risk,
+                )
+            if norm_reviewer in contributing:
+                return MergeAuthorization(
+                    False,
+                    f"Codex (openai) is in contributing_providers {sorted(contributing)}; independent Codex review required.",
+                    block_reason="codex_review_required",
+                    effective_risk_class=effective_risk,
+                )
         if self.require_independent_reviewer:
             if norm_reviewer and norm_reviewer in contributing:
                 return MergeAuthorization(

@@ -83,6 +83,7 @@ export default function PlanBuilderPage() {
         depends_on: phase.depends_on ?? JSON.parse((phase as PlanPhase & { depends_on_json?: string }).depends_on_json ?? "[]"),
         auto_merge: Boolean(phase.auto_merge),
         release_after_merge: Boolean(phase.release_after_merge),
+        require_codex_review: phase.require_codex_review ?? true,
         force_rerun: Boolean(phase.force_rerun),
       }));
       setPhases(loaded);
@@ -295,6 +296,7 @@ export default function PlanBuilderPage() {
       timeout_minutes: 90,
       auto_merge: true,
       release_after_merge: false,
+      require_codex_review: true,
       implementer: "Antigravity",
     };
     setPhases((prev) => [...prev, newPhase]);
@@ -746,6 +748,14 @@ export default function PlanBuilderPage() {
                       helperText="Redo implementation even if branch was previously merged."
                       checked={Boolean(activePhase.force_rerun)}
                       onChange={(checked) => updateActivePhase({ force_rerun: checked })}
+                    />
+
+                    <Toggle
+                      id="toggle-codex-review"
+                      label="Require independent Codex review"
+                      helperText="Merge only when CircleCI is green and Codex reports zero P1 on the exact head."
+                      checked={activePhase.require_codex_review ?? true}
+                      onChange={(checked) => updateActivePhase({ require_codex_review: checked })}
                     />
                   </div>
                 </div>

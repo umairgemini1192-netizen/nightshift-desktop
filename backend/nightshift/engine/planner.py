@@ -27,6 +27,7 @@ class PhaseDefinition:
     forbidden_globs: list[str] | None = None
     risk_class: str = "business_logic"
     owner_approval_required: bool = False
+    require_codex_review: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PhaseDefinition:
@@ -52,6 +53,7 @@ class PhaseDefinition:
             release_after_merge=bool(data.get("release_after_merge", False)),
             force_rerun=bool(data.get("force_rerun", False)),
             position=int(data.get("position", 0)),
+            require_codex_review=bool(data.get("require_codex_review", True)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,10 +71,34 @@ class PhaseDefinition:
             "release_after_merge": self.release_after_merge,
             "force_rerun": self.force_rerun,
             "position": self.position,
+            "require_codex_review": self.require_codex_review,
         }
 
 
 KNOWN_LADDERS: set[str] = {"backend", "ui", "review", "ci_fix", "docs", "test", "default"}
+
+LEGACY_LADDER_ALIASES: dict[str, str] = {
+    "build": "backend",
+    "fix": "ci_fix",
+    "ci": "ci_fix",
+    "ci-fix": "ci_fix",
+    "frontend": "ui",
+    "design": "ui",
+    "qa": "test",
+    "tests": "test",
+    "doc": "docs",
+    "documentation": "docs",
+    "small": "ci_fix",
+    "triage": "ci_fix",
+}
+
+
+def map_legacy_ladder_name(name: str) -> str:
+    """Map legacy queue.json ladder names (e.g. 'build' -> 'backend') to canonical names."""
+    cleaned = str(name or "default").strip()
+    if not cleaned:
+        return "default"
+    return LEGACY_LADDER_ALIASES.get(cleaned.lower(), cleaned)
 
 
 def validate_plan(
@@ -216,9 +242,17 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
         "status": "draft",
     }
 
-    ladders = cfg.get("failover_ladders", {})
-    if not isinstance(ladders, dict):
-        ladders = {}
+    raw_ladders = cfg.get("failover_ladders", {})
+    if not isinstance(raw_ladders, dict):
+        raw_ladders = {}
+    ladders: dict[str, Any] = {}
+    for k, v in raw_ladders.items():
+        mapped_k = map_legacy_ladder_name(str(k)) if str(k) != "small_job_ladder" else "small_job_ladder"
+        if mapped_k not in ladders:
+            ladders[mapped_k] = v
+
+    proj_require_codex = bool(cfg.get("require_codex_review", True))
+    project["require_codex_review"] = proj_require_codex
 
     settings = {
         "auto_merge": bool(cfg.get("auto_merge", True)),
@@ -226,6 +260,7 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
         "max_ci_retries": int(cfg.get("max_ci_retries", 2)),
         "quota_cooldown_minutes": int(cfg.get("quota_cooldown_minutes", 60)),
         "runner_timeout_minutes": int(cfg.get("runner_timeout_minutes", 90)),
+        "require_codex_review": proj_require_codex,
     }
 
     raw_phases = cfg.get("phases", [])
@@ -236,12 +271,13 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
         branch = str(p.get("branch") or f"feat/{pid}")
         prompt = str(p.get("prompt", ""))
         deps = list(p.get("depends_on", []))
-        ladder = str(p.get("ladder", "default"))
+        ladder = map_legacy_ladder_name(str(p.get("ladder", "default")))
         size = str(p.get("size", "medium"))
         timeout = int(p.get("timeout_minutes", settings["runner_timeout_minutes"]))
         auto_m = bool(p.get("auto_merge", settings["auto_merge"]))
         rel = bool(p.get("release_after_merge", settings["auto_release"]))
         rerun = bool(p.get("force_rerun", False))
+        req_codex = bool(p.get("require_codex_review", proj_require_codex))
 
         phases.append(
             PhaseDefinition(
@@ -257,8 +293,14 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
                 release_after_merge=rel,
                 force_rerun=rerun,
                 position=idx,
+                require_codex_review=req_codex,
             )
         )
+
+    if phases:
+        problems = validate_plan(phases, known_ladders=KNOWN_LADDERS | set(ladders.keys()))
+        if problems:
+            raise ValueError(problems[0])
 
     return {
         "project": project,

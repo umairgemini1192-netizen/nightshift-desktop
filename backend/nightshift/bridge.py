@@ -20,6 +20,7 @@ from nightshift.engine.council import CouncilRoleResult, CouncilSessionResult, P
 from nightshift.engine.credentials import CredentialStore, get_credential_store
 from nightshift.engine.deck import generate_deck_data
 from nightshift.engine.logins import LoginHealthChecker
+from nightshift.engine.pipeline_economics import PipelineEconomics, is_free_only_engine
 from nightshift.engine.planner import (
     KNOWN_LADDERS,
     PhaseDefinition,
@@ -95,6 +96,44 @@ class BridgeAPI:
         self._run_lock = threading.Lock()
         self._run_thread: threading.Thread | None = None
         self._registry.attach(store=self._store, events=self._events, creds=self._creds, engine=self._engine)
+
+    def _resolve_project_id(self, payload: dict[str, Any] | None = None) -> str | None:
+        p = payload or {}
+        if p.get("projectId"):
+            return str(p["projectId"])
+        if p.get("planId"):
+            plan = self._store.get_plan(str(p["planId"]))
+            if plan and plan.get("project_id"):
+                return str(plan["project_id"])
+        if self._active_project_id:
+            return self._active_project_id
+        projects = self._store.list_projects()
+        return str(projects[0]["id"]) if projects else None
+
+    def _engine_unavailable_reason(self, engine_id: str, latest_logins: dict[str, Any]) -> str | None:
+        engines_by_id = {str(e["id"]): e for e in self._store.list_engines()}
+        eng_row = engines_by_id.get(engine_id) or next(
+            (e for e in engines_by_id.values() if str(e.get("runner") or "") == engine_id),
+            None,
+        )
+        if eng_row is not None and not int(eng_row.get("enabled", 1)):
+            return "Disabled by owner"
+        runner = str(eng_row.get("runner") or engine_id) if eng_row is not None else engine_id
+        tier = str(eng_row.get("cost_tier") or "") if eng_row is not None else ""
+        if PipelineEconomics(self._store).is_free_only_mode() and not is_free_only_engine(engine_id, runner=runner, cost_tier=tier):
+            return "Unavailable (free-only mode)"
+        if runner == "claude-compatible" or engine_id in ("deepseek", "kimi", "glm", "minimax"):
+            has_cred = bool(
+                self._creds.get_secret(f"api_key_{engine_id}")
+                or self._creds.get_secret(engine_id)
+                or os.environ.get(f"{engine_id.upper()}_API_KEY")
+            )
+            if not has_cred:
+                return "Unavailable (no credentials)"
+        login = latest_logins.get(engine_id) or (latest_logins.get(runner) if runner != engine_id else None)
+        if login and login.get("state") != "Ready":
+            return str(login["state"])
+        return None
 
     def attach_window(self, window: Any) -> None:
         """Attach the active pywebview window for frameless titlebar controls."""
@@ -500,6 +539,7 @@ class BridgeAPI:
                     ladder=str(p.get("ladder", "default")), timeout_minutes=int(p.get("timeout_minutes", 180)),
                     auto_merge=bool(p.get("auto_merge", True)), release_after_merge=bool(p.get("release_after_merge", False)),
                     force_rerun=bool(p.get("force_rerun", False)),
+                    require_codex_review=bool(p.get("require_codex_review", True)),
                 )
                 self._upsert_planned_engine(str(p["id"]), p.get("implementer"))
             return {"ok": True, "data": {"saved": True, "planId": plan_id, "projectId": project_id}}
@@ -515,15 +555,9 @@ class BridgeAPI:
                     phase_defs.append(PhaseDefinition.from_dict(p) if isinstance(p, dict) else p)
                 except Exception as e:
                     return {"ok": True, "data": {"valid": False, "problems": [f"Malformed phase: {e}"]}}
-            ladders_raw = self._store.get_setting("engines.ladders")
-            custom_ladders: set[str] = set()
-            if ladders_raw:
-                try:
-                    parsed_ladders = json.loads(ladders_raw)
-                    if isinstance(parsed_ladders, dict):
-                        custom_ladders = {str(k) for k in parsed_ladders.keys()}
-                except Exception:
-                    pass
+            target_project_id = self._resolve_project_id(payload)
+            parsed_ladders = self._store.get_project_ladders(target_project_id)
+            custom_ladders = {str(k) for k in parsed_ladders.keys()} if isinstance(parsed_ladders, dict) else set()
             problems = validate_plan(phase_defs, known_ladders=KNOWN_LADDERS | custom_ladders)
             return {"ok": True, "data": {"valid": len(problems) == 0, "problems": problems}}
 
@@ -553,6 +587,7 @@ class BridgeAPI:
                         build_rules=proj.get("build_rules", ""),
                         artifact_glob=proj.get("artifact_glob", "*.apk"),
                         output_dir=proj.get("output_dir", ""),
+                        require_codex_review=bool(proj.get("require_codex_review", True)),
                         **evidence_kwargs,
                     )
                 else:
@@ -567,6 +602,8 @@ class BridgeAPI:
                         updates["artifact_glob"] = proj.get("artifact_glob", "*.apk")
                     if "desktop_apk_dir" in raw_cfg:
                         updates["output_dir"] = proj.get("output_dir", "")
+                    if "require_codex_review" in raw_cfg:
+                        updates["require_codex_review"] = 1 if proj.get("require_codex_review", True) else 0
                     updates.update(evidence_kwargs)
                     proj = (
                         self._store.update_project(proj["id"], **updates)
@@ -596,11 +633,29 @@ class BridgeAPI:
                         size=ph.size,
                         position=idx, ladder=ph.ladder, timeout_minutes=ph.timeout_minutes,
                         auto_merge=ph.auto_merge, release_after_merge=ph.release_after_merge, force_rerun=ph.force_rerun,
+                        require_codex_review=ph.require_codex_review,
                     )
                     raw_ph = raw_phases[idx] if idx < len(raw_phases) and isinstance(raw_phases[idx], dict) else {}
                     self._upsert_planned_engine(ph.id, raw_ph.get("implementer"))
                 if imported.get("ladders"):
-                    self._store.set_setting("engines.ladders", json.dumps(imported["ladders"]))
+                    self._store.set_project_ladders(proj["id"], imported["ladders"], merge=True)
+                    # Seed priority list from imported ladders in order (Claude last)
+                    seen_engines: list[str] = []
+                    for _lname, entries in imported["ladders"].items():
+                        if not isinstance(entries, list):
+                            continue
+                        for entry in entries:
+                            eid = str(entry.get("runner") or entry.get("engine") or entry.get("id") or "") if isinstance(entry, dict) else str(entry)
+                            eid = ENGINE_NAME_TO_ID.get(eid.strip(), eid.strip())
+                            if eid and eid not in seen_engines:
+                                seen_engines.append(eid)
+                    if seen_engines:
+                        ordered = [e for e in seen_engines if e != "claude"]
+                        if "claude" in seen_engines:
+                            ordered.append("claude")
+                        self._store.set_priority_list(
+                            [{"engine": eid, "model": "", "effort": "medium"} for eid in ordered]
+                        )
                 self._store.set_setting("onboarding.completed", "1")
                 return {
                     "ok": True,
@@ -636,8 +691,7 @@ class BridgeAPI:
                 or {"repo": "owner/repo", "local_path": "", "output_dir": "", "artifact_glob": "*.apk"}
             )
             phases = [self._enrich_phase_with_assignment(ph) for ph in self._store.list_phases(plan.get("id"))]
-            ladders_raw = self._store.get_setting("engines.ladders")
-            ladders = json.loads(ladders_raw) if ladders_raw else {
+            ladders = self._store.get_project_ladders(str(plan.get("project_id") or target_project_id or "")) or {
                 "backend": ["agy", "gemini", "codex", "claude"],
                 "ui": ["agy", "gemini", "claude"],
                 "review": ["gemini", "codex", "claude"],
@@ -959,13 +1013,15 @@ class BridgeAPI:
                 "glm": "GLM",
                 "minimax": "MiniMax",
             }
+            latest_logins = self._store.get_latest_login_checks()
             formatted = []
             for engine in engines:
                 runner = engine["runner"]
                 model = engine.get("model", "")
                 reset_dt = self._quota.get_reset_at(runner, model)
                 cooling_until = reset_dt.strftime("%H:%M") if reset_dt else engine.get("coolingUntil")
-                if not engine.get("enabled", 1):
+                unavail_reason = self._engine_unavailable_reason(engine["id"], latest_logins)
+                if not engine.get("enabled", 1) or unavail_reason:
                     state = "unavailable"
                 elif cooling_until:
                     state = "cooling"
@@ -1114,8 +1170,8 @@ class BridgeAPI:
             return {"ok": True, "data": {name: asdict(result) for name, result in checks.items()}}
 
         if method == "engines.getLadders":
-            ladders_raw = self._store.get_setting("engines.ladders")
-            raw_ladders = json.loads(ladders_raw) if ladders_raw else {
+            target_project_id = self._resolve_project_id(payload)
+            raw_ladders = self._store.get_project_ladders(target_project_id) or {
                 "backend": ["agy", "gemini", "codex", "claude"],
                 "ui": ["agy", "gemini", "claude"],
                 "review": ["gemini", "codex", "claude"],
@@ -1161,7 +1217,11 @@ class BridgeAPI:
                 else:
                     non_claude.append("claude")
                 sanitized[cat] = non_claude
-            self._store.set_setting("engines.ladders", json.dumps(sanitized))
+            target_project_id = self._resolve_project_id(payload)
+            if target_project_id and self._store.get_project(target_project_id):
+                self._store.set_project_ladders(target_project_id, sanitized, merge=False)
+            else:
+                self._store.set_setting("engines.ladders", json.dumps(sanitized))
             return {
                 "ok": True,
                 "data": {
@@ -1256,6 +1316,7 @@ class BridgeAPI:
                 return {"ok": False, "error": f"Invalid evidence configuration: {exc}"}
 
             existing = self._store.get_project(pid)
+            req_codex = 1 if bool(p_data.get("require_codex_review", True)) else 0
             if existing:
                 updated = self._store.update_project(
                     pid,
@@ -1265,6 +1326,7 @@ class BridgeAPI:
                     build_rules=build_rules,
                     artifact_glob=artifact_glob,
                     output_dir=output_dir,
+                    require_codex_review=req_codex if "require_codex_review" in p_data else existing.get("require_codex_review", 1),
                     **evidence_kwargs,
                 )
                 return {"ok": True, "data": updated}
@@ -1277,6 +1339,7 @@ class BridgeAPI:
                     build_rules=build_rules,
                     artifact_glob=artifact_glob,
                     output_dir=output_dir,
+                    require_codex_review=bool(p_data.get("require_codex_review", True)),
                     **evidence_kwargs,
                 )
                 self._store.set_setting("onboarding.completed", "1")
@@ -1306,13 +1369,14 @@ class BridgeAPI:
             for item in p_list:
                 eng = item["engine"]
                 reset_dt = self._quota.get_reset_at(eng, item.get("model", ""))
-                login = latest_logins.get(eng)
+                unavail_reason = self._engine_unavailable_reason(eng, latest_logins)
                 if reset_dt:
                     availability = "Cooling down"
                     back_at = reset_dt.strftime("%H:%M")
-                elif login and login.get("state") != "Ready":
-                    availability = str(login["state"])
-                    back_at = login.get("back_at")
+                elif unavail_reason:
+                    availability = unavail_reason
+                    login = latest_logins.get(eng)
+                    back_at = login.get("back_at") if login else None
                 else:
                     availability = "Ready"
                     back_at = None
@@ -1550,6 +1614,23 @@ class BridgeAPI:
                     plain_text=f"Owner approved task {task_id} for commit {head_sha[:7]}.",
                     level="info",
                     phase_id=str(updated.get("phase_id") or "") or None,
+                )
+            )
+            return {"ok": True, "data": updated}
+
+        if method == "pipeline.approveCombinedGovernance":
+            task_id = str(payload.get("taskId") or "")
+            head_sha = str(payload.get("headSha") or "")
+            reason = str(payload.get("reason") or "").strip()
+            if not task_id or not head_sha or not reason:
+                return {"ok": False, "error": "taskId, headSha, and reason are required."}
+            updated = self._store.record_combined_governance_approval(task_id, head_sha, reason)
+            self._events.emit(
+                Event(
+                    kind="pipeline.combined_governance_approved",
+                    plain_text=f"Owner approved combined feature+test PR for {task_id} on {head_sha[:7]}.",
+                    phase_id=str(updated.get("phase_id") or ""),
+                    payload={"task_id": task_id, "head_sha": head_sha},
                 )
             )
             return {"ok": True, "data": updated}

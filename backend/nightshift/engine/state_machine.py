@@ -272,6 +272,7 @@ class EngineStateMachine:
             store=store,
             scheduler=self.scheduler,
             runners=self.runners,
+            runner_resolver=self._resolve_runner,
         )
         self.release_mgr = ReleaseManager(vcs=self.vcs, smoke_runner=smoke_runner)
 
@@ -396,6 +397,7 @@ class EngineStateMachine:
                     depends_on_json=json.dumps(p.depends_on),
                     size=p.size, ladder=p.ladder, timeout_minutes=p.timeout_minutes,
                     auto_merge=p.auto_merge, release_after_merge=p.release_after_merge, force_rerun=p.force_rerun,
+                    require_codex_review=bool(p.require_codex_review),
                     position=p.position,
                     status=previous.get("status", "pending"),
                     attempt=previous.get("attempt", 0),
@@ -611,6 +613,7 @@ class EngineStateMachine:
             allowed_globs=list(phase.allowed_globs),
             forbidden_globs=list(phase.forbidden_globs) if phase.forbidden_globs is not None else None,
             owner_approval_required=phase.owner_approval_required,
+            require_codex_review=bool(phase.require_codex_review),
         )
 
     def _safe_task_transition(
@@ -898,36 +901,9 @@ class EngineStateMachine:
                     return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": f"No eligible engine available (earliest reset {earliest_str})"}
 
                 active_runner_name = choice.engine
-                runner_obj = self.runners.get(active_runner_name)
+                runner_obj = self.runners.get(active_runner_name) or self._resolve_runner(active_runner_name)
                 if not runner_obj:
-                    eng_row = next(
-                        (e for e in self.store.list_engines() if e["id"] == active_runner_name),
-                        None,
-                    ) or next(
-                        (e for e in self.store.list_engines() if e["runner"] == active_runner_name),
-                        None,
-                    )
-                    if eng_row:
-                        runner_type = eng_row.get("runner", "")
-                        if runner_type and runner_type in self.runners:
-                            runner_obj = self.runners[runner_type]
-                            self.runners[active_runner_name] = runner_obj
-                        else:
-                            env = self.scheduler.router.build_isolated_environment(eng_row["id"])
-                            try:
-                                patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
-                            except Exception:
-                                patterns = []
-                            runner_obj = TemplateRunner(
-                                eng_row["runner"],
-                                eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
-                                quota_ledger=self.quota,
-                                quota_patterns=patterns,
-                                env=env,
-                            )
-                            self.runners[active_runner_name] = runner_obj
-                    else:
-                        raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
+                    raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
 
                 # Record step in SQLite before execution
                 step_id = self.store.record_step(phase.id, "implement", active_runner_name)
@@ -967,6 +943,35 @@ class EngineStateMachine:
                     timeout_seconds=inv_timeout,
                 )
                 attempt_wall_s = round(max(0.01, time.monotonic() - attempt_t0), 3)
+
+                # Misconfigured CLI argument error -> mark misconfigured & skip without burning an attempt
+                combined_err = f"{res.stdout}\n{res.stderr}".lower()
+                if res.rc != 0 and any(
+                    pat in combined_err
+                    for pat in (
+                        "cannot be used with",
+                        "unexpected argument",
+                        "unknown option",
+                        "unrecognized arguments",
+                        "invalid argument",
+                        "error: found argument",
+                        "unknown flag",
+                    )
+                ):
+                    implement_attempts = max(0, implement_attempts - 1)
+                    self.store.update_phase(phase.id, attempt=implement_attempts)
+                    self.store.increment_task_counter(task_id, "attempt_count", -1)
+                    self.scheduler.mark_engine_misconfigured(active_runner_name)
+                    self.events.emit(
+                        Event(
+                            kind="runner.misconfigured",
+                            plain_text=f"{active_runner_name} failed argument parsing and was marked misconfigured (not counted as an attempt).",
+                            level="warn",
+                            phase_id=phase.id,
+                            payload={"engine": active_runner_name},
+                        )
+                    )
+                    continue
 
                 # Record A/B samples for enabled token optimizer tools (BLUEPRINT 5g)
                 # Parse token usage from runner output
@@ -1038,11 +1043,22 @@ class EngineStateMachine:
                 if effective_size != phase.size:
                     self.store.update_phase(phase.id, size=effective_size)
 
+                non_split_findings = [f for f in findings if f.guard != "governance_split_required"]
                 for f in findings:
-                    self.store.record_guard_result(phase.id, f.guard, passed=False, detail=f.message)
+                    deferred_split = f.guard == "governance_split_required" and not non_split_findings
+                    self.store.record_guard_result(
+                        phase.id,
+                        f.guard,
+                        passed=deferred_split,
+                        detail=(
+                            "Combined feature+test PR deferred to MergeGate owner approval"
+                            if deferred_split
+                            else f.message
+                        ),
+                    )
 
                 elapsed_min = max(0.01, (time.time() - t0) / 60.0)
-                attempt_ok = bool(res.rc == 0 and ok_deliv and not findings)
+                attempt_ok = bool(res.rc == 0 and ok_deliv and not non_split_findings)
                 self.economics.record_ledger_event(
                     task_id=task_id,
                     role="coder",
@@ -1080,11 +1096,11 @@ class EngineStateMachine:
 
                 # Failure, diff-guard finding, or quota exhaustion -> self-heal / mid-phase handoff
                 self.store.update_engine_stats(active_runner_name, effective_size, success=False, minutes=elapsed_min)
-                failure_reason = "Diff guard failed: " + "; ".join(f.message for f in findings) if findings else deliv_reason if not ok_deliv else res.stderr[:200]
+                failure_reason = "Diff guard failed: " + "; ".join(f.message for f in non_split_findings) if non_split_findings else deliv_reason if not ok_deliv else res.stderr[:200]
                 self.store.update_step(step_id, rc=res.rc, verified=0, detail=failure_reason)
-                if findings:
+                if non_split_findings:
                     diff_guard_retries += 1
-                    findings_summary = "\n".join(f"- [{f.guard}] {f.message}" for f in findings)
+                    findings_summary = "\n".join(f"- [{f.guard}] {f.message}" for f in non_split_findings)
                     prompt_path.write_text(
                         guardrail_header + phase.prompt + f"\n\nDIFF GUARD FINDINGS TO FIX:\n{findings_summary}\n",
                         encoding="utf-8",
@@ -1163,11 +1179,12 @@ class EngineStateMachine:
                 forbidden_globs=contract_forbidden_globs,
                 test_file_snapshots=cur_snapshots,
             )
-            if not findings:
+            non_split_findings = [f for f in findings if f.guard != "governance_split_required"]
+            if not non_split_findings:
                 return None
-            for finding in findings:
+            for finding in non_split_findings:
                 self.store.record_guard_result(phase.id, finding.guard, passed=False, detail=finding.message)
-            reason = "Diff guard failed: " + "; ".join(f.message for f in findings)
+            reason = "Diff guard failed: " + "; ".join(f.message for f in non_split_findings)
             self._park_phase(project.id, phase, reason=reason, next_step="Fix the diff guard findings")
             return {"phase_id": phase.id, "title": phase.title, "runner": active_runner_name, "status": "PARKED", "detail": reason}
 
@@ -1208,6 +1225,7 @@ class EngineStateMachine:
             risk_class=str(cur_task_before_ci.get("risk_class") or pipeline_contract.get("risk_class") or "business_logic"),
             critical_paths=project.critical_paths,
             require_independent_reviewer=self.merge_gate.require_independent_reviewer,
+            require_codex_review=bool(phase.require_codex_review),
         )
 
         for fixer_engine in ci_res.contributing_engines:
@@ -1518,6 +1536,7 @@ class EngineStateMachine:
                 reviewer_engine=ci_res.reviewer_engine or None,
                 reviewer_tier=ci_res.reviewer_tier or None,
                 critical_paths=project.critical_paths,
+                require_codex_review=phase.require_codex_review,
             )
             if auth.effective_risk_class and fresh_task.get("risk_class") != auth.effective_risk_class:
                 self.store.update_task_fields(task_id, risk_class=auth.effective_risk_class)
@@ -1531,7 +1550,11 @@ class EngineStateMachine:
                 next_action = (
                     "Owner review and approval required before merge"
                     if auth.block_reason == "awaiting_owner_approval"
-                    else "Resolve MergeGate finding and re-verify"
+                    else (
+                        "Approve combined feature + test PR in Needs your attention"
+                        if auth.block_reason == "awaiting_combined_governance_approval"
+                        else "Resolve MergeGate finding and re-verify"
+                    )
                 )
                 cur_task = self.store.get_task(task_id)
                 if cur_task and cur_task["status"] != "BLOCKED":
@@ -1731,6 +1754,36 @@ class EngineStateMachine:
             "detail": detail,
         }
 
+    def _resolve_runner(self, engine_name: str) -> Runner | None:
+        """Return (constructing and caching if needed) the runner for a configured engine."""
+        runner_obj = self.runners.get(engine_name)
+        if runner_obj:
+            return runner_obj
+        engines = self.store.list_engines()
+        eng_row = next((e for e in engines if e["id"] == engine_name), None) or next(
+            (e for e in engines if e["runner"] == engine_name), None
+        )
+        if not eng_row:
+            return None
+        runner_type = eng_row.get("runner", "")
+        if runner_type and runner_type in self.runners:
+            runner_obj = self.runners[runner_type]
+        else:
+            env = self.scheduler.router.build_isolated_environment(eng_row["id"])
+            try:
+                patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
+            except Exception:
+                patterns = []
+            runner_obj = TemplateRunner(
+                eng_row["runner"],
+                eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
+                quota_ledger=self.quota,
+                quota_patterns=patterns,
+                env=env,
+            )
+        self.runners[engine_name] = runner_obj
+        return runner_obj
+
     @staticmethod
     def _uses_circleci_main_check(project: ProjectConfig) -> bool:
         """True when the project's main build runs on CircleCI only (no GitHub Actions workflows).
@@ -1793,9 +1846,48 @@ class EngineStateMachine:
         lease_token: str | None = None,
     ) -> dict[str, Any]:
         """Resume post-merge delivery without repeating implementation, merge, or release."""
+        prior = self.store.get_phase(phase.id) or {}
+        plan = self.store.get_plan(str(prior.get("plan_id") or "")) if prior.get("plan_id") else None
+        task = self.store.get_task_by_branch(phase.branch) or self.store.get_task(f"task-{phase.id}")
+        merged_at = str(merged_pr.get("mergedAt") or "").strip()
+        plan_created = str((plan or {}).get("created_at") or "").strip()
+        has_merge_intent = False
+        if task is not None:
+            ops = self.store.list_remote_operations(task_id=str(task["id"]))
+            has_merge_intent = any(op.get("op_type") in ("pr_merge", "pr_create") for op in ops)
+
+        is_historic_merge = (
+            bool(merged_pr.get("historic"))
+            or (bool(merged_at and plan_created) and merged_at < plan_created)
+            or (
+                runner == "none"
+                and prior.get("status") == "pending"
+                and not prior.get("started_at")
+                and not has_merge_intent
+            )
+        )
+        if is_historic_merge:
+            self.store.update_phase(phase.id, status="merged", pr_number=merged_pr.get("number"))
+            detail = f"historic merge, no delivery (PR #{merged_pr.get('number')})"
+            self.events.emit(
+                Event(
+                    kind="phase.skipped",
+                    plain_text=f"Skipping {phase.title}: {detail}.",
+                    level="info",
+                    phase_id=phase.id,
+                    payload={"project_id": project.id},
+                )
+            )
+            return {
+                "phase_id": phase.id,
+                "title": phase.title,
+                "runner": runner,
+                "status": "SKIPPED",
+                "detail": detail,
+            }
+
         self.store.update_phase(phase.id, status="verifying_build", pr_number=merged_pr.get("number"))
         merge_sha = (merged_pr.get("mergeCommit") or {}).get("oid")
-        task = self.store.get_task_by_branch(phase.branch) or self.store.get_task(f"task-{phase.id}")
         acquired_temp_lease: str | None = None
         temp_heartbeat: LeaseHeartbeat | None = None
         rel_work_tmp: Path | None = None

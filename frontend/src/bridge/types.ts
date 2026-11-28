@@ -30,6 +30,7 @@ export interface ModuleBadgeState {
 
 export type NeedAttentionActionKind =
   | "approve_task"
+  | "approve_combined_governance"
   | "rollback_release"
   | "configure_smoke_test"
   | "open_settings"
@@ -154,6 +155,7 @@ export interface PlanPhase {
   timeout_minutes: number;
   auto_merge: boolean;
   release_after_merge: boolean;
+  require_codex_review?: boolean;
   force_rerun?: boolean;
   position?: number;
   implementer?: string;

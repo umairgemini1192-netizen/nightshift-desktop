@@ -106,7 +106,7 @@ SEED_ENGINES: list[dict[str, Any]] = [
         "cost_tier": TIER_STANDARD,
         "skills": {"review": 5, "plan": 4, "fix_ci": 4, "backend": 4, "ui": 3, "docs": 3},
         "budget": {"max_runs_today": 25},
-        "command_template": ["codex", "exec", "--sandbox", "workspace-write", "--approve-for-me", "{instruction}", "--model", "{model}"],
+        "command_template": ["codex", "exec", "--approve-for-me", "{instruction}", "--model", "{model}"],
         "quota_patterns": ["rate limit", "usage limit", "429"],
     },
     {
