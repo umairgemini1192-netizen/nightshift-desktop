@@ -247,6 +247,10 @@ class EngineStateMachine:
         self._network_backoff_seconds = network_backoff_seconds
         self._lease_seconds = lease_seconds
         self._lease_heartbeat_interval = lease_heartbeat_interval
+        # Post-merge CircleCI main check polling (injectable for tests).
+        self._ci_poll_seconds = 30.0
+        self._ci_poll_sleep: Callable[[float], None] = time.sleep
+        self._ci_clock: Callable[[], float] = time.monotonic
         # Single mandatory merge-gate chokepoint (AGENT_PIPELINE §1).
         # Conditional auto-merge for eligible classes unlocks when pipeline.conditionalAutoMerge is enabled.
         if merge_gate is not None:
@@ -1727,6 +1731,58 @@ class EngineStateMachine:
             "detail": detail,
         }
 
+    @staticmethod
+    def _uses_circleci_main_check(project: ProjectConfig) -> bool:
+        """True when the project's main build runs on CircleCI only (no GitHub Actions workflows).
+
+        Explicit opt-in: ``release_workflow`` set to "circleci". Otherwise auto-detected from the
+        local checkout: ``.circleci/config.yml`` present and no ``.github/workflows`` directory.
+        """
+        if str(project.release_workflow or "").strip().lower() == "circleci":
+            return True
+        root = Path(project.local_path)
+        return (root / ".circleci" / "config.yml").is_file() and not (root / ".github" / "workflows").is_dir()
+
+    def _wait_for_circleci_main(
+        self,
+        project: ProjectConfig,
+        merge_sha: str,
+        *,
+        timeout_seconds: float = 3600.0,
+    ) -> tuple[bool | None, str]:
+        """Wait for every required CircleCI job on the exact merge commit.
+
+        Returns (True, msg) when all required jobs succeeded on ``merge_sha``; (False, msg) when a
+        required job finished unsuccessfully; (None, msg) when the result could not be determined
+        before the timeout (missing, still running, or bound to another commit).
+        """
+        required = [str(j) for j in project.required_ci_jobs]
+        if not merge_sha:
+            return None, "Merged commit SHA is required"
+        if not required:
+            return None, "No required CircleCI jobs configured for this project"
+        start = self._ci_clock()
+        pending: list[str] = list(required)
+        while True:
+            try:
+                observed = self.vcs.get_commit_ci_checks(project.repo, merge_sha, branch="main")
+            except Exception as exc:  # transient API/network error: keep waiting
+                observed = []
+                logger.warning("CircleCI main check lookup failed for %s: %s", merge_sha[:7], exc)
+            by_name = {j.name: j for j in observed if j.commit_sha == merge_sha}
+            failed = [
+                name for name in required
+                if name in by_name and by_name[name].status in ("failed", "canceled", "cancelled", "error", "skipped")
+            ]
+            if failed:
+                return False, f"CircleCI job(s) failed on main {merge_sha[:7]}: {', '.join(failed)}"
+            pending = [name for name in required if name not in by_name or by_name[name].status != "success"]
+            if not pending:
+                return True, f"All {len(required)} required CircleCI jobs passed on main {merge_sha[:7]}"
+            if self._ci_clock() - start >= timeout_seconds:
+                return None, f"CircleCI jobs not finished on main {merge_sha[:7]}: {', '.join(pending)}"
+            self._ci_poll_sleep(self._ci_poll_seconds)
+
     def _finish_merged_delivery(
         self,
         project: ProjectConfig,
@@ -1763,7 +1819,12 @@ class EngineStateMachine:
                     interval_seconds=self._lease_heartbeat_interval,
                 ).start()
 
-            ok, msg, run_id = self.vcs.watch_workflow_run(project.repo, branch="main", workflow=project.release_workflow, timeout_seconds=3600, commit_sha=merge_sha)
+            circleci_main = self._uses_circleci_main_check(project)
+            if circleci_main:
+                ok, msg = self._wait_for_circleci_main(project, str(merge_sha), timeout_seconds=3600)
+                run_id = None
+            else:
+                ok, msg, run_id = self.vcs.watch_workflow_run(project.repo, branch="main", workflow=project.release_workflow, timeout_seconds=3600, commit_sha=merge_sha)
             if ok is False:
                 reverted, revert_msg = self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
                 if reverted:
@@ -1795,7 +1856,7 @@ class EngineStateMachine:
                             )
                     return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": revert_msg}
                 raise RuntimeError(f"Main build failed: {msg}")
-            if ok is not True or run_id is None:
+            if ok is not True or (run_id is None and not circleci_main):
                 raise RuntimeError(f"Could not verify main build: {msg}")
 
             # Post-merge exact merge_sha CI evidence verification (Amendment F / Phase 8d)
@@ -1878,6 +1939,13 @@ class EngineStateMachine:
                     payload={"project_id": project.id},
                 ))
                 return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "COMPLETED", "detail": f"Merged PR #{merged_pr.get('number')}; main build passed"}
+            if circleci_main:
+                # Releases are built from a GitHub Actions run's artifacts; publishing from CircleCI
+                # artifacts is not supported yet, so fail closed instead of releasing unverified files.
+                raise RuntimeError(
+                    "Release after merge is not supported for CircleCI-built projects yet; "
+                    "main build passed on CircleCI, release left to the owner"
+                )
             self.store.update_phase(phase.id, status="releasing")
 
             # Durable release reconciliation via remote_operations outbox (AGENT_PIPELINE §4)
