@@ -5,6 +5,7 @@ Implements BLUEPRINT sections 5a, 5c, 5d, 5e, and 5h.
 
 from __future__ import annotations
 
+import logging
 import json
 import statistics
 from dataclasses import dataclass, field
@@ -17,6 +18,8 @@ from nightshift.engine.router import Router
 from nightshift.engine.vcs import GitGhClient
 from nightshift.quota.ledger import QuotaLedger
 from nightshift.store import Store
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PRIORITY_LIST = [
     {"position": 1, "engine": "agy", "model": "", "effort": "medium"},
@@ -398,7 +401,11 @@ class Scheduler:
 
         # 2. Checkpoint commit and push
         target_branch = branch or phase_id
-        checkpoint_sha = vcs.create_checkpoint_commit_and_push(worktree_dir, target_branch, commit_msg)
+        try:
+            checkpoint_sha = vcs.create_checkpoint_commit_and_push(worktree_dir, target_branch, commit_msg)
+        except Exception as exc:  # handoff must still happen when the push fails (e.g. flaky network)
+            logger.warning("Handoff checkpoint failed for %s: %s", phase_id, exc)
+            checkpoint_sha = None
         sha_str = checkpoint_sha or "uncommitted"
 
         # 3. Write .nightshift/handoff.md

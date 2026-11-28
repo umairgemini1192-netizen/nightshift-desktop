@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import json
 import re
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ from nightshift.engine.verify import RiskAssessment, check_diff_guards
 from nightshift.quota.usage import parse_cli_usage
 from nightshift.runners.base import Runner, RunnerResult
 from nightshift.store import Store
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -853,7 +856,10 @@ class CiPipelineManager:
             sha_after = self.vcs.remote_branch_sha(local_repo, branch)
             if not sha_after or sha_after == sha_before:
                 # Try checkpointing uncommitted work if runner forgot to push
-                self.vcs.create_checkpoint_commit_and_push(worktree_dir, branch, f"nightshift: auto-fix round {round_num + 1}")
+                try:
+                    self.vcs.create_checkpoint_commit_and_push(worktree_dir, branch, f"nightshift: auto-fix round {round_num + 1}")
+                except Exception as exc:  # a failed checkpoint (e.g. flaky network) must not abort the heal loop
+                    logger.warning("Could not checkpoint auto-fix round %s: %s", round_num + 1, exc)
 
         return CiWatchResult(
             passed=False,
