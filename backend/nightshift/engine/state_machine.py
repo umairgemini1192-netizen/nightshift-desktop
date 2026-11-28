@@ -973,7 +973,6 @@ class EngineStateMachine:
                 success = res.rc == 0
 
                 # Record A/B samples for all enabled tools
-                from nightshift.optimizer.tool_manager import ToolManager
                 tm = ToolManager(store=self.store)
                 enabled_tools = []
                 for spec in tm.list_specs():
