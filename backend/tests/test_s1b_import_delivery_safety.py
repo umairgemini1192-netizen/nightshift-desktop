@@ -618,3 +618,98 @@ def test_governance_guard_rejects_changed_assertion_of_equal_count() -> None:
     before = 'def test_value():\n    assert value == 42\n'
     after = 'def test_value():\n    assert value is not None\n'
     assert detect_python_assertion_relaxation('test_example.py', before, after)
+
+
+# ---------------------------------------------------------------------------
+# Codex review findings on PR #35 (a8d6ec1): regression tests
+# ---------------------------------------------------------------------------
+
+def test_new_task_carries_phase_codex_requirement(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    store.create_project("owner/repo", "Test", "owner/repo", str(tmp_path))
+    store.create_plan("plan-1", "owner/repo", "Plan 1")
+    store.upsert_phase(phase_id="p-cx", plan_id="plan-1", title="P", branch="feat/p-cx")
+    sm = EngineStateMachine(
+        store=store, event_bus=EventBus(store), quota_ledger=QuotaLedger(store),
+        vcs=FakeGitGh(), runners={"agy": FakeRunner("agy")},
+    )
+    phase = PhaseDefinition(id="p-cx", title="P", branch="feat/p-cx", require_codex_review=True)
+    proj_cfg = ProjectConfig(id="owner/repo", name="Test", repo="owner/repo", local_path=tmp_path, output_dir=tmp_path / "out")
+    task, _contract = sm._ensure_pipeline_task(proj_cfg, phase, "plan-1")
+    assert bool(task["require_codex_review"]) is True
+
+
+def test_ci_stage_receives_phase_codex_requirement() -> None:
+    import inspect
+
+    from nightshift.engine import state_machine as sm_mod
+
+    src = inspect.getsource(sm_mod.EngineStateMachine)
+    call = src[src.index("self.ci_pipeline.watch_and_heal("):]
+    call = call[: call.index("\n        )")]
+    assert "require_codex_review=bool(phase.require_codex_review)" in call
+
+
+@pytest.mark.asyncio
+async def test_required_codex_review_is_enforced_even_without_independent_reviewer(tmp_path: Path) -> None:
+    from nightshift.engine.ci import CiPipelineManager
+    from nightshift.engine.scheduler import Scheduler
+    from nightshift.engine.verify import RiskAssessment
+
+    with Store(tmp_path / "cx.db") as store:
+        store.migrate()
+        _proj, _task, contract_row = _seed_project_and_task(store, tmp_path, risk_class="ui_cosmetic")
+        vcs = FakeGitGh()
+        vcs.add_pr("feat/p1", number=101)
+        sched = Scheduler(store, QuotaLedger(store))
+        # No Codex runner available: a required Codex review must block, not be skipped.
+        ci_mgr = CiPipelineManager(vcs, store, sched, {"agy": FakeRunner.success("agy")})
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        res = await ci_mgr.watch_and_heal(
+            repo="owner/repo", local_repo=tmp_path, worktree_dir=wt, phase_id="p1",
+            phase_title="Phase 1", branch="feat/p1", pr_number=101, initial_engine="agy",
+            risk=RiskAssessment(level="low"),
+            task_contract=contract_row,
+            require_independent_reviewer=False,
+            require_codex_review=True,
+        )
+        assert res.passed is False
+        assert res.block_reason == "codex_review_required"
+
+
+def test_deck_offers_combined_governance_approval_with_exact_head(tmp_path: Path) -> None:
+    from nightshift.engine.deck import generate_deck_data
+
+    store = _make_store(tmp_path)
+    _proj, task, _contract = _seed_project_and_task(store, tmp_path)
+    store.update_task_fields(
+        str(task["id"]), status="BLOCKED", blocked_from_status="REVIEWING", head_sha="abc1234def",
+        block_reason="awaiting_combined_governance_approval", block_detail="Combined PR", pr_number=35,
+    )
+    deck = generate_deck_data(store, "owner/repo")
+    items = [i for i in deck["needs_you"] if i.get("task_id") == str(task["id"])]
+    assert items, deck["needs_you"]
+    assert items[0]["action_kind"] == "approve_combined_governance"
+    assert items[0]["head_sha"] == "abc1234def"
+    assert items[0]["pr_number"] == 35
+
+
+@pytest.mark.asyncio
+async def test_triage_uses_the_tasks_own_project_ladder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nightshift.engine import pipeline_triage
+
+    store = _make_store(tmp_path)
+    _seed_project_and_task(store, tmp_path, project_id="owner/repo")
+    store.create_project("other/repo", "Other", "other/repo", str(tmp_path))  # second project
+    seen: list[str | None] = []
+
+    def _spy(st: Any = None, project_id: str | None = None) -> list[str]:
+        seen.append(project_id)
+        return []
+
+    monkeypatch.setattr(pipeline_triage, "get_small_job_ladder", _spy)
+    await pipeline_triage.run_triage_stage(
+        failing_log="E   AssertionError", workdir=tmp_path, runners={}, store=store, task_id="task-p1",
+    )
+    assert seen == ["owner/repo"]

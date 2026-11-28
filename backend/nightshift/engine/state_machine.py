@@ -611,6 +611,7 @@ class EngineStateMachine:
             allowed_globs=list(phase.allowed_globs),
             forbidden_globs=list(phase.forbidden_globs) if phase.forbidden_globs is not None else None,
             owner_approval_required=phase.owner_approval_required,
+            require_codex_review=bool(phase.require_codex_review),
         )
 
     def _safe_task_transition(
@@ -1249,6 +1250,7 @@ class EngineStateMachine:
             risk_class=str(cur_task_before_ci.get("risk_class") or pipeline_contract.get("risk_class") or "business_logic"),
             critical_paths=project.critical_paths,
             require_independent_reviewer=self.merge_gate.require_independent_reviewer,
+            require_codex_review=bool(phase.require_codex_review),
         )
 
         for fixer_engine in ci_res.contributing_engines:

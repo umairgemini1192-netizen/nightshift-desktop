@@ -253,7 +253,8 @@ async def run_triage_stage(
     remains, falls back deterministically without running any ineligible engine.
     """
     prompt = build_triage_prompt(failing_log, job_name=job_name)
-    ladder = get_small_job_ladder(store)
+    project_id = store.get_task_project_id(task_id) if (store is not None and task_id) else None
+    ladder = get_small_job_ladder(store, project_id)
     economics = PipelineEconomics(store) if store is not None else None
     norm_risk = (risk_class or "business_logic").strip().lower()
 

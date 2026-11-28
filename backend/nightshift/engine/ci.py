@@ -279,7 +279,7 @@ class CiPipelineManager:
                         else bool((task_row or {}).get("require_codex_review", 0))
                     )
 
-                    if require_independent_reviewer and (classification.requires_independent_review or must_codex_review):
+                    if must_codex_review or (require_independent_reviewer and classification.requires_independent_review):
                         if must_codex_review:
                             codex_runner = self.runners.get("codex")
                             if "openai" in all_contributing_providers or codex_runner is None:
