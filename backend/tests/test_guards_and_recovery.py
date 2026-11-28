@@ -594,7 +594,10 @@ async def test_resumed_and_fixed_heads_obey_diff_guards(tmp_path: Path, after_ci
         if after_ci:
             engine.ci_pipeline.watch_and_heal = introduce_bad_diff
         project = ProjectConfig(id="guard", name="Guard", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
-        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch("nightshift.engine.state_machine.SingleInstanceLock") as lock:
+        wt_dir = tmp_path / "wt"
+        wt_dir.mkdir(parents=True, exist_ok=True)
+        vcs.prepare_worktree(tmp_path, wt_dir, "feat/p1")
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", wt_dir), patch("nightshift.engine.state_machine.SingleInstanceLock") as lock:
             lock.return_value.acquire.return_value = True
             rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1")], plan_id="plan")
         assert rows[0]["status"] == "PARKED"
