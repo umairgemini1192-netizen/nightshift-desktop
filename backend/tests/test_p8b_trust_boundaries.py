@@ -524,9 +524,13 @@ async def test_state_machine_creates_task_contract_and_blocks_autonomous_merge_b
             vcs.add_pr("feat/p8b-demo", number=777, head_sha="sha_verified_777")
             vcs.changed_files["feat/p8b-demo"] = ["src/feature.py"]
 
+        from nightshift.runners.base import RunnerResult
         runners = {
             "agy": FakeRunner(name="agy", on_call=on_call),
-            "codex": FakeRunner.success("codex"),
+            "codex": FakeRunner(
+                name="codex",
+                responses=[RunnerResult(rc=0, stdout='{"verdict":"APPROVE","summary":"OK","findings":[]}', stderr="")],
+            ),
         }
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
         # Default MergeGate has autonomous_merge_enabled=False!

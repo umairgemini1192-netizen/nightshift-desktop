@@ -675,8 +675,17 @@ async def test_e2e_crash_mid_merged_zero_duplicate_releases_and_partial_release_
         )
         store.update_task_fields("task-p1", status="MERGED", merge_sha="merge_88")
 
+        from nightshift.engine.release import SmokeTestResult
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
-        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={}, login_checker=logins)
+        engine = EngineStateMachine(
+            store,
+            EventBus(store),
+            quota,
+            vcs=vcs,
+            runners={},
+            login_checker=logins,
+            smoke_runner=lambda cmd, art, tag, to: SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T00:00:00Z"),
+        )
         project = ProjectConfig(
             id="p",
             name="P",
@@ -685,6 +694,7 @@ async def test_e2e_crash_mid_merged_zero_duplicate_releases_and_partial_release_
             output_dir=tmp_path / "out",
             release_workflow="Desktop build",
             artifact_glob="*.zip",
+            smoke_command="nightshift-desktop-selftest",
         )
         rows = await engine.execute_plan(
             project,
@@ -722,8 +732,17 @@ async def test_e2e_crash_mid_merged_zero_duplicate_releases_and_partial_release_
         )
         store.update_task_fields("task-p2", status="MERGED", merge_sha="merge_89")
 
+        from nightshift.engine.release import SmokeTestResult
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
-        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={}, login_checker=logins)
+        engine = EngineStateMachine(
+            store,
+            EventBus(store),
+            quota,
+            vcs=vcs,
+            runners={},
+            login_checker=logins,
+            smoke_runner=lambda cmd, art, tag, to: SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T00:00:00Z"),
+        )
         project = ProjectConfig(
             id="p",
             name="P",
@@ -732,6 +751,7 @@ async def test_e2e_crash_mid_merged_zero_duplicate_releases_and_partial_release_
             output_dir=tmp_path / "out",
             release_workflow="Desktop build",
             artifact_glob="*.zip",
+            smoke_command="nightshift-desktop-selftest",
         )
         rows = await engine.execute_plan(
             project,
@@ -958,6 +978,7 @@ async def test_lease_heartbeat_renews_during_blocking_ci_and_main_build_watches(
         vcs = BlockingWatchVcs()
         vcs.add_pr("feat/p-block", number=502, head_sha="sha_502")
 
+        from nightshift.engine.release import SmokeTestResult
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
         engine = EngineStateMachine(
             store,
@@ -969,6 +990,7 @@ async def test_lease_heartbeat_renews_during_blocking_ci_and_main_build_watches(
             merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
             lease_seconds=1,
             lease_heartbeat_interval=0.2,
+            smoke_runner=lambda cmd, art, tag, to: SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T00:00:00Z"),
         )
         renew_calls: list[str] = []
         orig_renew = engine.task_orchestrator.renew_lease
@@ -985,6 +1007,7 @@ async def test_lease_heartbeat_renews_during_blocking_ci_and_main_build_watches(
             output_dir=tmp_path / "out",
             release_workflow="Desktop build",
             artifact_glob="*.zip",
+            smoke_command="nightshift-desktop-selftest",
         )
         with (
             patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"),

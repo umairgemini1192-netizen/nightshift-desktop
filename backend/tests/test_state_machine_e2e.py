@@ -71,6 +71,7 @@ async def test_full_multi_phase_execution_and_digest(tmp_path: Path) -> None:
             output_dir=output_dir,
             release_workflow="Desktop build",
             artifact_glob="*.zip",
+            smoke_command="nightshift-desktop-selftest",
         )
         project.local_path.mkdir(parents=True, exist_ok=True)
 
@@ -83,6 +84,7 @@ async def test_full_multi_phase_execution_and_digest(tmp_path: Path) -> None:
         mock_login_runner = lambda cmd, to: (0, "Logged in to github.com\nOK", "", False)
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=mock_login_runner)
 
+        from nightshift.engine.release import SmokeTestResult
         engine = EngineStateMachine(
             store=store,
             event_bus=events,
@@ -91,6 +93,7 @@ async def test_full_multi_phase_execution_and_digest(tmp_path: Path) -> None:
             runners=runners,
             login_checker=logins,
             merge_gate=MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False),
+            smoke_runner=lambda cmd, art, tag, to: SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T00:00:00Z"),
         )
 
         with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt_root"):
@@ -211,8 +214,12 @@ async def test_crash_recovery_resumes_cleanly(tmp_path: Path) -> None:
         mock_login_runner = lambda cmd, to: (0, "Logged in to github.com\nOK", "", False)
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=mock_login_runner)
 
+        from nightshift.runners.base import RunnerResult
         runner = FakeRunner.success("agy")
-        reviewer = FakeRunner.success("codex")
+        reviewer = FakeRunner(
+            name="codex",
+            responses=[RunnerResult(rc=0, stdout='{"verdict":"APPROVE","summary":"OK","findings":[]}', stderr="")],
+        )
         engine = EngineStateMachine(
             store=store,
             event_bus=events,
@@ -309,9 +316,27 @@ async def test_merged_phase_resumes_pending_release(tmp_path: Path) -> None:
         quota = QuotaLedger(store)
         vcs = FakeGitGh()
         vcs.merged_prs["feat/p1"] = {"number": 502, "mergeCommit": {"oid": "merge-sha"}}
-        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs)
-        project = ProjectConfig(id="resume", name="Resume", repo="o/r", local_path=tmp_path, output_dir=tmp_path / "out")
-        with patch.object(engine.release_mgr, "publish_verified_release", return_value=("v1", [])) as publish:
+        from nightshift.engine.release import SmokeTestResult
+        engine = EngineStateMachine(
+            store,
+            EventBus(store),
+            quota,
+            vcs=vcs,
+            smoke_runner=lambda cmd, art, tag, to: SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T00:00:00Z"),
+        )
+        out_dir = tmp_path / "out"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        fake_art = out_dir / "NightShift-test.zip"
+        fake_art.write_bytes(b"PK\x03\x04ok")
+        project = ProjectConfig(
+            id="resume",
+            name="Resume",
+            repo="o/r",
+            local_path=tmp_path,
+            output_dir=out_dir,
+            smoke_command="nightshift-desktop-selftest",
+        )
+        with patch.object(engine.release_mgr, "publish_verified_release", return_value=("v1", [fake_art])) as publish:
             rows = await engine.execute_plan(project, [PhaseDefinition(id="p1", title="P1", branch="feat/p1", release_after_merge=True)])
         assert rows[0]["status"] == "COMPLETED"
         assert store.get_phase("p1")["status"] == "completed"

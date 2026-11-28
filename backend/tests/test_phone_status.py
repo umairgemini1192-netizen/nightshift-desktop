@@ -378,9 +378,13 @@ def test_urgent_engine_events_trigger_phone_status_immediately(tmp_path) -> None
     def on_call(_prompt: str, _wd: Any, _model: Any, _effort: str) -> None:
         vcs.add_pr("feat/p1", number=77)
 
+    from nightshift.runners.base import RunnerResult
     runners = {
         "agy": FakeRunner(name="agy", on_call=on_call),
-        "codex": FakeRunner.success("codex"),
+        "codex": FakeRunner(
+            name="codex",
+            responses=[RunnerResult(rc=0, stdout='{"verdict":"APPROVE","summary":"OK","findings":[]}', stderr="")],
+        ),
     }
     logins = LoginHealthChecker(
         store=store,

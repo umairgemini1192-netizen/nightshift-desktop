@@ -23,16 +23,72 @@ def generate_deck_data(
     proj = store.get_project(project_id)
     proj_name = proj.get("name", project_id) if proj else project_id
 
-    # 1. Inspect parked phases and alerts for 'needs_you'
+    # 1. Inspect parked phases, blocked pipeline tasks, and failed release smoke tests for 'needs_you'
     parked = store.list_parked()
     needs_you: list[dict[str, str]] = []
-    for p in parked[:3]:
+    seen_ids: set[str] = set()
+
+    for task in store.list_tasks(status="BLOCKED"):
+        if len(needs_you) >= 3:
+            break
+        block_reason = str(task.get("block_reason") or "")
+        phase_id = str(task.get("phase_id") or task.get("id") or "")
+        if block_reason == "awaiting_owner_approval":
+            risk_label = str(task.get("risk_class") or "high_risk").replace("_", " ").capitalize()
+            pr_num = task.get("pr_number")
+            pr_str = f" PR #{pr_num}" if pr_num else ""
+            needs_you.append({
+                "phase_id": phase_id,
+                "task_id": str(task["id"]),
+                "headline": f"{risk_label}{pr_str} needs your approval before merge",
+                "detail": str(task.get("block_detail") or "Explicit owner approval is required for this risk class."),
+                "action": "Review & Approve",
+            })
+            seen_ids.add(phase_id)
+        elif block_reason in ("smoke_test_failed", "smoke_test_unavailable"):
+            tag = str(task.get("release_tag") or "")
+            tag_str = f" ({tag})" if tag else ""
+            needs_you.append({
+                "phase_id": phase_id,
+                "task_id": str(task["id"]),
+                "headline": f"Release smoke test blocked{tag_str}",
+                "detail": str(task.get("block_detail") or "Post-release verification did not pass."),
+                "action": "Roll back release" if block_reason == "smoke_test_failed" else "Configure smoke test",
+            })
+            seen_ids.add(phase_id)
+
+    for rel in store.list_release_verifications(limit=5):
+        if len(needs_you) >= 3:
+            break
+        if str(rel.get("smoke_status") or "") == "failed":
+            rel_key = f"release:{rel['tag']}"
+            if rel_key not in seen_ids:
+                prev_tag = rel.get("previous_good_tag")
+                detail = str(rel.get("smoke_detail") or "Post-release smoke test failed.")
+                if prev_tag:
+                    detail += f" Previous good release: {prev_tag}."
+                needs_you.append({
+                    "phase_id": rel_key,
+                    "release_tag": str(rel["tag"]),
+                    "headline": f"Release {rel['tag']} failed launch smoke test",
+                    "detail": detail,
+                    "action": "Roll back release",
+                })
+                seen_ids.add(rel_key)
+
+    for p in parked:
+        if len(needs_you) >= 3:
+            break
+        pid = str(p["phase_id"])
+        if pid in seen_ids:
+            continue
         needs_you.append({
-            "phase_id": str(p["phase_id"]),
+            "phase_id": pid,
             "headline": f"Phase {p['phase_id']} is parked",
             "detail": str(p.get("reason", "Needs attention")),
             "action": str(p.get("next_step", "Inspect logs and resume")),
         })
+        seen_ids.add(pid)
 
     # 2. Phases status for 'done_tonight' and 'next'
     all_phases = store.list_phases()

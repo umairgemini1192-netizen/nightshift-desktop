@@ -86,7 +86,10 @@ async def test_diff_guard_self_heal_sends_findings_back_to_implementer(tmp_path:
                 if task_row is not None:
                     store.record_task_owner_approval(task_row["id"], "owner", vcs.prs["feat/p1"]["headRefOid"])
 
-        reviewer = FakeRunner.success("codex")
+        reviewer = FakeRunner(
+            name="codex",
+            responses=[RunnerResult(rc=0, stdout='{"verdict":"APPROVE","summary":"OK","findings":[]}', stderr="")],
+        )
         runners = {"agy": FakeRunner(name="agy", on_call=on_call), "codex": reviewer}
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
         engine = EngineStateMachine(
@@ -121,7 +124,13 @@ async def test_hard_guard_no_push_to_main(tmp_path: Path) -> None:
         events = EventBus(store)
         quota = QuotaLedger(store)
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
-        engine = EngineStateMachine(store, events, quota, vcs=vcs, runners={"agy": FakeRunner.success("agy")}, login_checker=logins)
+        codex_ok = FakeRunner(
+            name="codex",
+            responses=[RunnerResult(rc=0, stdout='{"verdict":"APPROVE","summary":"OK","findings":[]}', stderr="")],
+        )
+        engine = EngineStateMachine(
+            store, events, quota, vcs=vcs, runners={"agy": FakeRunner.success("agy"), "codex": codex_ok}, login_checker=logins
+        )
         project = ProjectConfig(id="p_main", name="MainGuard", repo="o/r", local_path=tmp_path / "repo", output_dir=tmp_path / "out")
         project.local_path.mkdir()
         phases = [PhaseDefinition(id="p1", title="Bad Phase", branch="main", prompt="Never push main")]
@@ -151,7 +160,13 @@ async def test_hard_guard_exact_head_sha_before_merge(tmp_path: Path) -> None:
             return ok, msg
 
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
-        engine = EngineStateMachine(store, events, quota, vcs=vcs, runners={"agy": FakeRunner.success("agy")}, login_checker=logins)
+        codex_ok = FakeRunner(
+            name="codex",
+            responses=[RunnerResult(rc=0, stdout='{"verdict":"APPROVE","summary":"OK","findings":[]}', stderr="")],
+        )
+        engine = EngineStateMachine(
+            store, events, quota, vcs=vcs, runners={"agy": FakeRunner.success("agy"), "codex": codex_ok}, login_checker=logins
+        )
 
         orig_watch_and_heal = engine.ci_pipeline.watch_and_heal
 
@@ -563,7 +578,13 @@ async def test_resumed_and_fixed_heads_obey_diff_guards(tmp_path: Path, after_ci
             vcs.changed_files["feat/p1"] = ["tests/t.py"]
         quota = QuotaLedger(store)
         logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
-        engine = EngineStateMachine(store, EventBus(store), quota, vcs=vcs, runners={"agy": FakeRunner.success("agy")}, login_checker=logins)
+        codex_ok = FakeRunner(
+            name="codex",
+            responses=[RunnerResult(rc=0, stdout='{"verdict":"APPROVE","summary":"OK","findings":[]}', stderr="")],
+        )
+        engine = EngineStateMachine(
+            store, EventBus(store), quota, vcs=vcs, runners={"agy": FakeRunner.success("agy"), "codex": codex_ok}, login_checker=logins
+        )
         original = engine.ci_pipeline.watch_and_heal
         async def introduce_bad_diff(*args, **kwargs):
             result = await original(*args, **kwargs)
