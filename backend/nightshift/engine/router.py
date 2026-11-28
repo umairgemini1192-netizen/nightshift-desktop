@@ -22,6 +22,14 @@ from pathlib import Path
 from typing import Any
 
 from nightshift.engine.credentials import get_credential_store, redact_known_secrets
+from nightshift.engine.pipeline_contracts import provider_for_engine
+from nightshift.engine.pipeline_economics import (
+    PipelineEconomics,
+    is_free_only_engine,
+    min_threshold_for_risk,
+)
+from nightshift.engine.pipeline_review import STRONG_TIERS, tier_for_engine
+from nightshift.events import Event, EventBus
 from nightshift.quota.ledger import QuotaLedger
 from nightshift.runners.base import run_subprocess_with_timeout
 from nightshift.store import Store
@@ -221,8 +229,24 @@ class RouterDecision:
     exhausted: bool = False
 
 
+@dataclass(frozen=True)
+class PipelineRouteDecision:
+    """Deterministic risk-based pipeline routing result (AGENT_PIPELINE §6.2)."""
+
+    blocked: bool
+    chosen_id: str = ""
+    runner: str = ""
+    model: str = ""
+    effort: str = "medium"
+    cost_tier: str = TIER_STANDARD
+    provider: str = ""
+    reason: str = ""
+    warning: str = ""
+    excluded_reasons: dict[str, str] = field(default_factory=dict)
+
+
 class Router:
-    """Smart quota-aware router implementing BLUEPRINT 5a, 5c, and 5h."""
+    """Smart quota-aware router implementing BLUEPRINT 5a, 5c, 5h and AGENT_PIPELINE §6.2."""
 
     def __init__(
         self,
@@ -230,15 +254,33 @@ class Router:
         quota_ledger: QuotaLedger,
         login_checker: Any | None = None,
         cred_store: Any | None = None,
+        events: EventBus | None = None,
+        runners: dict[str, Any] | None = None,
     ) -> None:
         self.store = store
         self.quota_ledger = quota_ledger
         self.login_checker = login_checker
         self.cred_store = cred_store or get_credential_store()
+        self.events = events
+        self.economics = PipelineEconomics(store, events)
+        self._fake_runners: set[str] = set()
+        if runners:
+            self.register_runners(runners)
         seed_default_engines(store)
+
+    def register_runners(self, runners: dict[str, Any]) -> None:
+        """Register injected FakeRunner instances (and subclasses) so offline tests do not depend on host PATH."""
+        for key, runner_obj in (runners or {}).items():
+            if any(cls.__name__ == "FakeRunner" for cls in type(runner_obj).__mro__):
+                self._fake_runners.add(str(key))
+                r_name = getattr(runner_obj, "name", "")
+                if r_name:
+                    self._fake_runners.add(str(r_name))
 
     def is_engine_installed(self, runner: str) -> bool:
         """Check if runner CLI executable is present in PATH or tools folder."""
+        if runner in self._fake_runners or any(k.split("-")[0] == runner for k in self._fake_runners):
+            return True
         if runner in ("claude-compatible", "claude"):
             return shutil.which("claude") is not None or shutil.which("claude.cmd") is not None
         if runner == "agy":
@@ -623,6 +665,287 @@ class Router:
             "cost_saved_usd": est_dollars_saved,
             "headline": f"${est_dollars_saved} gold saved tonight (estimate)" if economy_successes > 0 else "0 gold burned tonight",
         }
+
+    def route_pipeline_task(
+        self,
+        *,
+        role: str,
+        risk_class: str,
+        contributing_providers: set[str] | list[str] | None = None,
+        owner_override: str | None = None,
+        free_only_mode: bool | None = None,
+        task_id: str | None = None,
+        allowed_engines: set[str] | None = None,
+        exclude_engines: set[str] | None = None,
+        step_id: int | None = None,
+    ) -> PipelineRouteDecision:
+        """Risk-based, safeguard-first, deadlock-free router (AGENT_PIPELINE §6.2).
+
+        Hard eligibility checks ALWAYS run before owner overrides so an override can
+        never bypass provider independence, high_risk/governance strong-model rules,
+        free_only_mode, Economy benchmark graduation, or hard budgets.
+        """
+        norm_role = (role or "coder").strip().lower()
+        norm_risk = (risk_class or "business_logic").strip().lower()
+        contrib_set = {str(p).strip().lower() for p in (contributing_providers or []) if str(p).strip()}
+        free_only = self.economics.is_free_only_mode() if free_only_mode is None else bool(free_only_mode)
+        thresh = min_threshold_for_risk(norm_risk)
+
+        engines = self.store.list_engines()
+        priority_rows = self.store.get_priority_list()
+        if priority_rows:
+            priority_order = {str(r["engine"]).lower(): int(r["position"]) for r in priority_rows}
+        else:
+            priority_order = {"agy": 1, "gemini": 2, "codex": 3, "claude": 4}
+
+        role_skill_key = {
+            "coder": "backend",
+            "fixer": "fix_ci",
+            "triage": "fix_ci",
+            "reviewer": "review",
+            "planner": "plan",
+        }.get(norm_role, norm_role)
+
+        eligible: list[dict[str, Any]] = []
+        excluded_reasons: dict[str, str] = {}
+
+        # Step 1: Build hard-eligible candidate set
+        for eng in engines:
+            eng_id = str(eng["id"])
+            runner = str(eng["runner"])
+            model = str(eng.get("model") or "")
+            tier = tier_for_engine(eng_id, explicit_tier=str(eng.get("cost_tier") or ""))
+            provider = provider_for_engine(eng_id if runner == "claude-compatible" else runner)
+
+            if allowed_engines is not None and eng_id not in allowed_engines and runner not in allowed_engines:
+                excluded_reasons[eng_id] = "not in allowed ladder"
+                continue
+
+            if exclude_engines and (eng_id in exclude_engines or runner in exclude_engines):
+                excluded_reasons[eng_id] = "excluded for this step"
+                continue
+
+            if not int(eng.get("enabled", 1)):
+                excluded_reasons[eng_id] = "disabled by owner"
+                continue
+
+            # CLI installed, login health, cooldown, runner budget
+            avail, avail_reason = self.check_availability(eng)
+            if not avail:
+                excluded_reasons[eng_id] = avail_reason
+                continue
+
+            # Free-only mode (strict; NEVER relax)
+            if free_only and not is_free_only_engine(eng_id, runner=runner, cost_tier=tier):
+                excluded_reasons[eng_id] = "blocked by free_only_mode (paid API engine)"
+                continue
+
+            # Hard budgets (task / night / month)
+            bcheck = self.economics.check_hard_budgets(
+                task_id=task_id,
+                role=norm_role,
+                engine_id=eng_id,
+                runner=runner,
+                cost_tier=tier,
+            )
+            if not bcheck.allowed:
+                excluded_reasons[eng_id] = f"hard budget exceeded ({bcheck.scope}): {bcheck.reason}"
+                continue
+
+            # Provider independence for reviewers (strict; NEVER relax)
+            if norm_role == "reviewer" and provider in contrib_set:
+                excluded_reasons[eng_id] = f"provider '{provider}' already contributed to this task (independence rule)"
+                continue
+
+            # High-risk / governance strong-model rule (strict; NEVER relax)
+            if norm_risk in ("high_risk", "governance") and tier not in STRONG_TIERS:
+                excluded_reasons[eng_id] = f"risk class '{norm_risk}' requires Standard or Gold tier (not {tier})"
+                continue
+
+            # Economy benchmark graduation gate (strict; NEVER relax)
+            score_row = self.store.get_model_score(eng_id, model, norm_role, norm_risk)
+            if tier == TIER_ECONOMY:
+                graduated = bool(score_row and int(score_row.get("benchmark_graduated") or 0) == 1)
+                if not graduated:
+                    samples = int(score_row.get("sample_tasks") or 0) if score_row else 0
+                    excluded_reasons[eng_id] = (
+                        f"Economy engine not benchmark-graduated for {norm_role}/{norm_risk} ({samples}/10 samples)"
+                    )
+                    continue
+
+            eligible.append(
+                {
+                    "engine": eng,
+                    "eng_id": eng_id,
+                    "runner": runner,
+                    "model": model,
+                    "effort": str(eng.get("effort") or "medium"),
+                    "tier": tier,
+                    "provider": provider,
+                    "score_row": score_row,
+                }
+            )
+
+        # Step 2: Owner override check (ONLY against hard-eligible candidates)
+        if owner_override and owner_override.strip().lower() not in ("", "auto"):
+            alias_map = {
+                "Antigravity": "agy",
+                "Gemini CLI": "gemini",
+                "Codex CLI": "codex",
+                "Claude Code": "claude",
+                "Qwen Code": "qwen",
+            }
+            target_override = alias_map.get(owner_override.strip(), owner_override.strip())
+            matched = next(
+                (c for c in eligible if c["eng_id"] == target_override or c["runner"] == target_override),
+                None,
+            )
+            if matched is not None:
+                reason = f"Owner pinned {matched['eng_id']} (verified eligible)"
+                self.store.record_router_decision(
+                    chosen=matched["eng_id"],
+                    reason=reason,
+                    step_id=step_id,
+                    scores_json=json.dumps({matched["eng_id"]: 1.0}),
+                )
+                return PipelineRouteDecision(
+                    blocked=False,
+                    chosen_id=matched["eng_id"],
+                    runner=matched["runner"],
+                    model=matched["model"],
+                    effort=matched["effort"],
+                    cost_tier=matched["tier"],
+                    provider=matched["provider"],
+                    reason=reason,
+                    excluded_reasons=excluded_reasons,
+                )
+
+            # Find exact safeguard reason why override was excluded
+            fail_reason = excluded_reasons.get(target_override)
+            if fail_reason is None:
+                for k, v in excluded_reasons.items():
+                    if k.startswith(f"{target_override}-") or k.startswith(f"{target_override}_"):
+                        fail_reason = v
+                        break
+            if fail_reason is None:
+                fail_reason = "engine not found in catalogue"
+            reason = f"Owner override {target_override} rejected: {fail_reason}"
+            self.store.record_router_decision(chosen="BLOCKED", reason=reason, step_id=step_id)
+            return PipelineRouteDecision(
+                blocked=True,
+                reason=reason,
+                excluded_reasons=excluded_reasons,
+            )
+
+        # Step 3: Empty hard-eligible set -> BLOCKED
+        if not eligible:
+            summary_reasons = "; ".join(f"{k}: {v}" for k, v in list(excluded_reasons.items())[:5])
+            reason = f"No eligible engine for {norm_role}/{norm_risk} ({summary_reasons or 'catalogue empty'})"
+            self.store.record_router_decision(chosen="BLOCKED", reason=reason, step_id=step_id)
+            return PipelineRouteDecision(
+                blocked=True,
+                reason=reason,
+                excluded_reasons=excluded_reasons,
+            )
+
+        # Step 4: Compute effective success_rate per candidate (bootstrap-safe)
+        enriched: list[dict[str, Any]] = []
+        for c in eligible:
+            srow = c["score_row"]
+            sample_tasks = int(srow.get("sample_tasks") or 0) if srow else 0
+            accepted_tasks = int(srow.get("accepted_tasks") or 0) if srow else 0
+            regression_count = int(srow.get("regression_count") or 0) if srow else 0
+            if sample_tasks >= 5:
+                effective_rate = accepted_tasks / sample_tasks
+                cost_est = float(srow.get("cost_per_accepted_usd_est") or 0.0)
+                reg_denom = max(1, accepted_tasks + regression_count)
+                reg_rate = regression_count / reg_denom
+            else:
+                # Neutral bootstrap prior for Standard/Gold so cold start never deadlocks
+                effective_rate = thresh
+                # Default cost ordering when unmeasured: economy (0.0) < standard (0.20) < gold (0.90)
+                cost_est = 0.0 if c["tier"] == TIER_ECONOMY else (0.20 if c["tier"] == TIER_STANDARD else 0.90)
+                reg_rate = 0.0
+
+            try:
+                skills = json.loads(str(c["engine"].get("skills_json") or "{}"))
+            except Exception:
+                skills = {}
+            skill_score = float(skills.get(role_skill_key, 3.0))
+            prio = priority_order.get(c["eng_id"].lower(), priority_order.get(c["runner"].lower(), 999))
+
+            enriched.append(
+                {
+                    **c,
+                    "effective_rate": effective_rate,
+                    "cost_est": cost_est,
+                    "reg_rate": reg_rate,
+                    "skill_score": skill_score,
+                    "priority": prio,
+                }
+            )
+
+        # Step 5: Filter to qualifying = [c for c in eligible if c.effective_rate >= thresh]
+        qualifying = [c for c in enriched if c["effective_rate"] >= thresh]
+        warning_msg = ""
+
+        if qualifying:
+            qualifying.sort(
+                key=lambda x: (
+                    x["cost_est"],
+                    x["reg_rate"],
+                    -x["skill_score"],
+                    x["priority"],
+                    x["eng_id"],
+                )
+            )
+            chosen = qualifying[0]
+            reason = (
+                f"{chosen['eng_id']} chosen for {norm_role}/{norm_risk}: "
+                f"lowest est. cost ${chosen['cost_est']:.3f}/accepted "
+                f"(reliability {chosen['effective_rate']:.0%} >= {thresh:.0%})"
+            )
+        else:
+            if norm_risk in ("high_risk", "governance"):
+                reason = f"No Standard/Gold engine meets reliability threshold ({thresh:.0%}) for {norm_risk}"
+                self.store.record_router_decision(chosen="BLOCKED", reason=reason, step_id=step_id)
+                return PipelineRouteDecision(
+                    blocked=True,
+                    reason=reason,
+                    excluded_reasons=excluded_reasons,
+                )
+            strong_candidates = [c for c in enriched if c["tier"] in STRONG_TIERS]
+            pool = strong_candidates if strong_candidates else enriched
+            pool.sort(key=lambda x: (-x["effective_rate"], x["reg_rate"], -x["skill_score"], x["priority"], x["eng_id"]))
+            chosen = pool[0]
+            warning_msg = (
+                f"All measured engines fell below {thresh:.0%} for {norm_role}/{norm_risk}; "
+                f"falling back to highest-reliability engine {chosen['eng_id']} ({chosen['effective_rate']:.0%})."
+            )
+            reason = warning_msg
+            if self.events is not None:
+                self.events.emit(Event(kind="router.threshold_fallback", plain_text=warning_msg, level="warn"))
+
+        # Step 6: Persist decision to router_decisions
+        scores_map = {c["eng_id"]: round(c["effective_rate"], 4) for c in enriched[:6]}
+        self.store.record_router_decision(
+            chosen=chosen["eng_id"],
+            reason=reason,
+            step_id=step_id,
+            scores_json=json.dumps(scores_map),
+        )
+        return PipelineRouteDecision(
+            blocked=False,
+            chosen_id=chosen["eng_id"],
+            runner=chosen["runner"],
+            model=chosen["model"],
+            effort=chosen["effort"],
+            cost_tier=chosen["tier"],
+            provider=chosen["provider"],
+            reason=reason,
+            warning=warning_msg,
+            excluded_reasons=excluded_reasons,
+        )
 
 
 def test_engine_cli_version(runner: str, custom_cmd: list[str] | None = None) -> tuple[bool, str]:

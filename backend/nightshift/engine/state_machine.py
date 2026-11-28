@@ -21,6 +21,7 @@ from nightshift.engine.ci import CiPipelineManager, CiWatchResult
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
 from nightshift.engine.pipeline_contracts import MergeGate, provider_for_engine
+from nightshift.engine.pipeline_economics import PipelineEconomics
 from nightshift.engine.pipeline_evidence import (
     DEFAULT_MIN_BUILD_DURATION_S,
     DEFAULT_MIN_GATE_DURATION_S,
@@ -240,6 +241,7 @@ class EngineStateMachine:
         self.events = event_bus
         self.quota = quota_ledger
         self.vcs = vcs or SubprocessGitGh()
+        self._restrict_to_registered_runners = bool(runners)
         self.runners = runners or {}
         self.logins = login_checker or LoginHealthChecker(store=store, quota_ledger=quota_ledger)
         self._network_backoff_seconds = network_backoff_seconds
@@ -258,7 +260,9 @@ class EngineStateMachine:
             store=store,
             quota_ledger=quota_ledger,
             login_checker=self.logins,
+            runners=self.runners,
         )
+        self.economics = PipelineEconomics(store, event_bus)
         self.ci_pipeline = CiPipelineManager(
             vcs=self.vcs,
             store=store,
@@ -846,24 +850,48 @@ class EngineStateMachine:
 
                 implement_attempts += 1
                 self.store.update_phase(phase.id, attempt=implement_attempts)
+                task_risk_class = str(
+                    (self.store.get_task(task_id) or pipeline_task).get("risk_class")
+                    or pipeline_contract.get("risk_class")
+                    or "business_logic"
+                )
+                allowed_coder_engines = (
+                    set(self.runners.keys())
+                    if (self._restrict_to_registered_runners and self.runners)
+                    else None
+                )
+
+                if pending_choice is not None:
+                    pending_budget = self.economics.check_hard_budgets(
+                        task_id=task_id,
+                        role="coder",
+                        engine_id=pending_choice.engine,
+                    )
+                    if not pending_budget.allowed:
+                        pending_choice = None
 
                 choice = pending_choice or self.scheduler.select_engine(
                     phase_id=phase.id,
                     step_kind="implement",
                     current_engine=active_runner_name if active_runner_name != "unknown" else None,
+                    task_id=task_id,
+                    risk_class=task_risk_class,
+                    role="coder",
+                    allowed_engines=allowed_coder_engines,
+                    enforce_pipeline_safeguards=True,
                 )
                 pending_choice = None
                 if not choice:
-                    # All engines exhausted -> cooldown wait
+                    # All engines exhausted, blocked by safeguards, or cooling down
                     earliest = self.quota.earliest_cooldown_expiry()
                     earliest_str = earliest.strftime("%H:%M") if earliest else "soon"
                     self.events.emit(Event(
                         kind="quota.exhausted",
-                        plain_text=f"All engines cooling down. Waiting for earliest reset at {earliest_str}.",
+                        plain_text=f"No eligible engine available (cooldown, budget, or routing safeguard). Earliest reset: {earliest_str}.",
                         phase_id=phase.id,
                     ))
-                    self._park_phase(project.id, phase, reason=f"All engines cooling down until {earliest_str}", next_step="Resume after cooldown")
-                    return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": f"All engines in cooldown until {earliest_str}"}
+                    self._park_phase(project.id, phase, reason=f"No eligible engine available (cooldown, budget, or routing safeguard; earliest reset {earliest_str})", next_step="Check budget caps, free-only mode, or resume after cooldown")
+                    return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": f"No eligible engine available (earliest reset {earliest_str})"}
 
                 active_runner_name = choice.engine
                 runner_obj = self.runners.get(active_runner_name)
@@ -900,6 +928,7 @@ class EngineStateMachine:
                 # Record step in SQLite before execution
                 step_id = self.store.record_step(phase.id, "implement", active_runner_name)
                 self.scheduler.record_invocation()
+                self.store.increment_task_counter(task_id, "attempt_count")
                 self.store.record_task_contributing_provider(
                     str(pipeline_task["id"]),
                     provider_for_engine(active_runner_name),
@@ -925,6 +954,7 @@ class EngineStateMachine:
                 inv_timeout = self.scheduler.invocation_timeout_seconds(
                     phase.id, active_runner_name, min(phase.timeout_minutes, int(self.store.get_setting("guard.runnerTimeoutMinutes", "90") or "90")) * 60
                 )
+                attempt_t0 = time.monotonic()
                 res = await runner_obj.run(
                     instruction,
                     wt_dir,
@@ -932,6 +962,7 @@ class EngineStateMachine:
                     effort=choice.effort,
                     timeout_seconds=inv_timeout,
                 )
+                attempt_wall_s = round(max(0.01, time.monotonic() - attempt_t0), 3)
 
                 # Record A/B samples for enabled token optimizer tools (BLUEPRINT 5g)
                 # Parse token usage from runner output
@@ -1008,7 +1039,19 @@ class EngineStateMachine:
                     self.store.record_guard_result(phase.id, f.guard, passed=False, detail=f.message)
 
                 elapsed_min = max(0.01, (time.time() - t0) / 60.0)
-                if res.rc == 0 and ok_deliv and not findings:
+                attempt_ok = bool(res.rc == 0 and ok_deliv and not findings)
+                self.economics.record_ledger_event(
+                    task_id=task_id,
+                    role="coder",
+                    engine_id=active_runner_name,
+                    model=choice.model or active_runner_name,
+                    risk_class=task_risk_class,
+                    tokens_in=tokens_in or (len(prompt_body) // 4),
+                    tokens_out=tokens_out or (len(raw_output or "") // 4),
+                    wall_seconds=attempt_wall_s,
+                    outcome="ok" if attempt_ok else "retry",
+                )
+                if attempt_ok:
                     delivered = True
                     self.store.update_step(step_id, rc=0, verified=1, detail=deliv_reason)
                     self.store.record_duration("implement", active_runner_name, time.time() - t0)
@@ -1053,6 +1096,11 @@ class EngineStateMachine:
                     step_kind="implement",
                     current_engine=active_runner_name,
                     exclude_engines={active_runner_name},
+                    task_id=task_id,
+                    risk_class=task_risk_class,
+                    role="coder",
+                    allowed_engines=allowed_coder_engines,
+                    enforce_pipeline_safeguards=True,
                 )
                 pending_choice = next_choice
                 next_engine = next_choice.engine if next_choice else "none"
@@ -1720,6 +1768,12 @@ class EngineStateMachine:
             if ok is False:
                 reverted, revert_msg = self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
                 if reverted:
+                    if task is not None:
+                        self.economics.record_task_terminal_outcome(
+                            task_id=str(task["id"]),
+                            outcome="reverted",
+                            risk_class=str(task.get("risk_class") or "business_logic"),
+                        )
                     if task is not None and effective_lease:
                         post_fail_updates = {
                             "blocked_from_status": "MERGED",
@@ -1807,6 +1861,14 @@ class EngineStateMachine:
                 }
 
             if not phase.release_after_merge:
+                if task is not None:
+                    ci_mins = round(sum(float(getattr(j, "duration_seconds", 0.0) or 0.0) for j in post_jobs) / 60.0, 3)
+                    self.economics.record_task_terminal_outcome(
+                        task_id=str(task["id"]),
+                        outcome="accepted",
+                        risk_class=str(task.get("risk_class") or "business_logic"),
+                        ci_minutes=ci_mins,
+                    )
                 self.store.unpark_phase(phase.id)
                 self.store.update_phase(phase.id, status="completed")
                 self.events.emit(Event(
@@ -2032,6 +2094,16 @@ class EngineStateMachine:
                             "status": "PARKED",
                             "detail": block_msg,
                         }
+                    self.economics.record_task_terminal_outcome(
+                        task_id=t_id,
+                        outcome="accepted",
+                        risk_class=str((self.store.get_task(t_id) or task).get("risk_class") or "business_logic"),
+                        ci_minutes=round(sum(float(getattr(j, "duration_seconds", 0.0) or 0.0) for j in post_jobs) / 60.0, 3),
+                        artifact_mb=round(
+                            sum(p.stat().st_size for p in (prepared_artifacts or []) if p.exists()) / (1024 * 1024),
+                            4,
+                        ),
+                    )
                     self.store.unpark_phase(phase.id)
                     self.store.update_phase(phase.id, status="completed")
                     self.events.emit(Event(
@@ -2165,6 +2237,14 @@ class EngineStateMachine:
                         },
                         lease_token=effective_lease,
                     )
+            if task is not None:
+                self.economics.record_task_terminal_outcome(
+                    task_id=str(task["id"]),
+                    outcome="accepted",
+                    risk_class=str((self.store.get_task(str(task["id"])) or task).get("risk_class") or "business_logic"),
+                    ci_minutes=round(sum(float(getattr(j, "duration_seconds", 0.0) or 0.0) for j in post_jobs) / 60.0, 3),
+                    artifact_mb=round(sum(f.stat().st_size for f in files if f.exists()) / (1024 * 1024), 4),
+                )
             self.store.unpark_phase(phase.id)
             self.store.update_phase(phase.id, status="completed")
             self.events.emit(Event(

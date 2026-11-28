@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 from nightshift.engine.pipeline_contracts import canonical_contract_json, provider_for_engine
+from nightshift.engine.pipeline_economics import PipelineEconomics
 from nightshift.engine.pipeline_review import (
     ValidatedReviewResult,
     build_isolated_review_prompt,
@@ -20,6 +22,7 @@ from nightshift.engine.pipeline_review import (
 from nightshift.engine.scheduler import Scheduler
 from nightshift.engine.vcs import GitGhClient
 from nightshift.engine.verify import RiskAssessment, check_diff_guards
+from nightshift.quota.usage import parse_cli_usage
 from nightshift.runners.base import Runner, RunnerResult
 from nightshift.store import Store
 
@@ -84,6 +87,9 @@ class CiPipelineManager:
         self.store = store
         self.scheduler = scheduler
         self.runners = runners
+        self.economics = PipelineEconomics(store)
+        if self.scheduler.router is not None and runners:
+            self.scheduler.router.register_runners(runners)
 
     def select_reviewer(
         self,
@@ -92,17 +98,39 @@ class CiPipelineManager:
         contributing_providers: set[str] | None = None,
         risk_class: str = "business_logic",
         graduated_economy_engines: set[str] | None = None,
+        task_id: str | None = None,
     ) -> tuple[str, Runner] | tuple[None, None]:
-        """Select an independent cross-provider reviewer (AGENT_PIPELINE §§2, 6.1, 9.2).
+        """Select an independent cross-provider reviewer (AGENT_PIPELINE §§2, 6.1, 6.2, 9.2).
 
-        Excludes ALL ``contributing_providers`` (coders, fixers, handoffs; ``agy`` and
-        ``gemini`` both map to ``google``). NEVER falls back to self-review.
+        Enforces all pipeline routing safeguards (free_only_mode, hard budgets,
+        high_risk/governance strong-tier rule, Economy benchmark graduation, and
+        provider independence). NEVER falls back to self-review.
         """
         excluded = {provider_for_engine(p) for p in (contributing_providers or set()) if p}
         if implementer_engine:
             imp_prov = provider_for_engine(implementer_engine)
             if imp_prov:
                 excluded.add(imp_prov)
+
+        if self.scheduler.router is not None and self.runners:
+            route = self.scheduler.router.route_pipeline_task(
+                role="reviewer",
+                risk_class=risk_class,
+                contributing_providers=excluded,
+                task_id=task_id,
+                allowed_engines=set(self.runners.keys()),
+            )
+            if route.blocked or not route.chosen_id:
+                return None, None
+            runner = (
+                self.runners.get(route.chosen_id)
+                or self.runners.get(route.runner)
+                or self.runners.get(route.chosen_id.split("-")[0])
+            )
+            if runner is None:
+                return None, None
+            chosen_name = route.runner if route.runner in self.runners else route.chosen_id
+            return chosen_name, runner
 
         engine_tiers = {
             str(e.get("id") or ""): str(e.get("cost_tier") or "")
@@ -156,6 +184,10 @@ class CiPipelineManager:
             init_prov = provider_for_engine(initial_engine)
             if init_prov:
                 all_contributing_providers.add(init_prov)
+
+        task_id_val = str(task_contract.get("task_id") or "") or None if task_contract is not None else None
+        base_risk_for_routing = str(risk_class or (task_contract or {}).get("risk_class") or "business_logic")
+        allowed_runner_ids = set(self.runners.keys()) if self.runners else None
 
         for round_num in range(max_retries + 1):
             if on_status_change:
@@ -244,6 +276,7 @@ class CiPipelineManager:
                             active_engine,
                             contributing_providers=all_contributing_providers,
                             risk_class=effective_risk_class,
+                            task_id=task_id_val,
                         )
                         if not reviewer or not rev_engine_name:
                             return CiWatchResult(
@@ -285,7 +318,9 @@ class CiPipelineManager:
                             raw_diff=diff_text,
                             head_sha=checked_sha,
                         )
+                        rev_t0 = time.monotonic()
                         rev_res = await reviewer.run(review_prompt, worktree_dir, effort="low", timeout_seconds=900)
+                        rev_elapsed = round(time.monotonic() - rev_t0, 3)
                         validated = parse_and_validate_review_output(
                             rev_res.stdout or "",
                             worktree_dir=worktree_dir,
@@ -303,7 +338,9 @@ class CiPipelineManager:
                                 head_sha=checked_sha,
                                 retry_validation_errors=retry_errors,
                             )
+                            rev_t1 = time.monotonic()
                             rev_res = await reviewer.run(retry_prompt, worktree_dir, effort="low", timeout_seconds=900)
+                            rev_elapsed = round(rev_elapsed + (time.monotonic() - rev_t1), 3)
                             validated = parse_and_validate_review_output(
                                 rev_res.stdout or "",
                                 worktree_dir=worktree_dir,
@@ -311,6 +348,28 @@ class CiPipelineManager:
                                 reviewer_engine=rev_engine_name,
                                 reviewer_provider=rev_provider,
                                 reviewer_tier=rev_tier,
+                            )
+
+                        if task_id_val:
+                            rev_raw_out = rev_res.stdout if rev_res.rc == 0 else rev_res.stderr
+                            rev_tin, rev_tout = parse_cli_usage(rev_raw_out or "")
+                            rev_eng_row = self.store.get_engine(rev_engine_name)
+                            rev_model = (
+                                str(rev_eng_row.get("model") or "")
+                                if rev_eng_row
+                                else getattr(reviewer, "model", "") or rev_engine_name
+                            )
+                            self.economics.record_ledger_event(
+                                task_id=task_id_val,
+                                role="reviewer",
+                                engine_id=rev_engine_name,
+                                provider=rev_provider,
+                                model=rev_model,
+                                risk_class=effective_risk_class,
+                                tokens_in=rev_tin or (len(review_prompt) // 4),
+                                tokens_out=rev_tout or (len(rev_raw_out or "") // 4),
+                                wall_seconds=rev_elapsed,
+                                outcome="ok" if (rev_res.rc == 0 and not rev_res.timed_out and validated.valid) else "retry",
                             )
 
                         if rev_res.rc != 0 or rev_res.timed_out or not validated.valid:
@@ -389,7 +448,16 @@ class CiPipelineManager:
                                     effective_risk_class=effective_risk_class,
                                     block_reason="budget_exhausted",
                                 )
-                            choice = self.scheduler.select_engine(phase_id=phase_id, step_kind="fix_ci", current_engine=active_engine)
+                            choice = self.scheduler.select_engine(
+                                phase_id=phase_id,
+                                step_kind="fix_ci",
+                                current_engine=active_engine,
+                                task_id=task_id_val,
+                                risk_class=effective_risk_class,
+                                role="review_fixer",
+                                allowed_engines=allowed_runner_ids,
+                                enforce_pipeline_safeguards=True,
+                            )
                             if not choice:
                                 return CiWatchResult(
                                     passed=False,
@@ -415,6 +483,8 @@ class CiPipelineManager:
                                     block_reason="no_fixer_available",
                                 )
                             self.scheduler.record_invocation()
+                            if task_id_val:
+                                self.store.increment_task_counter(task_id_val, "review_fix_rounds")
                             self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
                             timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
                             if active_engine not in contributing_engines:
@@ -422,7 +492,22 @@ class CiPipelineManager:
                             fix_prov = provider_for_engine(active_engine)
                             if fix_prov:
                                 all_contributing_providers.add(fix_prov)
-                            await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
+                            fix_t0 = time.monotonic()
+                            fix_res = await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
+                            if task_id_val:
+                                fix_raw_out = fix_res.stdout if fix_res.rc == 0 else fix_res.stderr
+                                fix_tin, fix_tout = parse_cli_usage(fix_raw_out or "")
+                                self.economics.record_ledger_event(
+                                    task_id=task_id_val,
+                                    role="fixer",
+                                    engine_id=active_engine,
+                                    model=choice.model or active_engine,
+                                    risk_class=effective_risk_class,
+                                    tokens_in=fix_tin or (len(fix_review_prompt) // 4),
+                                    tokens_out=fix_tout or (len(fix_raw_out or "") // 4),
+                                    wall_seconds=round(time.monotonic() - fix_t0, 3),
+                                    outcome="ok" if fix_res.rc == 0 else "retry",
+                                )
                             continue
 
                         verified_reviewer_engine = rev_engine_name
@@ -468,7 +553,16 @@ class CiPipelineManager:
 
                             if not self.scheduler.has_run_budget_remaining():
                                 return CiWatchResult(passed=False, rounds_used=round_num, detail="Runaway protection: max AI invocations per run reached during review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
-                            choice = self.scheduler.select_engine(phase_id=phase_id, step_kind="fix_ci", current_engine=active_engine)
+                            choice = self.scheduler.select_engine(
+                                phase_id=phase_id,
+                                step_kind="fix_ci",
+                                current_engine=active_engine,
+                                task_id=task_id_val,
+                                risk_class=base_risk_for_routing,
+                                role="review_fixer",
+                                allowed_engines=allowed_runner_ids,
+                                enforce_pipeline_safeguards=True,
+                            )
                             if not choice:
                                 return CiWatchResult(passed=False, rounds_used=round_num, detail="No engine available for review fix.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
                             active_engine = choice.engine
@@ -476,6 +570,8 @@ class CiPipelineManager:
                             if not runner_obj:
                                 return CiWatchResult(passed=False, rounds_used=round_num, detail=f"Selected review fixer {active_engine} is unavailable.", last_engine=active_engine, review_findings=review_findings, contributing_engines=list(contributing_engines))
                             self.scheduler.record_invocation()
+                            if task_id_val:
+                                self.store.increment_task_counter(task_id_val, "review_fix_rounds")
                             self.scheduler.quota_ledger.record_usage(active_engine, choice.model)
                             timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 1800)
                             if active_engine not in contributing_engines:
@@ -526,6 +622,25 @@ class CiPipelineManager:
             # Pull failed CI log
             failed_log = self.vcs.get_failed_ci_log(repo, branch)
 
+            # Stage 4 TRIAGE on small_job_ladder (AGENT_PIPELINE §2, §7.2 — Phase 8f)
+            triage_block = ""
+            if task_contract is not None:
+                from nightshift.engine.pipeline_triage import run_triage_stage
+
+                if on_status_change:
+                    on_status_change(f"TRIAGING_CI_{round_num + 1}")
+                triage_res = await run_triage_stage(
+                    failing_log=failed_log,
+                    workdir=worktree_dir,
+                    runners=self.runners,
+                    store=self.store,
+                    router=self.scheduler.router,
+                    task_id=task_id_val,
+                    risk_class=base_risk_for_routing,
+                    job_name=f"PR #{pr_number} CI",
+                )
+                triage_block = f"\n\nStage 4 Triage Summary (<= 10 lines):\n{triage_res.render()}\n"
+
             # Same-error detector & engine rotation (BLUEPRINT 5d):
             # Rotate engine after 2 failed rounds by the same engine
             engine_failure_count += 1
@@ -538,6 +653,7 @@ class CiPipelineManager:
                     last_engine=active_engine,
                 )
 
+            selected_fix_choice = None
             if engine_failure_count >= 2 or rotate:
                 # Rotate engine to fresh eyes
                 new_choice = self.scheduler.select_engine(
@@ -545,18 +661,46 @@ class CiPipelineManager:
                     step_kind="fix_ci",
                     current_engine=active_engine,
                     exclude_engines={active_engine},
+                    task_id=task_id_val,
+                    risk_class=base_risk_for_routing,
+                    role="fixer",
+                    allowed_engines=allowed_runner_ids,
+                    enforce_pipeline_safeguards=True,
                 )
                 if new_choice:
+                    selected_fix_choice = new_choice
                     active_engine = new_choice.engine
                     engine_failure_count = 0
+                else:
+                    # Fall back to checking if any eligible engine (including active) is allowed
+                    fallback_choice = self.scheduler.select_engine(
+                        phase_id=phase_id,
+                        step_kind="fix_ci",
+                        current_engine=active_engine,
+                        task_id=task_id_val,
+                        risk_class=base_risk_for_routing,
+                        role="fixer",
+                        allowed_engines=allowed_runner_ids,
+                        enforce_pipeline_safeguards=True,
+                    )
+                    if not fallback_choice:
+                        return CiWatchResult(passed=False, rounds_used=round_num, detail="No eligible engine available for CI fix.", last_engine=active_engine)
+                    selected_fix_choice = fallback_choice
+                    active_engine = fallback_choice.engine
             else:
                 # Fast switch-back at CI-fix round boundary (BLUEPRINT 5c)
                 sb_choice = self.scheduler.select_engine(
                     phase_id=phase_id,
                     step_kind="fix_ci",
                     current_engine=active_engine,
+                    task_id=task_id_val,
+                    risk_class=base_risk_for_routing,
+                    role="fixer",
+                    allowed_engines=allowed_runner_ids,
+                    enforce_pipeline_safeguards=True,
                 )
                 if sb_choice:
+                    selected_fix_choice = sb_choice
                     if sb_choice.engine != active_engine:
                         engine_failure_count = 0
                     active_engine = sb_choice.engine
@@ -582,7 +726,7 @@ class CiPipelineManager:
 
             fix_prompt = (
                 f"{guardrail_header}\n\nCI failed on PR #{pr_number} (branch `{branch}`).\n"
-                f"Fix the root cause, commit, and push to `{branch}`.{conflict_note}\n\n"
+                f"Fix the root cause, commit, and push to `{branch}`.{conflict_note}{triage_block}\n\n"
                 f"Failed CI Log Tail:\n```\n{failed_log[-2000:]}\n```"
             )
             prompt_file = worktree_dir / ".nightshift_prompt.md"
@@ -594,18 +738,36 @@ class CiPipelineManager:
 
             sha_before = self.vcs.remote_branch_sha(local_repo, branch)
             self.scheduler.record_invocation()
+            if task_id_val:
+                self.store.increment_task_counter(task_id_val, "ci_fix_rounds")
             if active_engine not in contributing_engines:
                 contributing_engines.append(active_engine)
             fix_prov = provider_for_engine(active_engine)
             if fix_prov:
                 all_contributing_providers.add(fix_prov)
             fix_timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 2400)
-            await runner.run(
+            ci_fix_t0 = time.monotonic()
+            ci_fix_res = await runner.run(
                 f"Read and fix the CI failure in .nightshift_prompt.md, commit, and push to {branch}.",
                 worktree_dir,
-                effort="medium",
+                model=(selected_fix_choice.model if selected_fix_choice else None) or None,
+                effort=(selected_fix_choice.effort if selected_fix_choice else "medium"),
                 timeout_seconds=fix_timeout,
             )
+            if task_id_val:
+                ci_fix_raw = ci_fix_res.stdout if ci_fix_res.rc == 0 else ci_fix_res.stderr
+                ci_tin, ci_tout = parse_cli_usage(ci_fix_raw or "")
+                self.economics.record_ledger_event(
+                    task_id=task_id_val,
+                    role="fixer",
+                    engine_id=active_engine,
+                    model=(selected_fix_choice.model if selected_fix_choice else "") or active_engine,
+                    risk_class=base_risk_for_routing,
+                    tokens_in=ci_tin or (len(fix_prompt) // 4),
+                    tokens_out=ci_tout or (len(ci_fix_raw or "") // 4),
+                    wall_seconds=round(time.monotonic() - ci_fix_t0, 3),
+                    outcome="ok" if ci_fix_res.rc == 0 else "retry",
+                )
 
             # Verify that a new commit was pushed (NO-OP check per BLUEPRINT 5d)
             sha_after = self.vcs.remote_branch_sha(local_repo, branch)

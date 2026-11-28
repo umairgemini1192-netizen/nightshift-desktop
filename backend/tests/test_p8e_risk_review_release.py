@@ -485,6 +485,8 @@ async def test_ci_review_fixer_provider_excluded_from_re_review(tmp_path: Path) 
 
         # Priority list puts codex first for fixes so codex becomes a contributing provider during fix round
         store.set_priority_list([{"position": 1, "engine": "codex", "model": "o3-mini", "effort": "medium"}])
+        # Allow paid Claude as the 3rd-party reviewer once google and openai both contributed
+        store.set_setting("pipeline.freeOnlyMode", "0")
 
         p1_json = json.dumps(
             {

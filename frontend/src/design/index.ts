@@ -1,4 +1,5 @@
 export { Badge, type BadgeTone } from "./Badge";
+export { BudgetMeter, type BudgetMeterProps } from "./BudgetMeter";
 export { Button, type ButtonProps, type ButtonSize, type ButtonVariant } from "./Button";
 export { Checkbox, type CheckboxProps } from "./Checkbox";
 export { CodeEditor, type CodeEditorProps } from "./CodeEditor";

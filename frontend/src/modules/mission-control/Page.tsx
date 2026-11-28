@@ -710,9 +710,32 @@ export default function MissionControlPage() {
             <div className="md:col-span-8 grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div>
                 <p className="text-xs uppercase tracking-wider text-text-muted">Now doing</p>
-                <p className="mt-1 text-sm font-semibold text-text-primary">
-                  {deck?.now?.step ?? "Waiting for next phase trigger"}
-                </p>
+                <div className="mt-1 flex flex-wrap items-center gap-2">
+                  <p className="text-sm font-semibold text-text-primary">
+                    {deck?.now?.step ?? "Waiting for next phase trigger"}
+                  </p>
+                  {deck?.now?.risk_class && (
+                    <Badge
+                      tone={
+                        deck.now.risk_class === "high_risk" || deck.now.risk_class === "governance"
+                          ? "danger"
+                          : deck.now.risk_class === "business_logic"
+                            ? "warning"
+                            : "info"
+                      }
+                    >
+                      {deck.now.risk_class === "docs_format"
+                        ? "Docs"
+                        : deck.now.risk_class === "ui_cosmetic"
+                          ? "UI"
+                          : deck.now.risk_class === "business_logic"
+                            ? "Logic"
+                            : deck.now.risk_class === "high_risk"
+                              ? "High risk"
+                              : "Governance"}
+                    </Badge>
+                  )}
+                </div>
               </div>
 
               <div>
@@ -746,15 +769,28 @@ export default function MissionControlPage() {
           {/* Slim Guards Strip under hero */}
           <div className="mt-6 border-t border-border-subtle pt-4">
             <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
-              <span className="text-text-muted font-medium">Phase safety guards:</span>
+              <button
+                type="button"
+                onClick={() => navigate("/pipeline-ledger")}
+                className="text-text-muted font-medium hover:text-accent-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-focus-ring rounded-sm"
+              >
+                Phase safety guards:
+              </button>
               <div className="flex flex-wrap items-center gap-2">
                 {(deck?.guards ?? [
-                  { name: "Branch protection", status: "pass", detail: "Active on main" },
-                  { name: "Diff guards", status: "pass", detail: "Zero test deletions" },
-                  { name: "Tests verified", status: "pass", detail: "Deliverables checked" },
-                  { name: "Secrets scan", status: "pass", detail: "High-entropy scan passed" },
+                  { name: "Allowed files", status: "pass", detail: "Changes stay within allowed globs" },
+                  { name: "Protected tests", status: "pass", detail: "Zero test deletions or relaxed assertions" },
+                  { name: "Real CI", status: "pass", detail: "Exact-SHA checks verified" },
+                  { name: "Screenshots", status: "pass", detail: "Verified-build UI evidence" },
+                  { name: "Independent review", status: "pass", detail: "Cross-provider reviewer verified" },
                 ]).map((guard, idx) => (
-                  <span key={idx} title={guard.detail}>
+                  <button
+                    key={idx}
+                    type="button"
+                    title={guard.detail}
+                    onClick={() => navigate("/pipeline-ledger")}
+                    className="rounded-pill focus-visible:outline focus-visible:outline-2 focus-visible:outline-focus-ring"
+                  >
                     <Badge
                       tone={guard.status === "pass" ? "success" : guard.status === "warn" ? "warning" : "danger"}
                     >
@@ -764,7 +800,7 @@ export default function MissionControlPage() {
                       />
                       <span>{guard.name}</span>
                     </Badge>
-                  </span>
+                  </button>
                 ))}
               </div>
             </div>
@@ -824,6 +860,16 @@ export default function MissionControlPage() {
               </div>
               <span className="font-mono font-semibold text-text-primary ns-tabular">
                 {deck?.handoff_count ?? 0}
+              </span>
+            </div>
+
+            <div className="flex items-center justify-between text-xs text-text-secondary">
+              <div className="flex items-center gap-1.5">
+                <Icon name="ShieldCheck" size={16} className="text-accent-primary" />
+                <span>Spend tonight:</span>
+              </div>
+              <span className="font-mono font-medium text-text-primary ns-tabular">
+                {deck?.budget_tonight?.displayLine ?? "$0.00 / $0.00 (free-only mode)"}
               </span>
             </div>
 

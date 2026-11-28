@@ -2040,6 +2040,22 @@ class Store:
             raise KeyError(f"Unknown task_id: {task_id}")
         return updated
 
+    def increment_task_counter(self, task_id: str, field: str, delta: int = 1) -> int:
+        """Atomically increment one of the durable task attempt/fix counters."""
+        allowed_counters = {"attempt_count", "ci_fix_rounds", "review_fix_rounds"}
+        if field not in allowed_counters:
+            raise ValueError(f"Disallowed task counter field: {field}")
+        now = _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                f"UPDATE tasks SET {field} = COALESCE({field}, 0) + ?, updated_at = ? WHERE id = ?",
+                (int(delta), now, task_id),
+            )
+            if cur.rowcount == 0:
+                raise KeyError(f"Unknown task_id: {task_id}")
+            row = self._conn.execute(f"SELECT {field} FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return int(row[0] or 0) if row is not None else 0
+
     def record_evidence(
         self,
         *,
@@ -2265,5 +2281,298 @@ class Store:
         if updated is None:
             raise KeyError(f"Unknown release tag '{tag}' for repository '{repo}'")
         return updated
+
+    # ------------------------------------------------------------------
+    # Phase 8f: Task attempts, pipeline economics ledger & model scores
+    # ------------------------------------------------------------------
+
+    def record_task_attempt(
+        self,
+        *,
+        task_id: str,
+        stage: str,
+        role: str,
+        engine_id: str,
+        provider: str,
+        model: str = "",
+        input_ref: str = "",
+        output_ref: str = "",
+        decision_reason: str = "",
+        head_sha_before: str | None = None,
+        head_sha_after: str | None = None,
+        rc: int | None = None,
+        outcome: str = "ok",
+        wall_seconds: float = 0.0,
+        started_at: str | None = None,
+        finished_at: str | None = None,
+    ) -> int:
+        now = _utc_now()
+        start = started_at or now
+        fin = finished_at or now
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO task_attempts (
+                    task_id, stage, role, engine_id, provider, model,
+                    input_ref, output_ref, decision_reason,
+                    head_sha_before, head_sha_after, rc, outcome,
+                    wall_seconds, started_at, finished_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    stage,
+                    role,
+                    engine_id,
+                    provider,
+                    model,
+                    input_ref,
+                    output_ref,
+                    decision_reason,
+                    head_sha_before,
+                    head_sha_after,
+                    rc,
+                    outcome,
+                    float(wall_seconds),
+                    start,
+                    fin,
+                ),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_task_attempts(
+        self,
+        *,
+        task_id: str | None = None,
+        stage: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            params.append(task_id)
+        if stage is not None:
+            clauses.append("stage = ?")
+            params.append(stage)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM task_attempts {where} ORDER BY id ASC LIMIT ?",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_pipeline_ledger(
+        self,
+        *,
+        task_id: str,
+        role: str,
+        engine_id: str,
+        provider: str,
+        model: str,
+        risk_class: str,
+        outcome: str,
+        attempt_id: int | None = None,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+        est_token_cost_usd: float = 0.0,
+        ci_minutes: float = 0.0,
+        artifact_mb: float = 0.0,
+        wall_seconds: float = 0.0,
+        is_estimate: bool = True,
+        created_at: str | None = None,
+    ) -> int:
+        ts = created_at or _utc_now()
+        with self._conn:
+            cur = self._conn.execute(
+                """
+                INSERT INTO pipeline_ledger (
+                    task_id, attempt_id, role, engine_id, provider, model, risk_class,
+                    tokens_in, tokens_out, est_token_cost_usd, ci_minutes, artifact_mb,
+                    wall_seconds, outcome, is_estimate, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id,
+                    attempt_id,
+                    role,
+                    engine_id,
+                    provider,
+                    model,
+                    risk_class,
+                    int(tokens_in),
+                    int(tokens_out),
+                    float(est_token_cost_usd),
+                    float(ci_minutes),
+                    float(artifact_mb),
+                    float(wall_seconds),
+                    outcome,
+                    1 if is_estimate else 0,
+                    ts,
+                ),
+            )
+            assert cur.lastrowid is not None
+            return int(cur.lastrowid)
+
+    def list_pipeline_ledger(
+        self,
+        *,
+        task_id: str | None = None,
+        engine_id: str | None = None,
+        model: str | None = None,
+        role: str | None = None,
+        risk_class: str | None = None,
+        since_iso: str | None = None,
+        project_id: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if task_id is not None:
+            clauses.append("plg.task_id = ?")
+            params.append(task_id)
+        if engine_id is not None:
+            clauses.append("plg.engine_id = ?")
+            params.append(engine_id)
+        if model is not None:
+            clauses.append("plg.model = ?")
+            params.append(model)
+        if role is not None:
+            clauses.append("plg.role = ?")
+            params.append(role)
+        if risk_class is not None:
+            clauses.append("plg.risk_class = ?")
+            params.append(risk_class)
+        if since_iso is not None:
+            clauses.append("plg.created_at >= ?")
+            params.append(since_iso)
+        if project_id is not None:
+            clauses.append("p.project_id = ?")
+            params.append(project_id)
+            where = f"WHERE {' AND '.join(clauses)}"
+            params.append(limit)
+            rows = self._conn.execute(
+                f"""
+                SELECT plg.* FROM pipeline_ledger plg
+                INNER JOIN tasks t ON plg.task_id = t.id
+                INNER JOIN plans p ON t.plan_id = p.id
+                {where}
+                ORDER BY plg.id ASC LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        else:
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            params.append(limit)
+            rows = self._conn.execute(
+                f"SELECT plg.* FROM pipeline_ledger plg {where} ORDER BY plg.id ASC LIMIT ?",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def upsert_model_score(
+        self,
+        *,
+        engine_id: str,
+        model: str,
+        role: str,
+        risk_class: str,
+        sample_tasks: int,
+        accepted_tasks: int,
+        total_attempts: int,
+        regression_count: int,
+        avg_retries: float,
+        avg_turnaround_min: float,
+        total_cost_usd_est: float,
+        cost_per_accepted_usd_est: float,
+        benchmark_graduated: bool,
+        updated_at: str | None = None,
+    ) -> dict[str, Any]:
+        now = updated_at or _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO model_scores (
+                    engine_id, model, role, risk_class,
+                    sample_tasks, accepted_tasks, total_attempts, regression_count,
+                    avg_retries, avg_turnaround_min, total_cost_usd_est,
+                    cost_per_accepted_usd_est, benchmark_graduated, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(engine_id, model, role, risk_class) DO UPDATE SET
+                    sample_tasks = excluded.sample_tasks,
+                    accepted_tasks = excluded.accepted_tasks,
+                    total_attempts = excluded.total_attempts,
+                    regression_count = excluded.regression_count,
+                    avg_retries = excluded.avg_retries,
+                    avg_turnaround_min = excluded.avg_turnaround_min,
+                    total_cost_usd_est = excluded.total_cost_usd_est,
+                    cost_per_accepted_usd_est = excluded.cost_per_accepted_usd_est,
+                    benchmark_graduated = excluded.benchmark_graduated,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    engine_id,
+                    model,
+                    role,
+                    risk_class,
+                    int(sample_tasks),
+                    int(accepted_tasks),
+                    int(total_attempts),
+                    int(regression_count),
+                    float(avg_retries),
+                    float(avg_turnaround_min),
+                    float(total_cost_usd_est),
+                    float(cost_per_accepted_usd_est),
+                    1 if benchmark_graduated else 0,
+                    now,
+                ),
+            )
+        row = self.get_model_score(engine_id, model, role, risk_class)
+        assert row is not None
+        return row
+
+    def get_model_score(
+        self,
+        engine_id: str,
+        model: str,
+        role: str,
+        risk_class: str,
+    ) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            """
+            SELECT * FROM model_scores
+            WHERE engine_id = ? AND model = ? AND role = ? AND risk_class = ?
+            """,
+            (engine_id, model, role, risk_class),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_model_scores(
+        self,
+        *,
+        engine_id: str | None = None,
+        role: str | None = None,
+        risk_class: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if engine_id is not None:
+            clauses.append("engine_id = ?")
+            params.append(engine_id)
+        if role is not None:
+            clauses.append("role = ?")
+            params.append(role)
+        if risk_class is not None:
+            clauses.append("risk_class = ?")
+            params.append(risk_class)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"SELECT * FROM model_scores {where} ORDER BY risk_class ASC, role ASC, cost_per_accepted_usd_est ASC, engine_id ASC",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+
 
 

@@ -1033,6 +1033,7 @@ class BridgeAPI:
                 "ui": ["agy", "gemini", "claude"],
                 "review": ["gemini", "codex", "claude"],
                 "ci_fix": ["codex", "gemini", "claude"],
+                "small_job_ladder": ["qwen", "deepseek", "kimi", "glm", "minimax", "gemini", "codex", "agy"],
                 "default": ["agy", "gemini", "codex", "claude"],
             }
             return {
