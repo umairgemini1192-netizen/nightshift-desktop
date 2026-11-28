@@ -342,10 +342,12 @@ class PipelineEconomics:
                 by_task[tid] = []
             by_task[tid].append(r)
 
+        norm_role = str(role or "").strip().lower()
         sample_tasks = len(tasks_order)
         total_attempts = len(rows)
         accepted_tasks = 0
         regression_count = 0
+        total_retries = 0
         total_cost_usd_est = 0.0
         total_wall_seconds = 0.0
         task_outcomes: list[tuple[bool, bool]] = []  # (accepted, reverted)
@@ -353,25 +355,72 @@ class PipelineEconomics:
         for tid in tasks_order:
             t_rows = by_task[tid]
             outcomes = {str(x.get("outcome") or "").lower() for x in t_rows}
+            t_row_ids = {int(x.get("id") or 0) for x in t_rows}
+            first_row_id = min(t_row_ids) if t_row_ids else 0
+            last_row_id = max(t_row_ids) if t_row_ids else 0
+            last_outcome = str(t_rows[-1].get("outcome") or "").strip().lower()
+
             task_all_rows = self.store.list_pipeline_ledger(task_id=tid, limit=500)
             task_terminal_outcomes = {
                 str(x.get("outcome") or "").lower()
                 for x in task_all_rows
                 if str(x.get("outcome") or "").lower() in ("accepted", "reverted")
             }
-            all_outcomes = outcomes | task_terminal_outcomes
-            reverted = "reverted" in all_outcomes
-            accepted = ("accepted" in all_outcomes) and not reverted
+
+            subsequent_other_rows = [
+                x
+                for x in task_all_rows
+                if int(x.get("id") or 0) not in t_row_ids and int(x.get("id") or 0) > first_row_id
+            ]
+            superseded_in_role = any(
+                int(x.get("id") or 0) > last_row_id
+                and str(x.get("role") or "").strip().lower() == norm_role
+                and (str(x.get("engine_id") or "").strip(), str(x.get("model") or "").strip()) != (engine_id, model)
+                and str(x.get("outcome") or "").strip().lower() in ("ok", "accepted")
+                for x in task_all_rows
+            )
+            contributed_success = (last_outcome in ("ok", "accepted")) and not (
+                norm_role == "coder" and superseded_in_role
+            )
+
+            reverted = ("reverted" in outcomes) or (contributed_success and "reverted" in task_terminal_outcomes)
+            task_delivered = ("accepted" in outcomes) or ("accepted" in task_terminal_outcomes)
+            accepted = contributed_success and task_delivered and not reverted
             if accepted:
                 accepted_tasks += 1
             if reverted:
                 regression_count += 1
             task_outcomes.append((accepted, reverted))
+
+            if norm_role == "coder":
+                escalation_retry_rows = [
+                    x
+                    for x in subsequent_other_rows
+                    if str(x.get("role") or "").strip().lower() in ("coder", "fixer", "review_fixer")
+                ]
+            else:
+                escalation_retry_rows = [
+                    x
+                    for x in subsequent_other_rows
+                    if str(x.get("role") or "").strip().lower() == norm_role
+                ]
+            own_retries = max(0, len(t_rows) - 1)
+            task_retries = own_retries + len(escalation_retry_rows)
+            if not contributed_success and "retry" in outcomes and task_retries == 0:
+                task_retries = 1
+            total_retries += task_retries
+
             for x in t_rows:
                 total_cost_usd_est += compute_entry_total_cost_usd_est(x)
                 total_wall_seconds += float(x.get("wall_seconds") or 0.0)
+            if norm_role == "coder":
+                for x in subsequent_other_rows:
+                    total_cost_usd_est += compute_entry_total_cost_usd_est(x)
+            else:
+                for x in escalation_retry_rows:
+                    total_cost_usd_est += compute_entry_total_cost_usd_est(x)
 
-        avg_retries = round(max(0.0, (total_attempts - sample_tasks) / sample_tasks), 3) if sample_tasks > 0 else 0.0
+        avg_retries = round(total_retries / sample_tasks, 3) if sample_tasks > 0 else 0.0
         avg_turnaround_min = round((total_wall_seconds / 60.0) / sample_tasks, 3) if sample_tasks > 0 else 0.0
         total_cost_usd_est = round(total_cost_usd_est, 6)
         cost_per_accepted_usd_est = (
@@ -720,6 +769,7 @@ class PipelineEconomics:
                 used_economy = any(
                     tier_for_engine(str(x.get("engine_id") or "")) == "economy"
                     and str(x.get("role") or "") in ("coder", "fixer", "triage")
+                    and str(x.get("outcome") or "").lower() in ("ok", "accepted")
                     for x in t_rows
                 )
                 if used_economy:

@@ -987,3 +987,117 @@ async def test_task_attempt_and_fix_counters_enforce_contract_budgets(
     assert not rev_res.passed
     assert review_fix_calls == 1
     assert store_rev.get_task("t-cap-rev")["review_fix_rounds"] == 1
+
+
+def test_failed_attempts_excluded_from_acceptance_credit_and_escalation_costs_attributed(tmp_path: Path) -> None:
+    """P1 regression: failed attempts must not inherit acceptance credit from failover delivery,
+    and downstream escalation costs/retries must be attributed before graduation."""
+    store = Store(tmp_path / "nightshift.db")
+    store.migrate()
+    store.create_project("proj-1", "NightShift", "owner/nightshift-desktop", str(tmp_path))
+    store.create_plan("plan-1", "proj-1", "Escalation Attribution")
+    store.upsert_phase("p8f", "plan-1", "Benchmarks", "feat/p8f")
+    econ = PipelineEconomics(store)
+    _make_router(store)
+
+    # Seed incumbent Standard engine score ($0.30/accepted)
+    store.upsert_model_score(
+        engine_id="agy-gemini-4-neon",
+        model="gemini-4-neon",
+        role="coder",
+        risk_class="docs_format",
+        sample_tasks=10,
+        accepted_tasks=9,
+        total_attempts=11,
+        regression_count=0,
+        avg_retries=0.1,
+        avg_turnaround_min=3.0,
+        total_cost_usd_est=2.70,
+        cost_per_accepted_usd_est=0.30,
+        benchmark_graduated=True,
+    )
+
+    # 1. Ten Qwen retry attempts followed by successful Codex delivery:
+    # Qwen must get 0 accepted tasks, avg_retries >= 1.0, escalation cost included, and NOT graduate.
+    for i in range(1, 11):
+        tid = f"failover-t{i}"
+        store.create_task_with_contract(
+            task_id=tid, phase_id="p8f", plan_id="plan-1", title=tid, branch=f"feat/{tid}", risk_class="docs_format"
+        )
+        econ.record_ledger_event(
+            task_id=tid,
+            role="coder",
+            engine_id="qwen",
+            model="qwen-2.5-coder-32b",
+            risk_class="docs_format",
+            est_token_cost_usd=0.0,
+            wall_seconds=30.0,
+            outcome="retry",
+        )
+        econ.record_ledger_event(
+            task_id=tid,
+            role="coder",
+            engine_id="codex",
+            model="gpt-5.3-codex",
+            risk_class="docs_format",
+            est_token_cost_usd=0.25,
+            wall_seconds=60.0,
+            outcome="ok",
+        )
+        econ.record_task_terminal_outcome(task_id=tid, outcome="accepted", risk_class="docs_format", ci_minutes=2.0)
+
+    qwen_score = store.get_model_score("qwen", "qwen-2.5-coder-32b", "coder", "docs_format")
+    assert qwen_score is not None
+    assert qwen_score["sample_tasks"] == 10
+    assert qwen_score["accepted_tasks"] == 0
+    assert qwen_score["avg_retries"] == pytest.approx(1.0)
+    assert qwen_score["total_cost_usd_est"] > 2.50
+    assert qwen_score["benchmark_graduated"] == 0
+
+    # Codex succeeded on all 10 tasks and gets full acceptance credit with 0 retries.
+    codex_score = store.get_model_score("codex", "gpt-5.3-codex", "coder", "docs_format")
+    assert codex_score is not None
+    assert codex_score["sample_tasks"] == 10
+    assert codex_score["accepted_tasks"] == 10
+    assert codex_score["avg_retries"] == pytest.approx(0.0)
+
+    # Failed Qwen attempts must not count as goldSavedTasks in 30d summary.
+    summary = econ.get_30d_summary(project_id="proj-1")
+    assert summary["acceptedChanges30d"] == 10
+    assert summary["goldSavedTasks"] == 0
+
+    # 2. Even if an Economy coder returns "ok", expensive downstream fixer escalations prevent graduation.
+    for i in range(1, 11):
+        tid = f"esc-fix-t{i}"
+        store.create_task_with_contract(
+            task_id=tid, phase_id="p8f", plan_id="plan-1", title=tid, branch=f"feat/{tid}", risk_class="ui_cosmetic"
+        )
+        econ.record_ledger_event(
+            task_id=tid,
+            role="coder",
+            engine_id="qwen",
+            model="qwen-2.5-coder-32b",
+            risk_class="ui_cosmetic",
+            est_token_cost_usd=0.0,
+            wall_seconds=30.0,
+            outcome="ok",
+        )
+        econ.record_ledger_event(
+            task_id=tid,
+            role="fixer",
+            engine_id="codex",
+            model="gpt-5.3-codex",
+            risk_class="ui_cosmetic",
+            est_token_cost_usd=0.45,
+            wall_seconds=45.0,
+            outcome="ok",
+        )
+        econ.record_task_terminal_outcome(task_id=tid, outcome="accepted", risk_class="ui_cosmetic", ci_minutes=2.0)
+
+    qwen_ui = store.get_model_score("qwen", "qwen-2.5-coder-32b", "coder", "ui_cosmetic")
+    assert qwen_ui is not None
+    assert qwen_ui["sample_tasks"] == 10
+    assert qwen_ui["accepted_tasks"] == 10
+    assert qwen_ui["avg_retries"] == pytest.approx(1.0)
+    assert qwen_ui["cost_per_accepted_usd_est"] >= 0.45
+    assert qwen_ui["benchmark_graduated"] == 0
