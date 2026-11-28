@@ -62,6 +62,7 @@ class CiArtifact:
     size_bytes: int = 0
     build_id: str = ""
     url: str = ""
+    scope: str = "job"  # "job" (per-job, e.g. CircleCI) | "workflow_run" (workflow-wide, e.g. GitHub Actions)
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,8 @@ class CiJobCheck:
     compat_mode: bool = False
     is_gate_job: bool = False
     branch: str = ""
+    workflow_run_id: str = ""
+    workflow_run_job_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -138,25 +141,47 @@ def _artifact_matches(actual_path: str, required_spec: str) -> bool:
     return False
 
 
-def _job_has_required_artifact(job: CiJobCheck, required_spec: str) -> tuple[bool, str]:
-    """Verify ``job`` has a non-empty downloadable artifact matching ``required_spec`` for ``job.build_id``."""
+def _job_has_required_artifact(
+    job: CiJobCheck,
+    required_spec: str,
+    *,
+    observed_jobs: list[CiJobCheck] | None = None,
+) -> tuple[bool, str]:
+    """Verify ``job`` has a non-empty downloadable artifact matching ``required_spec`` with valid producer provenance."""
     found_empty = False
     found_wrong_build = False
+    found_ambiguous_scope = False
     for raw_art in job.artifacts:
         if isinstance(raw_art, CiArtifact):
             art_path = raw_art.path
             size_bytes = raw_art.size_bytes
             art_build_id = raw_art.build_id
+            art_scope = (raw_art.scope or "job").strip().lower()
         else:
             art_path = str(raw_art)
             size_bytes = 1  # Legacy string artifact entries represent non-empty artifact paths
             art_build_id = job.build_id
+            art_scope = "job"
 
         if not _artifact_matches(art_path, required_spec):
             continue
-        if art_build_id and job.build_id and art_build_id != job.build_id:
-            found_wrong_build = True
-            continue
+
+        if art_scope == "workflow_run":
+            expected_wf_build = f"workflow-run:{job.workflow_run_id}" if job.workflow_run_id else ""
+            if not expected_wf_build or art_build_id != expected_wf_build:
+                found_wrong_build = True
+                continue
+            observed_same_run = sum(
+                1 for j in (observed_jobs or []) if j.workflow_run_id and j.workflow_run_id == job.workflow_run_id
+            )
+            if max(int(job.workflow_run_job_count or 1), observed_same_run) > 1:
+                found_ambiguous_scope = True
+                continue
+        else:
+            if not art_build_id or not job.build_id or art_build_id != job.build_id:
+                found_wrong_build = True
+                continue
+
         if size_bytes <= 0:
             found_empty = True
             continue
@@ -164,6 +189,12 @@ def _job_has_required_artifact(job: CiJobCheck, required_spec: str) -> tuple[boo
 
     if found_empty:
         return False, f"Job '{job.name}' artifact matching '{required_spec}' is empty (0 bytes)."
+    if found_ambiguous_scope:
+        return (
+            False,
+            f"Job '{job.name}' artifact matching '{required_spec}' has workflow-run scope shared by multiple jobs; "
+            f"job-specific producer provenance cannot be verified.",
+        )
     if found_wrong_build:
         return (
             False,
@@ -317,7 +348,7 @@ def validate_ci_evidence(
         expected_arts = req_artifacts.get(job_name, [])
         missing_art_msg = ""
         for art in expected_arts:
-            ok_art, art_msg = _job_has_required_artifact(job, art)
+            ok_art, art_msg = _job_has_required_artifact(job, art, observed_jobs=observed_jobs)
             if not ok_art:
                 missing_art_msg = art_msg
                 break
@@ -577,9 +608,11 @@ def persist_ci_evidence(
             job.name,
             (validation.verified and (job.status or "").lower() == "success", validation.rejection_reason),
         )
-        # Overall validation failure (e.g. base_branch_drifted) invalidates the run as merge evidence.
-        effective_verified = bool(validation.verified and job_ok)
-        effective_reason = "" if effective_verified else (job_reason or validation.rejection_reason)
+        # Overall validation failure (e.g. base_branch_drifted) or SHA mismatch invalidates the run as merge evidence.
+        effective_verified = bool(validation.verified and job_ok and job.commit_sha == commit_sha)
+        effective_reason = "" if effective_verified else (
+            job_reason or ("stale_commit_sha" if job.commit_sha != commit_sha else validation.rejection_reason)
+        )
         art_paths = [a.path if isinstance(a, CiArtifact) else str(a) for a in job.artifacts]
         rec_id = store.record_evidence(
             task_id=task_id,

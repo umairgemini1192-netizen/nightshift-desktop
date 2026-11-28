@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -81,6 +82,23 @@ def _default_http_json_get(
             raw = resp.read().decode("utf-8", errors="replace")
             parsed = json.loads(raw)
             return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _default_http_bytes_get(
+    url: str,
+    headers: dict[str, str],
+    timeout: int = 60,
+) -> bytes | None:
+    """Download raw artifact bytes while stripping CircleCI tokens off external hosts."""
+    req_headers = dict(headers)
+    if not _is_circleci_host(url):
+        req_headers = {k: v for k, v in req_headers.items() if k.lower() != "circle-token"}
+    req = urllib.request.Request(url, headers=req_headers, method="GET")
+    try:
+        with _SAFE_CIRCLE_OPENER.open(req, timeout=timeout) as resp:
+            return resp.read()
     except Exception:
         return None
 
@@ -218,6 +236,14 @@ class GitGhClient(Protocol):
         branch: str = "",
     ) -> list[CiJobCheck]: ...
 
+    def download_job_screenshot_evidence(
+        self,
+        repo: str,
+        producer_job: CiJobCheck,
+        manifest_spec: str,
+        dest_dir: Path,
+    ) -> tuple[Path | None, str]: ...
+
     def get_failed_ci_log(self, repo: str, branch: str) -> str: ...
 
     def merge_pr(
@@ -298,10 +324,12 @@ class SubprocessGitGh:
         *,
         http_json_get: Callable[[str, dict[str, str], int], dict[str, Any] | None] | None = None,
         http_artifact_size: Callable[[str, dict[str, str], int], int] | None = None,
+        http_bytes_get: Callable[[str, dict[str, str], int], bytes | None] | None = None,
         circle_token: str | None = None,
     ) -> None:
         self._http_json_get = http_json_get or _default_http_json_get
         self._http_artifact_size = http_artifact_size or _default_http_artifact_size
+        self._http_bytes_get = http_bytes_get or _default_http_bytes_get
         self._circle_token = circle_token
 
     def _circleci_headers(self) -> dict[str, str]:
@@ -418,16 +446,17 @@ class SubprocessGitGh:
                 workflow_cache[workflow_id] = wf_items
 
             matched_item: dict[str, Any] | None = None
-            for item in workflow_cache[workflow_id]:
-                if job_uuid and str(item.get("id") or "") == job_uuid:
-                    matched_item = item
-                    break
-            if matched_item is None and job_number:
+            if job_uuid:
+                for item in workflow_cache[workflow_id]:
+                    if str(item.get("id") or "") == job_uuid:
+                        matched_item = item
+                        break
+            elif job_number:
                 for item in workflow_cache[workflow_id]:
                     if str(item.get("job_number") or "") == job_number:
                         matched_item = item
                         break
-            if matched_item is None and job_name:
+            elif job_name:
                 for item in workflow_cache[workflow_id]:
                     if str(item.get("name") or "") == job_name:
                         matched_item = item
@@ -534,10 +563,10 @@ class SubprocessGitGh:
         self,
         repo: str,
         run_id: str,
-        build_id: str,
+        expected_commit_sha: str,
         gh_artifacts_cache: dict[str, list[dict[str, Any]]],
     ) -> list[CiArtifact]:
-        """Fetch non-expired GitHub Actions workflow run artifacts via gh api."""
+        """Fetch non-expired GitHub Actions workflow run artifacts, preserving workflow-run provenance."""
         from nightshift.engine.pipeline_evidence import CiArtifact
 
         if not run_id:
@@ -559,9 +588,16 @@ class SubprocessGitGh:
             gh_artifacts_cache[run_id] = raw_list
 
         artifacts: list[CiArtifact] = []
+        wf_build_id = f"workflow-run:{run_id}"
         for art in gh_artifacts_cache[run_id]:
             if art.get("expired"):
                 continue
+            art_wf = art.get("workflow_run")
+            if isinstance(art_wf, dict):
+                if art_wf.get("id") is not None and str(art_wf["id"]) != str(run_id):
+                    continue
+                if expected_commit_sha and art_wf.get("head_sha") and str(art_wf["head_sha"]) != expected_commit_sha:
+                    continue
             art_name = str(art.get("name") or "").strip()
             if not art_name:
                 continue
@@ -569,8 +605,9 @@ class SubprocessGitGh:
                 CiArtifact(
                     path=art_name,
                     size_bytes=max(0, int(art.get("size_in_bytes") or 0)),
-                    build_id=build_id,
+                    build_id=wf_build_id,
                     url=str(art.get("archive_download_url") or ""),
+                    scope="workflow_run",
                 )
             )
         return artifacts
@@ -817,10 +854,11 @@ class SubprocessGitGh:
                         if started and completed
                         else 0.0
                     )
-                    head_oid = str(run.get("head_sha") or commit_sha)
+                    head_oid = str(run.get("head_sha") or "")
                     build_id = str(run.get("id") or run.get("external_id") or "")
                     details_url = str(run.get("details_url") or run.get("html_url") or "")
                     artifacts: list[CiArtifact] = []
+                    gha_run_id = ""
 
                     circle_info = self._resolve_circleci_job(
                         target_url=details_url,
@@ -849,12 +887,14 @@ class SubprocessGitGh:
                     else:
                         m_gha = _GH_ACTIONS_RUN_RE.search(details_url)
                         if m_gha:
-                            artifacts = self._fetch_gh_actions_artifacts(
-                                repo,
-                                m_gha.group(1),
-                                build_id,
-                                gh_artifacts_cache,
-                            )
+                            gha_run_id = m_gha.group(1)
+                            if head_oid == commit_sha:
+                                artifacts = self._fetch_gh_actions_artifacts(
+                                    repo,
+                                    gha_run_id,
+                                    commit_sha,
+                                    gh_artifacts_cache,
+                                )
 
                     results.append(
                         CiJobCheck(
@@ -867,6 +907,7 @@ class SubprocessGitGh:
                             compat_mode=False,
                             is_gate_job=norm_name in DEFAULT_GATE_JOB_NAMES,
                             branch=branch,
+                            workflow_run_id=gha_run_id,
                         )
                     )
             except Exception:
@@ -896,7 +937,8 @@ class SubprocessGitGh:
                     duration = 0.0
                     build_id = str(st.get("id") or "")
                     artifacts = []
-                    resolved_commit_sha = str(st_payload.get("sha") or commit_sha)
+                    resolved_commit_sha = str(st_payload.get("sha") or "")
+                    gha_run_id = ""
 
                     circle_info = self._resolve_circleci_job(
                         target_url=target_url,
@@ -920,6 +962,8 @@ class SubprocessGitGh:
                         m_gha = _GH_ACTIONS_RUN_RE.search(target_url)
                         if m_gha:
                             run_id, gha_job_id = m_gha.group(1), m_gha.group(2)
+                            gha_run_id = run_id
+                            gha_verified = False
                             if gha_job_id:
                                 rc_j, out_j, _, _ = run_subprocess_with_timeout(
                                     ["gh", "api", f"repos/{repo}/actions/jobs/{gha_job_id}"],
@@ -928,20 +972,36 @@ class SubprocessGitGh:
                                 if rc_j == 0 and out_j:
                                     try:
                                         j_payload = json.loads(out_j)
-                                        started = _parse_iso_dt(j_payload.get("started_at"))
-                                        completed = _parse_iso_dt(j_payload.get("completed_at"))
-                                        if started and completed:
-                                            duration = max(0.0, (completed - started).total_seconds())
-                                        if j_payload.get("id"):
-                                            build_id = str(j_payload["id"])
+                                        j_sha = str(j_payload.get("head_sha") or "").strip()
+                                        j_run_id = str(j_payload.get("run_id") or "").strip()
+                                        if j_sha:
+                                            resolved_commit_sha = j_sha
+                                        if (
+                                            j_sha == commit_sha
+                                            and (not j_run_id or j_run_id == run_id)
+                                        ):
+                                            gha_verified = True
+                                            started = _parse_iso_dt(j_payload.get("started_at"))
+                                            completed = _parse_iso_dt(j_payload.get("completed_at"))
+                                            if started and completed:
+                                                duration = max(0.0, (completed - started).total_seconds())
+                                            if j_payload.get("id"):
+                                                build_id = str(j_payload["id"])
+                                            j_status = str(j_payload.get("status") or "").lower()
+                                            j_concl = str(j_payload.get("conclusion") or "").lower()
+                                            if j_status == "completed":
+                                                eff_status = j_concl or "failed"
+                                            elif j_status:
+                                                eff_status = j_status
                                     except Exception:
                                         pass
-                            artifacts = self._fetch_gh_actions_artifacts(
-                                repo,
-                                run_id,
-                                build_id,
-                                gh_artifacts_cache,
-                            )
+                            if gha_verified:
+                                artifacts = self._fetch_gh_actions_artifacts(
+                                    repo,
+                                    run_id,
+                                    commit_sha,
+                                    gh_artifacts_cache,
+                                )
 
                     results.append(
                         CiJobCheck(
@@ -954,12 +1014,181 @@ class SubprocessGitGh:
                             compat_mode=False,
                             is_gate_job=norm_name in DEFAULT_GATE_JOB_NAMES,
                             branch=branch,
+                            workflow_run_id=gha_run_id,
                         )
                     )
                     seen.add(norm_name)
             except Exception:
                 pass
+
+        # Record authoritative job count per GitHub Actions workflow run so multi-job runs
+        # cannot misattribute workflow-wide artifacts to an arbitrary job.
+        run_counts: dict[str, int] = {}
+        for job in results:
+            if job.workflow_run_id:
+                run_counts[job.workflow_run_id] = run_counts.get(job.workflow_run_id, 0) + 1
+        if run_counts:
+            results = [
+                replace(job, workflow_run_job_count=run_counts[job.workflow_run_id])
+                if job.workflow_run_id
+                else job
+                for job in results
+            ]
         return results
+
+    def download_job_screenshot_evidence(
+        self,
+        repo: str,
+        producer_job: CiJobCheck,
+        manifest_spec: str,
+        dest_dir: Path,
+    ) -> tuple[Path | None, str]:
+        """Download screenshot manifest and referenced PNGs from the exact verified ``producer_job`` build."""
+        from nightshift.engine.pipeline_evidence import CiArtifact, _artifact_matches, _norm_posix
+
+        if not producer_job.build_id:
+            return None, f"Screenshot producer job '{producer_job.name}' has no verified build_id."
+        if not producer_job.artifacts:
+            return None, f"Screenshot producer job '{producer_job.name}' (build {producer_job.build_id}) has no downloadable artifacts."
+
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_root = dest_dir.resolve()
+
+        spec_norm = _norm_posix(manifest_spec)
+        spec_name = Path(spec_norm).name if spec_norm else "screenshot-manifest.json"
+
+        job_scoped_arts = [
+            a
+            for a in producer_job.artifacts
+            if isinstance(a, CiArtifact)
+            and (a.scope or "job").strip().lower() == "job"
+            and a.build_id == producer_job.build_id
+            and a.size_bytes > 0
+            and a.url
+        ]
+        if job_scoped_arts:
+            manifest_art: CiArtifact | None = None
+            for art in job_scoped_arts:
+                art_norm = _norm_posix(art.path)
+                if not art_norm.lower().endswith(".json"):
+                    continue
+                if _artifact_matches(art_norm, spec_norm):
+                    manifest_art = art
+                    break
+            if manifest_art is None:
+                return (
+                    None,
+                    f"No downloadable screenshot manifest matching '{manifest_spec}' found in verified build '{producer_job.build_id}'.",
+                )
+
+            headers = self._circleci_headers()
+            manifest_bytes = self._http_bytes_get(manifest_art.url, headers, 60)
+            if not manifest_bytes:
+                return (
+                    None,
+                    f"Failed to download screenshot manifest '{manifest_art.path}' from verified build '{producer_job.build_id}'.",
+                )
+
+            manifest_posix = _norm_posix(manifest_art.path)
+            manifest_filename = manifest_posix.rsplit("/", 1)[-1] or "screenshot-manifest.json"
+            manifest_prefix = manifest_posix.rsplit("/", 1)[0] + "/" if "/" in manifest_posix else ""
+            local_manifest = dest_root / manifest_filename
+            local_manifest.write_bytes(manifest_bytes)
+
+            try:
+                parsed = json.loads(manifest_bytes.decode("utf-8"))
+            except Exception:
+                return local_manifest, ""
+
+            if isinstance(parsed, dict) and isinstance(parsed.get("screenshots"), list):
+                art_by_path = {_norm_posix(a.path): a for a in job_scoped_arts}
+                for entry in parsed["screenshots"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    file_rel = str(entry.get("file") or "").strip()
+                    if not file_rel:
+                        continue
+                    target_png = (dest_root / file_rel).resolve()
+                    try:
+                        target_png.relative_to(dest_root)
+                    except ValueError:
+                        continue
+                    norm_rel = _norm_posix(file_rel)
+                    candidate_key = f"{manifest_prefix}{norm_rel}" if manifest_prefix else norm_rel
+                    png_art = art_by_path.get(candidate_key)
+                    if png_art is None:
+                        continue
+                    png_bytes = self._http_bytes_get(png_art.url, headers, 60)
+                    if png_bytes:
+                        target_png.parent.mkdir(parents=True, exist_ok=True)
+                        target_png.write_bytes(png_bytes)
+
+            return local_manifest, ""
+
+        # GitHub Actions workflow-run artifacts: enforce single-job producer provenance before downloading.
+        wf_run_id = producer_job.workflow_run_id
+        expected_wf_build = f"workflow-run:{wf_run_id}" if wf_run_id else ""
+        wf_scoped_arts = [
+            a
+            for a in producer_job.artifacts
+            if isinstance(a, CiArtifact)
+            and (a.scope or "").strip().lower() == "workflow_run"
+            and expected_wf_build
+            and a.build_id == expected_wf_build
+            and a.size_bytes > 0
+        ]
+        if wf_scoped_arts:
+            if int(producer_job.workflow_run_job_count or 1) > 1:
+                return (
+                    None,
+                    f"Workflow run '{wf_run_id}' contains multiple jobs; screenshot artifact provenance for job '{producer_job.name}' cannot be verified.",
+                )
+            top_dir = spec_norm.split("/", 1)[0] if "/" in spec_norm else ""
+            chosen_art = next(
+                (
+                    a
+                    for a in wf_scoped_arts
+                    if _artifact_matches(a.path, spec_norm)
+                    or (top_dir and _artifact_matches(a.path, top_dir))
+                    or a.path == "ui-screenshots"
+                ),
+                None,
+            )
+            if chosen_art is None:
+                return (
+                    None,
+                    f"No workflow artifact matching '{manifest_spec}' found in verified run '{wf_run_id}'.",
+                )
+            rc_dl, _, err_dl, _ = run_subprocess_with_timeout(
+                ["gh", "run", "download", str(wf_run_id), "--repo", repo, "--name", chosen_art.path, "--dir", str(dest_root)],
+                timeout_seconds=180,
+            )
+            if rc_dl != 0:
+                return None, f"Failed to download workflow artifact '{chosen_art.path}' from run '{wf_run_id}': {err_dl}"
+
+            candidates = [
+                p
+                for p in dest_root.rglob("*.json")
+                if p.is_file()
+                and (
+                    _artifact_matches(_norm_posix(str(p.relative_to(dest_root))), spec_norm)
+                    or (spec_name.lower().endswith(".json") and p.name == spec_name)
+                    or p.name == "screenshot-manifest.json"
+                )
+            ]
+            if not candidates:
+                return (
+                    None,
+                    f"Downloaded workflow artifact '{chosen_art.path}' from run '{wf_run_id}' does not contain '{manifest_spec}'.",
+                )
+            return candidates[0], ""
+
+        return (
+            None,
+            f"No downloadable artifacts bound to verified build '{producer_job.build_id}' for job '{producer_job.name}'.",
+        )
 
     def get_failed_ci_log(self, repo: str, branch: str) -> str:
         rc, out, _, _ = run_subprocess_with_timeout(
@@ -1139,7 +1368,7 @@ class SubprocessGitGh:
         if not commit_sha:
             return None, "Merged commit SHA is required", None
         rc, out, err, _ = run_subprocess_with_timeout(
-            ["gh", "run", "list", "--repo", repo, "--branch", branch, "--workflow", workflow, "--commit", commit_sha, "--limit", "1", "--json", "databaseId,status,conclusion"],
+            ["gh", "run", "list", "--repo", repo, "--branch", branch, "--workflow", workflow, "--commit", commit_sha, "--limit", "1", "--json", "databaseId,status,conclusion,headSha"],
             timeout_seconds=60,
         )
         if rc != 0 or not out:
@@ -1148,6 +1377,9 @@ class SubprocessGitGh:
             runs = json.loads(out)
             if not runs:
                 return None, "No workflow runs found", None
+            run_head_sha = str(runs[0].get("headSha") or "").strip()
+            if run_head_sha and run_head_sha != commit_sha:
+                return None, f"Workflow run headSha {run_head_sha[:7]} != expected {commit_sha[:7]}", None
             run_id = int(runs[0]["databaseId"])
             rc_w, out_w, err_w, _ = run_subprocess_with_timeout(
                 ["gh", "run", "watch", str(run_id), "--repo", repo, "--exit-status"],
@@ -1270,6 +1502,7 @@ class FakeGitGh:
         self.workflow_runs: dict[str, bool] = {"Android build": True, "Desktop build": True}
         self.artifacts_to_create: list[str] = ["NightShift-test.zip"]
         self.commit_ci_checks: dict[str, list[Any]] = {}
+        self.job_artifact_files: dict[str, dict[str, bytes]] = {}
         self.default_ci_jobs: list[str] = [
             "desktop-gates",
             "desktop-backend",
@@ -1441,6 +1674,95 @@ class FakeGitGh:
                 )
             )
         return checks
+
+    def register_job_artifacts_from_dir(
+        self,
+        build_id: str,
+        source_dir: Path,
+        *,
+        artifact_prefix: str = "ui-screenshots",
+    ) -> None:
+        """Populate in-memory CI artifacts for ``build_id`` from ``source_dir`` for offline tests."""
+        from nightshift.engine.pipeline_evidence import _norm_posix
+
+        prefix = _norm_posix(artifact_prefix).rstrip("/")
+        bucket = self.job_artifact_files.setdefault(build_id, {})
+        for file_path in source_dir.rglob("*"):
+            if not file_path.is_file():
+                continue
+            rel = _norm_posix(str(file_path.relative_to(source_dir)))
+            key = f"{prefix}/{rel}" if prefix else rel
+            bucket[key] = file_path.read_bytes()
+
+    def download_job_screenshot_evidence(
+        self,
+        repo: str,
+        producer_job: CiJobCheck,
+        manifest_spec: str,
+        dest_dir: Path,
+    ) -> tuple[Path | None, str]:
+        """Download screenshot manifest and referenced PNGs strictly from ``producer_job.build_id``."""
+        from nightshift.engine.pipeline_evidence import _artifact_matches, _norm_posix
+
+        if not producer_job.build_id:
+            return None, f"Screenshot producer job '{producer_job.name}' has no verified build_id."
+        files_for_build = self.job_artifact_files.get(producer_job.build_id)
+        if not files_for_build:
+            return None, f"No screenshot artifacts uploaded by verified build '{producer_job.build_id}'."
+
+        if dest_dir.exists():
+            shutil.rmtree(dest_dir, ignore_errors=True)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest_root = dest_dir.resolve()
+
+        spec_norm = _norm_posix(manifest_spec)
+        spec_name = Path(spec_norm).name if spec_norm else "screenshot-manifest.json"
+        norm_files = {_norm_posix(k): v for k, v in files_for_build.items()}
+
+        manifest_key: str | None = None
+        for k in norm_files:
+            if not k.lower().endswith(".json"):
+                continue
+            if _artifact_matches(k, spec_norm):
+                manifest_key = k
+                break
+        if manifest_key is None:
+            return (
+                None,
+                f"No screenshot manifest matching '{manifest_spec}' uploaded by verified build '{producer_job.build_id}'.",
+            )
+
+        manifest_bytes = norm_files[manifest_key]
+        manifest_filename = manifest_key.rsplit("/", 1)[-1] or "screenshot-manifest.json"
+        manifest_prefix = manifest_key.rsplit("/", 1)[0] + "/" if "/" in manifest_key else ""
+        local_manifest = dest_root / manifest_filename
+        local_manifest.write_bytes(manifest_bytes)
+
+        try:
+            parsed = json.loads(manifest_bytes.decode("utf-8"))
+        except Exception:
+            return local_manifest, ""
+
+        if isinstance(parsed, dict) and isinstance(parsed.get("screenshots"), list):
+            for entry in parsed["screenshots"]:
+                if not isinstance(entry, dict):
+                    continue
+                file_rel = str(entry.get("file") or "").strip()
+                if not file_rel:
+                    continue
+                target_png = (dest_root / file_rel).resolve()
+                try:
+                    target_png.relative_to(dest_root)
+                except ValueError:
+                    continue
+                norm_rel = _norm_posix(file_rel)
+                candidate_key = f"{manifest_prefix}{norm_rel}" if manifest_prefix else norm_rel
+                png_bytes = norm_files.get(candidate_key)
+                if png_bytes is not None:
+                    target_png.parent.mkdir(parents=True, exist_ok=True)
+                    target_png.write_bytes(png_bytes)
+
+        return local_manifest, ""
 
     def get_failed_ci_log(self, repo: str, branch: str) -> str:
         return self.failed_ci_logs.get(branch, "Build failed at Task :app:compileKotlin: Type mismatch error")

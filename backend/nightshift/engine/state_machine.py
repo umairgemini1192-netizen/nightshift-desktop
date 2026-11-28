@@ -10,6 +10,7 @@ import logging
 import os
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -25,6 +26,7 @@ from nightshift.engine.pipeline_evidence import (
     DEFAULT_MIN_GATE_DURATION_S,
     DEFAULT_NIGHTSHIFT_REQUIRED_JOBS,
     EvidenceValidationResult,
+    _select_observed_job,
     persist_ci_evidence,
     persist_screenshot_evidence,
     validate_ci_evidence,
@@ -1144,6 +1146,18 @@ class EngineStateMachine:
         # Step 3b: Authoritative CI & screenshot evidence integrity check (Amendment F / Phase 8d)
         expected_base_sha = ci_res.expected_base_sha or self.vcs.remote_branch_sha(project.local_path, "main")
         current_base_sha = self.vcs.remote_branch_sha(project.local_path, "main")
+        if not ci_res.checked_sha:
+            missing_sha_reason = "CI evidence rejected (missing_commit_sha): Could not determine verified PR head commit SHA."
+            self.store.record_guard_result(phase.id, "evidence:missing_commit_sha", passed=False, detail=missing_sha_reason)
+            self._park_phase(project.id, phase, reason=missing_sha_reason, next_step="Re-run CI on a verified PR head commit")
+            return {
+                "phase_id": phase.id,
+                "title": phase.title,
+                "runner": ci_res.last_engine,
+                "status": "PARKED",
+                "detail": missing_sha_reason,
+            }
+
         if ci_res.checked_sha:
             observed_jobs = (
                 list(ci_res.ci_jobs)
@@ -1202,25 +1216,23 @@ class EngineStateMachine:
                 }
 
             if project.screenshot_manifest_path:
-                manifest_p = Path(project.screenshot_manifest_path)
+                manifest_spec = project.screenshot_manifest_path
                 producer_job_name = project.screenshot_job_name.strip()
                 if not producer_job_name and "desktop-frontend" in project.required_ci_jobs:
                     producer_job_name = "desktop-frontend"
 
                 producer_job = None
                 if producer_job_name and ci_ev.job_results.get(producer_job_name) == (True, ""):
-                    producer_job = next(
-                        (
-                            j
-                            for j in reversed(observed_jobs)
-                            if j.name == producer_job_name
-                            and j.commit_sha == ci_res.checked_sha
-                            and (j.status or "").strip().lower() == "success"
-                            and j.build_id
-                        ),
-                        None,
-                    )
+                    candidate_job = _select_observed_job(producer_job_name, observed_jobs, ci_res.checked_sha)
+                    if (
+                        candidate_job is not None
+                        and candidate_job.commit_sha == ci_res.checked_sha
+                        and (candidate_job.status or "").strip().lower() == "success"
+                        and candidate_job.build_id
+                    ):
+                        producer_job = candidate_job
 
+                shot_renderer = "playwright-mockbridge"
                 if producer_job is None:
                     detail_msg = (
                         f"Configured screenshot producer job '{producer_job_name}' has no verified successful build on {ci_res.checked_sha[:7]}."
@@ -1235,19 +1247,46 @@ class EngineStateMachine:
                     expected_shot_build = ""
                 else:
                     expected_shot_build = producer_job.build_id
-                    shot_ev = validate_screenshot_manifest(
-                        manifest_p,
-                        expected_commit_sha=ci_res.checked_sha,
-                        expected_build_id=expected_shot_build,
-                    )
+                    shot_stage_dir = Path(tempfile.mkdtemp(prefix="nightshift-screenshots-"))
+                    try:
+                        downloaded_manifest, dl_err = self.vcs.download_job_screenshot_evidence(
+                            project.repo,
+                            producer_job,
+                            manifest_spec,
+                            shot_stage_dir,
+                        )
+                        if downloaded_manifest is None:
+                            shot_ev = EvidenceValidationResult(
+                                verified=False,
+                                rejection_reason="missing_screenshot_manifest",
+                                details=[dl_err or f"Failed to retrieve screenshot manifest from build '{expected_shot_build}'."],
+                            )
+                        else:
+                            try:
+                                parsed_shot = json.loads(downloaded_manifest.read_text(encoding="utf-8"))
+                                if isinstance(parsed_shot, dict):
+                                    r_val = str(parsed_shot.get("renderer") or parsed_shot.get("controlled_renderer") or "").strip()
+                                    if r_val:
+                                        shot_renderer = r_val
+                            except Exception:
+                                pass
+                            shot_ev = validate_screenshot_manifest(
+                                downloaded_manifest,
+                                expected_commit_sha=ci_res.checked_sha,
+                                expected_build_id=expected_shot_build,
+                                screenshots_root=downloaded_manifest.parent,
+                            )
+                    finally:
+                        shutil.rmtree(shot_stage_dir, ignore_errors=True)
                 persist_screenshot_evidence(
                     self.store,
                     task_id=task_id,
                     contract_sha256=str(pipeline_contract["contract_sha256"]),
                     commit_sha=ci_res.checked_sha,
-                    manifest_path=manifest_p,
+                    manifest_path=Path(manifest_spec),
                     validation=shot_ev,
                     build_id=expected_shot_build,
+                    renderer=shot_renderer,
                 )
                 if not shot_ev.verified:
                     shot_reason = f"Screenshot manifest rejected ({shot_ev.rejection_reason}): {'; '.join(shot_ev.details)}"

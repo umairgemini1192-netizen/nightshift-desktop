@@ -812,10 +812,15 @@ async def test_e2e_happy_path_with_screenshot_manifest_and_post_merge_evidence(t
         branch="main",
         build_prefix="post",
     )
-    manifest_path = _make_valid_manifest(
+    _make_valid_manifest(
         tmp_path / "ui-screenshots",
         commit_sha="sha_head_804",
         build_id="pre-3",
+    )
+    vcs.register_job_artifacts_from_dir(
+        "pre-3",
+        tmp_path / "ui-screenshots",
+        artifact_prefix="ui-screenshots",
     )
 
     store, engine = _build_engine(tmp_path, vcs)
@@ -832,7 +837,7 @@ async def test_e2e_happy_path_with_screenshot_manifest_and_post_merge_evidence(t
                 "desktop-frontend": ["ui-screenshots"],
                 "desktop-package": ["nightshift-windows/NightShift-windows.zip"],
             },
-            screenshot_manifest_path=str(manifest_path),
+            screenshot_manifest_path="ui-screenshots/screenshot-manifest.json",
         )
         phase = PhaseDefinition(
             id="p8d-happy",
@@ -1459,14 +1464,16 @@ async def test_e2e_screenshot_manifest_requires_verified_producer_for_custom_job
             commit_sha="sha_and_2",
             build_id="and-42",
             duration_seconds=95.0,
+            artifacts=[CiArtifact(path="shots/screenshot-manifest.json", size_bytes=512, build_id="and-42")],
             branch="feat/android-badbuild",
         ),
     ]
-    bad_build_manifest = _make_valid_manifest(
+    _make_valid_manifest(
         tmp_path / "shots-badbuild",
         commit_sha="sha_and_2",
         build_id="unrelated-999",
     )
+    vcs2.register_job_artifacts_from_dir("and-42", tmp_path / "shots-badbuild", artifact_prefix="shots")
     store2, engine2 = _build_engine(tmp_path / "s2", vcs2)
     try:
         project2 = ProjectConfig(
@@ -1476,7 +1483,7 @@ async def test_e2e_screenshot_manifest_requires_verified_producer_for_custom_job
             local_path=tmp_path / "repo2",
             output_dir=tmp_path / "out2",
             required_ci_jobs=["android-ui-tests"],
-            screenshot_manifest_path=str(bad_build_manifest),
+            screenshot_manifest_path="shots/screenshot-manifest.json",
             screenshot_job_name="android-ui-tests",
         )
         phase2 = PhaseDefinition(
@@ -1494,7 +1501,7 @@ async def test_e2e_screenshot_manifest_requires_verified_producer_for_custom_job
     finally:
         store2.close()
 
-    # 3. Custom Android screenshot_job_name configured AND manifest build_id matches verified producer: passes!
+    # 3. Custom Android screenshot_job_name configured AND manifest uploaded by verified producer: passes!
     vcs3 = FakeGitGh()
     vcs3.add_pr("feat/android-good", number=822, head_sha="sha_and_3")
     vcs3.commit_ci_checks["sha_and_3"] = [
@@ -1504,6 +1511,7 @@ async def test_e2e_screenshot_manifest_requires_verified_producer_for_custom_job
             commit_sha="sha_and_3",
             build_id="and-42",
             duration_seconds=95.0,
+            artifacts=[CiArtifact(path="shots/screenshot-manifest.json", size_bytes=512, build_id="and-42")],
             branch="feat/android-good",
         ),
     ]
@@ -1517,11 +1525,12 @@ async def test_e2e_screenshot_manifest_requires_verified_producer_for_custom_job
             branch="main",
         ),
     ]
-    good_manifest = _make_valid_manifest(
+    _make_valid_manifest(
         tmp_path / "shots-good",
         commit_sha="sha_and_3",
         build_id="and-42",
     )
+    vcs3.register_job_artifacts_from_dir("and-42", tmp_path / "shots-good", artifact_prefix="shots")
     store3, engine3 = _build_engine(tmp_path / "s3", vcs3)
     try:
         project3 = ProjectConfig(
@@ -1531,7 +1540,7 @@ async def test_e2e_screenshot_manifest_requires_verified_producer_for_custom_job
             local_path=tmp_path / "repo3",
             output_dir=tmp_path / "out3",
             required_ci_jobs=["android-ui-tests"],
-            screenshot_manifest_path=str(good_manifest),
+            screenshot_manifest_path="shots/screenshot-manifest.json",
             screenshot_job_name="android-ui-tests",
         )
         phase3 = PhaseDefinition(
@@ -1596,3 +1605,435 @@ def test_queue_export_import_preserves_duration_thresholds_and_screenshot_job_na
         assert cfg.min_build_duration_seconds == 2.5
         assert cfg.screenshot_manifest_path == "shots/screenshot-manifest.json"
         assert cfg.screenshot_job_name == "android-ui-tests"
+
+
+# ---------------------------------------------------------------------------
+# 6. Regression tests for producer-build screenshot retrieval & GHA provenance
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_e2e_rejects_forged_local_screenshot_manifest_not_uploaded_by_producer_build(
+    tmp_path: Path,
+) -> None:
+    """P1 regression: a local manifest copying expected SHA + build_id must never satisfy the gate."""
+    vcs = FakeGitGh()
+    vcs.add_pr("feat/forged-local-shots", number=830, head_sha="sha_forged_1")
+    vcs.commit_ci_checks["sha_forged_1"] = _make_valid_jobs(
+        "sha_forged_1",
+        branch="feat/forged-local-shots",
+        build_prefix="pre",
+    )
+    # Author a forged local manifest on disk with the EXACT expected commit_sha and producer build_id,
+    # and even upload artifacts to a DIFFERENT build ("pre-stale"), but NOT to verified build "pre-3".
+    forged_dir = tmp_path / "forged-local-shots"
+    forged_manifest = _make_valid_manifest(
+        forged_dir,
+        commit_sha="sha_forged_1",
+        build_id="pre-3",
+    )
+    vcs.register_job_artifacts_from_dir("pre-stale", forged_dir, artifact_prefix="ui-screenshots")
+
+    store, engine = _build_engine(tmp_path / "s_forged", vcs)
+    try:
+        project = ProjectConfig(
+            id="proj-forged-shots",
+            name="NightShift",
+            repo="owner/nightshift",
+            local_path=tmp_path / "repo_forged",
+            output_dir=tmp_path / "out_forged",
+            required_ci_jobs=["desktop-gates", "desktop-backend", "desktop-frontend", "desktop-package"],
+            screenshot_manifest_path=str(forged_manifest),
+        )
+        phase = PhaseDefinition(
+            id="p-forged-shots",
+            title="Forged local screenshot manifest test",
+            prompt="Implement UI",
+            branch="feat/forged-local-shots",
+            auto_merge=True,
+            release_after_merge=False,
+        )
+        rows = await engine.execute_plan(project, [phase], plan_id="plan-forged")
+        assert rows[0]["status"] == "PARKED"
+        assert "missing_screenshot_manifest" in rows[0]["detail"]
+        assert "feat/forged-local-shots" not in vcs.merged_prs
+    finally:
+        store.close()
+
+
+def test_subprocess_git_gh_downloads_screenshot_evidence_from_verified_circleci_build(
+    tmp_path: Path,
+) -> None:
+    """P1 regression: SubprocessGitGh downloads manifest + referenced PNGs from the exact verified CircleCI build."""
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    # Build authentic manifest + PNG bytes in a source dir to serve over fake HTTP
+    src_dir = tmp_path / "ci-output"
+    manifest_file = _make_valid_manifest(
+        src_dir,
+        commit_sha="sha_circle_shot_1",
+        build_id="142",
+        renderer="playwright-mockbridge",
+    )
+    manifest_bytes = manifest_file.read_bytes()
+    manifest_data = json.loads(manifest_bytes.decode("utf-8"))
+
+    url_map: dict[str, bytes] = {
+        "https://output.circle-artifacts.com/job/142/ui-screenshots/screenshot-manifest.json": manifest_bytes,
+    }
+    artifacts: list[CiArtifact] = [
+        CiArtifact(
+            path="ui-screenshots/screenshot-manifest.json",
+            size_bytes=len(manifest_bytes),
+            build_id="142",
+            url="https://output.circle-artifacts.com/job/142/ui-screenshots/screenshot-manifest.json",
+        )
+    ]
+    for entry in manifest_data["screenshots"]:
+        fname = entry["file"]
+        png_bytes = (src_dir / fname).read_bytes()
+        url = f"https://output.circle-artifacts.com/job/142/ui-screenshots/{fname}"
+        url_map[url] = png_bytes
+        artifacts.append(
+            CiArtifact(
+                path=f"ui-screenshots/{fname}",
+                size_bytes=len(png_bytes),
+                build_id="142",
+                url=url,
+            )
+        )
+
+    # Also add a decoy artifact from a different build_id that must be ignored
+    artifacts.append(
+        CiArtifact(
+            path="ui-screenshots/decoy.png",
+            size_bytes=1234,
+            build_id="999",
+            url="https://output.circle-artifacts.com/job/999/ui-screenshots/decoy.png",
+        )
+    )
+
+    fetched_urls: list[str] = []
+
+    def fake_bytes_get(url: str, headers: dict[str, str], timeout: int) -> bytes | None:
+        fetched_urls.append(url)
+        return url_map.get(url)
+
+    producer_job = CiJobCheck(
+        name="desktop-frontend",
+        status="success",
+        commit_sha="sha_circle_shot_1",
+        build_id="142",
+        duration_seconds=120.0,
+        artifacts=artifacts,
+        branch="feat/p8d",
+    )
+
+    vcs = SubprocessGitGh(http_bytes_get=fake_bytes_get)
+    stage_dir = tmp_path / "stage_ok"
+    downloaded, err = vcs.download_job_screenshot_evidence(
+        "owner/nightshift-desktop",
+        producer_job,
+        "ui-screenshots/screenshot-manifest.json",
+        stage_dir,
+    )
+    assert err == ""
+    assert downloaded is not None
+    assert downloaded.exists()
+    assert len(fetched_urls) == 1 + len(manifest_data["screenshots"])
+    assert not any("/job/999/" in u for u in fetched_urls)
+
+    val = validate_screenshot_manifest(
+        downloaded,
+        expected_commit_sha="sha_circle_shot_1",
+        expected_build_id="142",
+        screenshots_root=downloaded.parent,
+    )
+    assert val.verified is True
+
+    # If one referenced PNG is missing from the producer build's artifacts, validation must fail closed.
+    incomplete_job = CiJobCheck(
+        name="desktop-frontend",
+        status="success",
+        commit_sha="sha_circle_shot_1",
+        build_id="142",
+        duration_seconds=120.0,
+        artifacts=artifacts[:2],  # manifest + only 1 of 3 PNGs
+        branch="feat/p8d",
+    )
+    stage_inc = tmp_path / "stage_incomplete"
+    dl_inc, err_inc = vcs.download_job_screenshot_evidence(
+        "owner/nightshift-desktop",
+        incomplete_job,
+        "ui-screenshots/screenshot-manifest.json",
+        stage_inc,
+    )
+    assert err_inc == ""
+    assert dl_inc is not None
+    val_inc = validate_screenshot_manifest(
+        dl_inc,
+        expected_commit_sha="sha_circle_shot_1",
+        expected_build_id="142",
+        screenshots_root=dl_inc.parent,
+    )
+    assert val_inc.verified is False
+    assert val_inc.rejection_reason == "missing_screenshot_file"
+
+
+def test_subprocess_git_gh_preserves_gha_workflow_run_artifact_provenance_for_multi_job_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2 regression: multi-job GHA workflow artifacts keep workflow-run scope instead of caller job IDs."""
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "check_runs": [
+                            {
+                                "id": 8801,
+                                "name": "android-lint",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_multi_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:01:00Z",
+                                "details_url": "https://github.com/owner/drivelift/actions/runs/9911/job/8801",
+                            },
+                            {
+                                "id": 8802,
+                                "name": "android-build",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_multi_1",
+                                "started_at": "2026-11-27T10:01:00Z",
+                                "completed_at": "2026-11-27T10:04:00Z",
+                                "details_url": "https://github.com/owner/drivelift/actions/runs/9911/job/8802",
+                            },
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and cmd[2].startswith("repos/owner/drivelift/actions/runs/9911/artifacts"):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "name": "app-debug.apk",
+                                "size_in_bytes": 18_000_000,
+                                "expired": False,
+                                "archive_download_url": "https://api.github.com/repos/owner/drivelift/actions/artifacts/1/zip",
+                                "workflow_run": {"id": 9911, "head_sha": "sha_multi_1"},
+                            }
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (0, json.dumps({"sha": "sha_multi_1", "statuses": []}), "", False)
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    vcs = SubprocessGitGh(http_json_get=lambda *_: None, http_artifact_size=lambda *_: 0)
+    jobs = vcs.get_commit_ci_checks("owner/drivelift", "sha_multi_1", branch="feat/android")
+    assert len(jobs) == 2
+
+    lint_job = next(j for j in jobs if j.name == "android-lint")
+    build_job = next(j for j in jobs if j.name == "android-build")
+
+    # Neither job stamps its own job ID onto the workflow-run artifact!
+    assert lint_job.build_id == "8801"
+    assert build_job.build_id == "8802"
+    assert lint_job.workflow_run_id == "9911"
+    assert build_job.workflow_run_id == "9911"
+    assert lint_job.workflow_run_job_count == 2
+    assert build_job.workflow_run_job_count == 2
+
+    assert isinstance(lint_job.artifacts[0], CiArtifact)
+    assert isinstance(build_job.artifacts[0], CiArtifact)
+    assert lint_job.artifacts[0].build_id == "workflow-run:9911"
+    assert lint_job.artifacts[0].scope == "workflow_run"
+    assert build_job.artifacts[0].build_id == "workflow-run:9911"
+    assert build_job.artifacts[0].scope == "workflow_run"
+
+    # Job-specific artifact requirement on either job is rejected because workflow-run scope is shared by 2 jobs.
+    res_lint = validate_ci_evidence(
+        expected_commit_sha="sha_multi_1",
+        required_jobs=["android-lint"],
+        observed_jobs=jobs,
+        required_artifacts_by_job={"android-lint": ["app-debug.apk"]},
+    )
+    assert res_lint.verified is False
+    assert res_lint.rejection_reason == "missing_required_artifact"
+    assert "producer provenance cannot be verified" in res_lint.details[0]
+
+    # Even if only one job is passed to validate_ci_evidence, workflow_run_job_count == 2 still rejects it!
+    res_build_single = validate_ci_evidence(
+        expected_commit_sha="sha_multi_1",
+        required_jobs=["android-build"],
+        observed_jobs=[build_job],
+        required_artifacts_by_job={"android-build": ["app-debug.apk"]},
+    )
+    assert res_build_single.verified is False
+    assert res_build_single.rejection_reason == "missing_required_artifact"
+
+
+def test_subprocess_git_gh_rejects_stale_gha_status_job_and_mismatched_workflow_run_head_sha(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end audit hardening: stale GHA commit status job SHA and mismatched watch_workflow_run headSha fail closed."""
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (0, json.dumps({"check_runs": []}), "", False)
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "sha": "sha_new_head",
+                        "statuses": [
+                            {
+                                "id": 700,
+                                "context": "android-build",
+                                "state": "success",
+                                "target_url": "https://github.com/owner/drivelift/actions/runs/500/job/501",
+                            }
+                        ],
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and cmd[2] == "repos/owner/drivelift/actions/jobs/501":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "id": 501,
+                        "run_id": 500,
+                        "head_sha": "sha_stale_old",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "completed_at": "2026-11-27T10:05:00Z",
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:3] == ["gh", "run", "list"]:
+            return (
+                0,
+                json.dumps(
+                    [
+                        {
+                            "databaseId": 7777,
+                            "status": "completed",
+                            "conclusion": "success",
+                            "headSha": "sha_different_merge",
+                        }
+                    ]
+                ),
+                "",
+                False,
+            )
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    vcs = SubprocessGitGh(http_json_get=lambda *_: None, http_artifact_size=lambda *_: 0)
+    jobs = vcs.get_commit_ci_checks("owner/drivelift", "sha_new_head", branch="feat/android")
+    assert len(jobs) == 1
+    assert jobs[0].commit_sha == "sha_stale_old"
+    assert jobs[0].duration_seconds == 0.0
+    assert jobs[0].artifacts == []
+
+    ok, msg, run_id = vcs.watch_workflow_run(
+        "owner/drivelift",
+        branch="main",
+        workflow="Android build",
+        commit_sha="sha_expected_merge",
+    )
+    assert ok is None
+    assert run_id is None
+    assert "headSha" in msg
+
+
+def test_persist_ci_evidence_and_merge_gate_enforce_exact_sha_and_build_binding(tmp_path: Path) -> None:
+    """End-to-end audit hardening: stale job rows never persist verified=1, and MergeGate binds screenshot build_id."""
+    with Store(tmp_path / "bind.db") as store:
+        store.migrate()
+        task, contract = _setup_task(store, task_id="t-bind", branch="feat/bind")
+        store.record_task_owner_approval("t-bind", "owner", "sha_fresh")
+        task = store.get_task("t-bind")
+        assert task is not None
+
+        stale_job = CiJobCheck(
+            name="desktop-backend",
+            status="success",
+            commit_sha="sha_old",
+            build_id="old-1",
+            duration_seconds=30.0,
+        )
+        fresh_job = CiJobCheck(
+            name="desktop-backend",
+            status="success",
+            commit_sha="sha_fresh",
+            build_id="fresh-2",
+            duration_seconds=35.0,
+        )
+        val = validate_ci_evidence(
+            expected_commit_sha="sha_fresh",
+            required_jobs=["desktop-backend"],
+            observed_jobs=[stale_job, fresh_job],
+        )
+        assert val.verified is True
+        persist_ci_evidence(
+            store,
+            task_id="t-bind",
+            contract_sha256=contract["contract_sha256"],
+            commit_sha="sha_fresh",
+            kind="ci_check",
+            observed_jobs=[stale_job, fresh_job],
+            validation=val,
+        )
+        all_rows = store.list_evidence_for_task("t-bind")
+        stale_row = next(r for r in all_rows if r["commit_sha"] == "sha_old")
+        fresh_row = next(r for r in all_rows if r["commit_sha"] == "sha_fresh")
+        assert stale_row["verified"] == 0
+        assert fresh_row["verified"] == 1
+
+        # MergeGate rejects screenshot evidence whose build_id does not match any verified CI build_id on head_sha.
+        gate = MergeGate(autonomous_merge_enabled=True, require_independent_reviewer=False)
+        bad_shot = {
+            "kind": "screenshot",
+            "source": "screenshot-manifest:playwright-mockbridge",
+            "commit_sha": "sha_fresh",
+            "contract_sha256": contract["contract_sha256"],
+            "build_id": "unrelated-build-999",
+            "duration_seconds": 0.0,
+            "verified": 1,
+            "metadata_json": "{}",
+        }
+        res_bad = gate.authorize_merge(
+            task=task,
+            contract=contract,
+            head_sha="sha_fresh",
+            evidence_records=[fresh_row, bad_shot],
+            required_ci_jobs=["desktop-backend"],
+            require_screenshot_evidence=True,
+        )
+        assert res_bad.allowed is False
+        assert res_bad.block_reason == "missing_verified_screenshots"

@@ -787,6 +787,11 @@ class MergeGate:
                         block_reason="missing_required_job_evidence",
                     )
             if require_screenshot_evidence:
+                verified_ci_builds = {
+                    str(r.get("build_id") or "").strip()
+                    for r in valid_ci
+                    if str(r.get("build_id") or "").strip()
+                }
                 valid_shots: list[dict[str, Any]] = []
                 for rec in evidence_records:
                     if (
@@ -795,6 +800,9 @@ class MergeGate:
                         and rec.get("contract_sha256") == contract.get("contract_sha256")
                         and bool(rec.get("verified"))
                     ):
+                        shot_build_id = str(rec.get("build_id") or "").strip()
+                        if verified_ci_builds and shot_build_id and shot_build_id not in verified_ci_builds:
+                            continue
                         trusted, _ = validate_evidence_record_trust(rec)
                         if trusted:
                             valid_shots.append(rec)
