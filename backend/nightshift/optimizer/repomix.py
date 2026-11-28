@@ -37,6 +37,14 @@ def resolve_git_info_exclude(worktree_dir: Path) -> Path:
             git_dir = Path(git_dir_raw)
             if not git_dir.is_absolute():
                 git_dir = (worktree_dir / git_dir).resolve()
+            common_dir_file = git_dir / "commondir"
+            if common_dir_file.is_file():
+                common_rel = common_dir_file.read_text(encoding="utf-8").strip()
+                if common_rel:
+                    common_dir = Path(common_rel)
+                    if not common_dir.is_absolute():
+                        common_dir = (git_dir / common_dir).resolve()
+                    return common_dir / "info" / "exclude"
             return git_dir / "info" / "exclude"
     return dot_git / "info" / "exclude"
 

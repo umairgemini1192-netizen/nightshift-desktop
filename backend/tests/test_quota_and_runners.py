@@ -105,10 +105,10 @@ def test_proven_runner_command_lines(tmp_path: Path) -> None:
     gemini_cmd = gemini.build_command(prompt, model="gemini-2.5-flash")
     assert gemini_cmd == ["gemini", "-p", prompt, "--approval-mode=yolo", "--skip-trust", "--model", "gemini-2.5-flash"]
 
-    # 3. Codex: codex exec --sandbox workspace-write --approve-for-me <prompt>
+    # 3. Codex: codex exec --approve-for-me <prompt>
     codex = CodexRunner()
     codex_cmd = codex.build_command(prompt, model="o3-mini")
-    assert codex_cmd == ["codex", "exec", "--sandbox", "workspace-write", "--approve-for-me", prompt, "--model", "o3-mini"]
+    assert codex_cmd == ["codex", "exec", "--approve-for-me", prompt, "--model", "o3-mini"]
 
     # 4. Claude: claude -p <prompt> --permission-mode bypassPermissions --output-format text
     claude = ClaudeRunner()

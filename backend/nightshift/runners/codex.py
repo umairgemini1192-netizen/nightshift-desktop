@@ -24,9 +24,9 @@ class CodexRunner:
         model: str | None = None,
         effort: str = "medium",
     ) -> list[str]:
-        cmd = ["codex", "exec", "--sandbox", "workspace-write", "--approve-for-me", prompt]
-        if model:
-            cmd.extend(["--model", model])
+        cmd = ["codex", "exec", "--approve-for-me", prompt]
+        if model and str(model).strip().lower() not in ("", "auto", "default"):
+            cmd.extend(["--model", str(model).strip()])
         return cmd
 
     async def run(

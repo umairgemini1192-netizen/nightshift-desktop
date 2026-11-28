@@ -170,6 +170,7 @@ class CiPipelineManager:
         critical_paths: list[str] | None = None,
         max_review_fix_rounds: int = 2,
         require_independent_reviewer: bool = True,
+        require_codex_review: bool | None = None,
     ) -> CiWatchResult:
         """Watch CI checks and auto-fix failures up to max_retries with engine rotation."""
         active_engine = initial_engine
@@ -270,14 +271,39 @@ class CiPipelineManager:
                         critical_paths=critical_paths,
                     )
                     effective_risk_class = classification.risk_class
+                    task_row = self.store.get_task(task_id_val) if task_id_val else None
+                    must_codex_review = (
+                        bool(require_codex_review)
+                        if require_codex_review is not None
+                        else bool((task_row or {}).get("require_codex_review", 0))
+                    )
 
-                    if require_independent_reviewer and classification.requires_independent_review:
-                        rev_engine_name, reviewer = self.select_reviewer(
-                            active_engine,
-                            contributing_providers=all_contributing_providers,
-                            risk_class=effective_risk_class,
-                            task_id=task_id_val,
-                        )
+                    if require_independent_reviewer and (classification.requires_independent_review or must_codex_review):
+                        if must_codex_review:
+                            codex_runner = self.runners.get("codex")
+                            if "openai" in all_contributing_providers or codex_runner is None:
+                                return CiWatchResult(
+                                    passed=False,
+                                    rounds_used=round_num,
+                                    detail=(
+                                        "Owner merge rule requires an independent Codex review on this exact head; "
+                                        "Codex is unavailable or contributed to this branch."
+                                    ),
+                                    last_engine=active_engine,
+                                    checked_sha=checked_sha,
+                                    expected_base_sha=expected_base_sha,
+                                    contributing_engines=list(contributing_engines),
+                                    effective_risk_class=effective_risk_class,
+                                    block_reason="codex_review_required",
+                                )
+                            rev_engine_name, reviewer = "codex", codex_runner
+                        else:
+                            rev_engine_name, reviewer = self.select_reviewer(
+                                active_engine,
+                                contributing_providers=all_contributing_providers,
+                                risk_class=effective_risk_class,
+                                task_id=task_id_val,
+                            )
                         if not reviewer or not rev_engine_name:
                             return CiWatchResult(
                                 passed=False,

@@ -609,6 +609,66 @@ def _migration_008_release_verifications_repo_tag_pk(conn: sqlite3.Connection) -
     )
 
 
+def _migration_009_project_ladders_and_codex_review(conn: sqlite3.Connection) -> None:
+    """Store ladders per project, add require_codex_review (default ON), and combined governance approval."""
+    tables = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "projects" in tables:
+        proj_cols = {row["name"] for row in conn.execute("PRAGMA table_info(projects)").fetchall()}
+        if "ladders_json" not in proj_cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN ladders_json TEXT NOT NULL DEFAULT '{}'")
+        if "require_codex_review" not in proj_cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN require_codex_review INTEGER NOT NULL DEFAULT 1")
+
+    if "phases" in tables:
+        phase_cols = {row["name"] for row in conn.execute("PRAGMA table_info(phases)").fetchall()}
+        if "require_codex_review" not in phase_cols:
+            conn.execute("ALTER TABLE phases ADD COLUMN require_codex_review INTEGER NOT NULL DEFAULT 1")
+
+    if "tasks" in tables:
+        task_cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()}
+        if "require_codex_review" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN require_codex_review INTEGER NOT NULL DEFAULT 1")
+        if "combined_governance_approved_sha" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN combined_governance_approved_sha TEXT")
+        if "combined_governance_approved_reason" not in task_cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN combined_governance_approved_reason TEXT NOT NULL DEFAULT ''")
+
+    # Migrate existing global engines.ladders to the matching project
+    if "settings" in tables and "projects" in tables and "phases" in tables and "plans" in tables:
+        row = conn.execute("SELECT value FROM settings WHERE key = 'engines.ladders'").fetchone()
+        if row and row["value"]:
+            try:
+                global_ladders = json.loads(row["value"])
+            except Exception:
+                global_ladders = None
+            if isinstance(global_ladders, dict) and global_ladders:
+                ladder_keys = {str(k) for k in global_ladders.keys()}
+                projects = conn.execute("SELECT id, ladders_json FROM projects ORDER BY updated_at DESC").fetchall()
+                target_pid: str | None = None
+                for proj in projects:
+                    if str(proj["ladders_json"] or "{}") not in ("", "{}"):
+                        continue
+                    phase_ladders = {
+                        str(r["ladder"])
+                        for r in conn.execute(
+                            "SELECT DISTINCT ph.ladder FROM phases ph JOIN plans pl ON ph.plan_id = pl.id WHERE pl.project_id = ?",
+                            (proj["id"],),
+                        ).fetchall()
+                    }
+                    if phase_ladders & ladder_keys:
+                        target_pid = str(proj["id"])
+                        break
+                if target_pid is None:
+                    empty_projs = [str(p["id"]) for p in projects if str(p["ladders_json"] or "{}") in ("", "{}")]
+                    if empty_projs:
+                        target_pid = empty_projs[0]
+                if target_pid is not None:
+                    conn.execute(
+                        "UPDATE projects SET ladders_json = ? WHERE id = ?",
+                        (json.dumps(global_ladders), target_pid),
+                    )
+
+
 MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (1, "001_initial_schema", _migration_001_initial_schema),
     (2, "002_project_columns", _migration_002_project_columns),
@@ -618,6 +678,7 @@ MIGRATIONS: list[tuple[int, str, MigrationFn]] = [
     (6, "006_project_evidence_columns", _migration_006_project_evidence_columns),
     (7, "007_project_release_smoke_columns", _migration_007_project_release_smoke_columns),
     (8, "008_release_verifications_repo_tag_pk", _migration_008_release_verifications_repo_tag_pk),
+    (9, "009_project_ladders_and_codex_review", _migration_009_project_ladders_and_codex_review),
 ]
 
 
@@ -727,6 +788,8 @@ class Store:
         screenshot_job_name: str = "",
         smoke_command: str = "",
         smoke_timeout_seconds: int = 120,
+        ladders_json: str = "{}",
+        require_codex_review: bool = True,
     ) -> dict[str, Any]:
         now = _utc_now()
         effective_output = output_dir or output_folder
@@ -740,8 +803,9 @@ class Store:
                     required_ci_jobs_json, required_artifacts_by_job_json,
                     min_gate_duration_seconds, min_build_duration_seconds,
                     screenshot_manifest_path, screenshot_job_name,
-                    smoke_command, smoke_timeout_seconds, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    smoke_command, smoke_timeout_seconds, ladders_json, require_codex_review,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     project_id,
@@ -765,12 +829,52 @@ class Store:
                     screenshot_job_name,
                     smoke_command,
                     int(smoke_timeout_seconds),
+                    ladders_json,
+                    1 if require_codex_review else 0,
                     now,
                     now,
                 ),
             )
         row = self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
         return dict(row)
+
+    def get_project_ladders(self, project_id: str | None = None) -> dict[str, Any]:
+        """Return ladders for ``project_id``, falling back to legacy global setting if empty."""
+        proj = self.get_project(project_id) if project_id else None
+        if proj is None and not project_id:
+            projects = self.list_projects()
+            if len(projects) == 1:
+                proj = projects[0]
+        if proj is not None:
+            raw = str(proj.get("ladders_json") or "{}")
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed:
+                    return parsed
+            except Exception:
+                pass
+        legacy_raw = self.get_setting("engines.ladders")
+        if legacy_raw:
+            try:
+                parsed = json.loads(legacy_raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return {}
+
+    def set_project_ladders(
+        self,
+        project_id: str,
+        ladders: dict[str, Any],
+        *,
+        merge: bool = False,
+    ) -> dict[str, Any]:
+        """Persist ladders for a single project without overwriting other projects."""
+        current = self.get_project_ladders(project_id) if merge else {}
+        merged = {**current, **ladders} if merge else dict(ladders)
+        self.update_project(project_id, ladders_json=json.dumps(merged))
+        return merged
 
     def get_project(self, project_id: str) -> dict[str, Any] | None:
         row = self._conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
@@ -852,14 +956,16 @@ class Store:
         auto_merge: bool = True,
         release_after_merge: bool = False,
         force_rerun: bool = False,
+        require_codex_review: bool = True,
     ) -> dict[str, Any]:
         with self._conn:
             self._conn.execute(
                 """
                 INSERT INTO phases (
                     id, plan_id, title, prompt, depends_on_json, size, position,
-                    status, attempt, pr_number, branch, ladder, timeout_minutes, auto_merge, release_after_merge, force_rerun
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, attempt, pr_number, branch, ladder, timeout_minutes,
+                    auto_merge, release_after_merge, force_rerun, require_codex_review
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     prompt = excluded.prompt,
@@ -872,7 +978,8 @@ class Store:
                     branch = excluded.branch,
                     ladder = excluded.ladder, timeout_minutes = excluded.timeout_minutes,
                     auto_merge = excluded.auto_merge, release_after_merge = excluded.release_after_merge,
-                    force_rerun = excluded.force_rerun
+                    force_rerun = excluded.force_rerun,
+                    require_codex_review = excluded.require_codex_review
                 """,
                 (
                     phase_id,
@@ -886,6 +993,7 @@ class Store:
                     attempt,
                     pr_number,
                     branch, ladder, timeout_minutes, int(auto_merge), int(release_after_merge), int(force_rerun),
+                    int(require_codex_review),
                 ),
             )
         row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()
@@ -1631,6 +1739,7 @@ class Store:
         budget: dict[str, Any] | None = None,
         owner_approval_required: bool = False,
         expected_base_sha: str | None = None,
+        require_codex_review: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Atomically create a pipeline task and its frozen v1 requirement contract."""
         now = _utc_now()
@@ -1672,9 +1781,9 @@ class Store:
                 """
                 INSERT INTO tasks (
                     id, phase_id, plan_id, title, branch, risk_class, status,
-                    contract_id, contract_sha256, expected_base_sha,
+                    contract_id, contract_sha256, expected_base_sha, require_codex_review,
                     created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task_id,
@@ -1686,6 +1795,7 @@ class Store:
                     contract_id,
                     digest,
                     expected_base_sha,
+                    1 if require_codex_review else 0,
                     now,
                     now,
                 ),
@@ -1999,12 +2109,34 @@ class Store:
             raise KeyError(f"Unknown task_id: {task_id}")
         return updated
 
+    def record_combined_governance_approval(self, task_id: str, head_sha: str, reason: str) -> dict[str, Any]:
+        """Record an explicit owner approval for a combined feature+test PR on exact head_sha."""
+        now = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE tasks
+                SET combined_governance_approved_sha = ?,
+                    combined_governance_approved_reason = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (head_sha, reason.strip(), now, task_id),
+            )
+        updated = self.get_task(task_id)
+        if updated is None:
+            raise KeyError(f"Unknown task_id: {task_id}")
+        return updated
+
     def update_task_fields(self, task_id: str, **fields: Any) -> dict[str, Any]:
         """Update allowed mutable columns on a task row."""
         allowed_cols = {
             "status",
             "blocked_from_status",
             "risk_class",
+            "require_codex_review",
+            "combined_governance_approved_sha",
+            "combined_governance_approved_reason",
             "active_attempt_id",
             "pr_number",
             "head_sha",

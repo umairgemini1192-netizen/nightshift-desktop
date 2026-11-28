@@ -964,6 +964,35 @@ class EngineStateMachine:
                 )
                 attempt_wall_s = round(max(0.01, time.monotonic() - attempt_t0), 3)
 
+                # Misconfigured CLI argument error -> mark misconfigured & skip without burning an attempt
+                combined_err = f"{res.stdout}\n{res.stderr}".lower()
+                if res.rc != 0 and any(
+                    pat in combined_err
+                    for pat in (
+                        "cannot be used with",
+                        "unexpected argument",
+                        "unknown option",
+                        "unrecognized arguments",
+                        "invalid argument",
+                        "error: found argument",
+                        "unknown flag",
+                    )
+                ):
+                    implement_attempts = max(0, implement_attempts - 1)
+                    self.store.update_phase(phase.id, attempt=implement_attempts)
+                    self.store.increment_task_counter(task_id, "attempt_count", -1)
+                    self.scheduler.mark_engine_misconfigured(active_runner_name)
+                    self.events.emit(
+                        Event(
+                            kind="runner.misconfigured",
+                            plain_text=f"{active_runner_name} failed argument parsing and was marked misconfigured (not counted as an attempt).",
+                            level="warn",
+                            phase_id=phase.id,
+                            payload={"engine": active_runner_name},
+                        )
+                    )
+                    continue
+
                 # Record A/B samples for enabled token optimizer tools (BLUEPRINT 5g)
                 # Parse token usage from runner output
                 raw_output = res.stdout if res.rc == 0 else res.stderr
@@ -1514,6 +1543,7 @@ class EngineStateMachine:
                 reviewer_engine=ci_res.reviewer_engine or None,
                 reviewer_tier=ci_res.reviewer_tier or None,
                 critical_paths=project.critical_paths,
+                require_codex_review=phase.require_codex_review,
             )
             if auth.effective_risk_class and fresh_task.get("risk_class") != auth.effective_risk_class:
                 self.store.update_task_fields(task_id, risk_class=auth.effective_risk_class)
@@ -1527,7 +1557,11 @@ class EngineStateMachine:
                 next_action = (
                     "Owner review and approval required before merge"
                     if auth.block_reason == "awaiting_owner_approval"
-                    else "Resolve MergeGate finding and re-verify"
+                    else (
+                        "Approve combined feature + test PR in Needs your attention"
+                        if auth.block_reason == "awaiting_combined_governance_approval"
+                        else "Resolve MergeGate finding and re-verify"
+                    )
                 )
                 cur_task = self.store.get_task(task_id)
                 if cur_task and cur_task["status"] != "BLOCKED":
@@ -1737,9 +1771,48 @@ class EngineStateMachine:
         lease_token: str | None = None,
     ) -> dict[str, Any]:
         """Resume post-merge delivery without repeating implementation, merge, or release."""
+        prior = self.store.get_phase(phase.id) or {}
+        plan = self.store.get_plan(str(prior.get("plan_id") or "")) if prior.get("plan_id") else None
+        task = self.store.get_task_by_branch(phase.branch) or self.store.get_task(f"task-{phase.id}")
+        merged_at = str(merged_pr.get("mergedAt") or "").strip()
+        plan_created = str((plan or {}).get("created_at") or "").strip()
+        has_merge_intent = False
+        if task is not None:
+            ops = self.store.list_remote_operations(task_id=str(task["id"]))
+            has_merge_intent = any(op.get("op_type") in ("pr_merge", "pr_create") for op in ops)
+
+        is_historic_merge = (
+            bool(merged_pr.get("historic"))
+            or (bool(merged_at and plan_created) and merged_at < plan_created)
+            or (
+                runner == "none"
+                and prior.get("status") == "pending"
+                and not prior.get("started_at")
+                and not has_merge_intent
+            )
+        )
+        if is_historic_merge:
+            self.store.update_phase(phase.id, status="merged", pr_number=merged_pr.get("number"))
+            detail = f"historic merge, no delivery (PR #{merged_pr.get('number')})"
+            self.events.emit(
+                Event(
+                    kind="phase.skipped",
+                    plain_text=f"Skipping {phase.title}: {detail}.",
+                    level="info",
+                    phase_id=phase.id,
+                    payload={"project_id": project.id},
+                )
+            )
+            return {
+                "phase_id": phase.id,
+                "title": phase.title,
+                "runner": runner,
+                "status": "SKIPPED",
+                "detail": detail,
+            }
+
         self.store.update_phase(phase.id, status="verifying_build", pr_number=merged_pr.get("number"))
         merge_sha = (merged_pr.get("mergeCommit") or {}).get("oid")
-        task = self.store.get_task_by_branch(phase.branch) or self.store.get_task(f"task-{phase.id}")
         acquired_temp_lease: str | None = None
         temp_heartbeat: LeaseHeartbeat | None = None
         rel_work_tmp: Path | None = None

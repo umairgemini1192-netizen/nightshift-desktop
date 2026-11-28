@@ -46,8 +46,8 @@ def test_store_migrations_create_full_schema_and_are_idempotent(tmp_path: Path) 
     with Store(db_file) as store:
         assert store.current_schema_version() == 0
         applied_first = store.migrate()
-        assert applied_first == [1, 2, 3, 4, 5, 6, 7, 8]
-        assert store.current_schema_version() == 8
+        assert applied_first == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+        assert store.current_schema_version() == 9
         assert EXPECTED_TABLES.issubset(store.list_tables())
 
         # Re-running migrate must be a safe no-op.
@@ -144,7 +144,7 @@ def test_upgrade_existing_project_columns(tmp_path: Path) -> None:
             CREATE TABLE projects (id TEXT PRIMARY KEY, output_folder TEXT NOT NULL DEFAULT '');
             INSERT INTO projects VALUES ('old', 'saved');
         """)
-        assert store.migrate() == [2, 3, 4, 5, 6, 7, 8]
+        assert store.migrate() == [2, 3, 4, 5, 6, 7, 8, 9]
         row = store.connection.execute("SELECT * FROM projects").fetchone()
         assert row["output_dir"] == "saved"
         assert row["release_workflow"] == "Android build"
@@ -247,8 +247,8 @@ def test_migration_008_upgrades_v7_release_verifications_to_repo_tag_pk(tmp_path
 
         # Now run migrate() to apply migration 8
         applied = store.migrate()
-        assert applied == [8]
-        assert store.current_schema_version() == 8
+        assert applied == [8, 9]
+        assert store.current_schema_version() == 9
 
         # Existing row is preserved
         row_a = store.get_release_verification("owner/repo-a", "v1.0.0-preview.1")

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from nightshift.engine.pipeline_contracts import provider_for_engine
-from nightshift.engine.pipeline_economics import PipelineEconomics
+from nightshift.engine.pipeline_economics import PipelineEconomics, is_free_only_engine
 from nightshift.engine.verify import redact_secrets
 from nightshift.runners.base import Runner
 from nightshift.store import Store
@@ -178,24 +178,59 @@ def deterministic_triage_fallback(failing_log: str, *, job_name: str = "CI") -> 
     )
 
 
-def get_small_job_ladder(store: Store | None = None) -> list[str]:
-    """Return configured ``small_job_ladder`` from settings, or the default Economy-first ladder."""
+def _filter_small_job_candidates(
+    candidates: list[str],
+    store: Store | None,
+) -> list[str]:
+    """Filter out disabled, uncredentialed, or free_only_mode-forbidden engines."""
+    if store is None:
+        return candidates
+    economics = PipelineEconomics(store)
+    free_only = economics.is_free_only_mode()
+    engines_by_id = {str(e["id"]): e for e in store.list_engines()}
+    latest_logins = store.get_latest_login_checks()
+    filtered: list[str] = []
+    for cand in candidates:
+        eng = engines_by_id.get(cand)
+        if eng is None:
+            eng = next((e for e in engines_by_id.values() if str(e.get("runner") or "") == cand), None)
+        if eng is not None and not int(eng.get("enabled", 1)):
+            continue
+        runner = str(eng.get("runner") or "") if eng is not None else ""
+        tier = str(eng.get("cost_tier") or "") if eng is not None else ""
+        if free_only and not is_free_only_engine(cand, runner=runner, cost_tier=tier):
+            continue
+        if runner == "claude-compatible" or cand in ("deepseek", "kimi", "glm", "minimax"):
+            import os
+            env_key = f"{cand.upper()}_API_KEY"
+            if not os.environ.get(env_key):
+                continue
+        login = latest_logins.get(cand) or (latest_logins.get(runner) if runner else None)
+        if login and str(login.get("state") or "") in ("Logged out", "Not installed", "Disabled by owner"):
+            continue
+        filtered.append(cand)
+    return filtered
+
+
+def get_small_job_ladder(
+    store: Store | None = None,
+    project_id: str | None = None,
+) -> list[str]:
+    """Return configured ``small_job_ladder`` for ``project_id``, filtered by availability & free_only_mode."""
     if store is not None:
-        raw = store.get_setting("engines.ladders")
-        if raw:
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict) and isinstance(parsed.get("small_job_ladder"), list):
-                    ladder = []
-                    for x in parsed["small_job_ladder"]:
-                        val = str(x.get("runner") or "").strip() if isinstance(x, dict) else str(x).strip()
-                        if val:
-                            ladder.append(val)
-                    if ladder:
-                        return ladder
-            except Exception:
-                pass
-    return list(SMALL_JOB_LADDER_DEFAULT)
+        parsed = store.get_project_ladders(project_id)
+        if isinstance(parsed, dict) and isinstance(parsed.get("small_job_ladder"), list):
+            ladder: list[str] = []
+            for x in parsed["small_job_ladder"]:
+                if isinstance(x, dict):
+                    val = str(x.get("runner") or x.get("engine") or x.get("id") or "").strip()
+                else:
+                    val = str(x).strip()
+                if val and val not in ladder:
+                    ladder.append(val)
+            if ladder:
+                return _filter_small_job_candidates(ladder, store)
+    return _filter_small_job_candidates(list(SMALL_JOB_LADDER_DEFAULT), store)
 
 
 async def run_triage_stage(

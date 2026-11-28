@@ -225,6 +225,13 @@ class Scheduler:
                 )
         return (default_ladder, "", "medium")
 
+    def mark_engine_misconfigured(self, engine: str) -> None:
+        """Exclude a misconfigured runner/engine for the remainder of this run."""
+        if not hasattr(self, "_misconfigured_engines"):
+            self._misconfigured_engines: set[str] = set()
+        if engine:
+            self._misconfigured_engines.add(engine)
+
     def select_engine(
         self,
         phase_id: str,
@@ -246,7 +253,7 @@ class Scheduler:
         strong-tier rule, Economy benchmark graduation, provider independence) are enforced
         via ``Router.route_pipeline_task`` BEFORE owner overrides or fallback selection.
         """
-        excluded = set(exclude_engines or set())
+        excluded = set(exclude_engines or set()) | getattr(self, "_misconfigured_engines", set())
         assignment = self.store.get_phase_assignment(phase_id)
         has_explicit_assignment = bool(
             assignment

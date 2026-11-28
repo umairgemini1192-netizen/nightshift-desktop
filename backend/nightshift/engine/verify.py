@@ -117,6 +117,26 @@ def check_diff_guards(
     """
     findings: list[GuardFinding] = []
 
+    # 0. Reject NightShift internal runner prompt/handoff artifacts
+    candidate_paths = list(changed_files or [])
+    for entry in diff_entries or []:
+        for p in (getattr(entry, "path", None), getattr(entry, "old_path", None)):
+            if p and p not in candidate_paths:
+                candidate_paths.append(p)
+    for f in candidate_paths:
+        norm = f.replace("\\", "/")
+        while norm.startswith("./"):
+            norm = norm[2:]
+        base = norm.rsplit("/", 1)[-1]
+        if base == ".nightshift_prompt.md" or norm == ".nightshift_prompt.md":
+            findings.append(
+                GuardFinding(
+                    guard="no_nightshift_artifacts",
+                    message=f"Runner prompt file '{f}' must not be committed.",
+                    path=f,
+                )
+            )
+
     # 1. Check for skipped or weakened tests
     for pattern in TEST_SKIP_PATTERNS:
         if pattern.search(diff_content):

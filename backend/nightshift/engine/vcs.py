@@ -564,6 +564,13 @@ class SubprocessGitGh:
                 return _failed(name=auth_job_name, job_uuid=auth_job_uuid, workflow_id=auth_workflow_id)
 
             auth_status = str(matched_item.get("status") or "").strip().lower()
+            if not circle_revision:
+                if matched_item.get("vcs_revision"):
+                    circle_revision = str(matched_item["vcs_revision"]).strip()
+                elif isinstance(matched_item.get("vcs"), dict) and matched_item["vcs"].get("revision"):
+                    circle_revision = str(matched_item["vcs"]["revision"]).strip()
+                elif matched_item.get("revision"):
+                    circle_revision = str(matched_item["revision"]).strip()
             started = _parse_iso_dt(matched_item.get("started_at"))
             stopped = _parse_iso_dt(matched_item.get("stopped_at"))
             if started and stopped:
@@ -623,6 +630,41 @@ class SubprocessGitGh:
                         workflow_revision_cache,
                         pipeline_revision_cache,
                     )
+
+                if not payload_revision and lookup_job_number and project_slug:
+                    v11_url = f"https://circleci.com/api/v1.1/project/{project_slug}/{lookup_job_number}"
+                    v11_payload = self._http_json_get(v11_url, headers, 30)
+                    if not v11_payload and project_slug.startswith("circleci/") and repo:
+                        v11_payload = self._http_json_get(
+                            f"https://circleci.com/api/v1.1/project/gh/{repo}/{lookup_job_number}",
+                            headers,
+                            30,
+                        )
+                    if v11_payload:
+                        raw_v11_num = v11_payload.get("build_num")
+                        v11_num = (
+                            str(raw_v11_num).strip()
+                            if raw_v11_num is not None and not isinstance(raw_v11_num, bool)
+                            else ""
+                        )
+                        v11_wf = v11_payload.get("workflows") if isinstance(v11_payload.get("workflows"), dict) else {}
+                        v11_job_name = str(v11_wf.get("job_name") or "").strip()
+                        v11_wf_id = str(v11_wf.get("workflow_id") or "").strip()
+                        if v11_num and v11_num != lookup_job_number:
+                            return _failed(name=auth_job_name, job_uuid=auth_job_uuid, workflow_id=auth_workflow_id)
+                        if v11_job_name and ((auth_job_name and v11_job_name != auth_job_name) or (job_name and v11_job_name != job_name)):
+                            return _failed(name=v11_job_name, job_uuid=auth_job_uuid, workflow_id=auth_workflow_id)
+                        if v11_wf_id and auth_workflow_id and v11_wf_id != auth_workflow_id:
+                            return _failed(name=auth_job_name, job_uuid=auth_job_uuid, workflow_id=auth_workflow_id)
+                        if v11_payload.get("vcs_revision"):
+                            payload_revision = str(v11_payload["vcs_revision"]).strip()
+                        if not payload_status and v11_payload.get("status"):
+                            payload_status = str(v11_payload["status"]).strip().lower()
+                        if not has_authoritative_duration:
+                            raw_v11_ms = v11_payload.get("build_time_millis")
+                            if not isinstance(raw_v11_ms, bool) and isinstance(raw_v11_ms, (int, float)):
+                                duration = max(0.0, float(raw_v11_ms) / 1000.0)
+                                has_authoritative_duration = True
 
                 if not workflow_id:
                     auth_job_name = payload_name
