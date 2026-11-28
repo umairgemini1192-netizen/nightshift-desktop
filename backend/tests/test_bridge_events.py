@@ -103,9 +103,10 @@ def test_login_fix_uses_allowlisted_argument_list(tmp_path, monkeypatch) -> None
     store.migrate()
     bridge = BridgeAPI(store, EventBus(), ModuleRegistry())
     calls = []
+    monkeypatch.setattr("nightshift.bridge.resolve_bin", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr("nightshift.bridge.subprocess.Popen", lambda command, **kwargs: calls.append((command, kwargs)))
     assert bridge.call("logins.openFix", {"tool": "gh"})["ok"]
-    assert calls[0][0] == ["gh", "auth", "login"]
+    assert calls[0][0] == ["/usr/bin/gh", "auth", "login"]
     assert not bridge.call("logins.openFix", {"tool": "gh; dangerous"})["ok"]
     assert len(calls) == 1
     store.close()
@@ -179,7 +180,12 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     assert plan_resp["data"]["plan"]["title"] == "Overnight Plan"
     assert len(plan_resp["data"]["phases"]) == 1
 
-    # runs.list
+    # runs.list: draft plan with no steps/runs does NOT appear; once a step is recorded it appears
+    runs_resp_draft = bridge.call("runs.list")
+    assert runs_resp_draft["ok"]
+    assert len(runs_resp_draft["data"]) == 0
+
+    store.record_step("ph1", "implement", "agy")
     runs_resp = bridge.call("runs.list")
     assert runs_resp["ok"]
     assert len(runs_resp["data"]) == 1
@@ -298,11 +304,18 @@ def test_bridge_plan_and_runs_and_engines_list(tmp_path, monkeypatch) -> None:
     # Verify claude was automatically pinned last!
     assert set_ladders["data"]["ladders"]["backend"][-1] == "claude"
 
-    # engines.getLedger
+    # engines.getLedger (empty DB returns no fabricated chartData; real ledger rows appear)
+    empty_ledger_resp = bridge.call("engines.getLedger")
+    assert empty_ledger_resp["ok"]
+    assert empty_ledger_resp["data"]["isEstimate"] is True
+    assert empty_ledger_resp["data"]["chartData"] == []
+
+    store.record_ledger_entry("agy", "gemini-4-neon", "ok", tokens_in=1000, tokens_out=500)
     ledger_resp = bridge.call("engines.getLedger")
     assert ledger_resp["ok"]
     assert ledger_resp["data"]["isEstimate"] is True
-    assert len(ledger_resp["data"]["chartData"]) == 4
+    assert len(ledger_resp["data"]["chartData"]) == 1
+    assert ledger_resp["data"]["chartData"][0]["tokens"] == 1500
 
     # engines.update
     eng_up = bridge.call("engines.update", {"id": "agy", "effort": "high"})

@@ -599,3 +599,65 @@ for (const vp of VIEWPORTS) {
     });
   }
 }
+
+// Engines & Quota: object-shaped ladders (runner:model) imported from legacy queue.json
+for (const vp of VIEWPORTS) {
+  for (const theme of THEMES) {
+    test(`engines-quota [object-ladders] @ ${vp.name} (${theme})`, async ({ page }) => {
+      await page.setViewportSize({ width: vp.width, height: vp.height });
+      await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme });
+
+      await page.goto(`/engines?scenario=idle&ladders=object`, { waitUntil: "networkidle" });
+      await page.locator("main h1").waitFor({ state: "visible" });
+      await expect(page.getByText(/agy:gemini-4-neon/i)).toBeVisible();
+
+      await page.evaluate((th) => {
+        localStorage.setItem("nightshift.theme", th);
+        document.documentElement.dataset.theme = th;
+      }, theme);
+
+      if (vp.fontScalePct !== 100) {
+        await page.evaluate((pct) => {
+          document.documentElement.style.fontSize = `${pct}%`;
+        }, vp.fontScalePct);
+      }
+
+      await page.evaluate(() => document.fonts.ready);
+
+      const overflow = await page.evaluate(() => ({
+        scrollWidth: document.documentElement.scrollWidth,
+        clientWidth: document.documentElement.clientWidth,
+      }));
+      expect(
+        overflow.scrollWidth,
+        `Horizontal overflow on engines-quota object-ladders (${theme}, ${vp.name}): scrollWidth=${overflow.scrollWidth} > clientWidth=${overflow.clientWidth}`,
+      ).toBeLessThanOrEqual(overflow.clientWidth);
+
+      const axeResults = await new AxeBuilder({ page }).analyze();
+      const blocking = axeResults.violations.filter(
+        (v) => v.impact === "serious" || v.impact === "critical",
+      );
+      expect(
+        blocking,
+        `Accessibility violations on engines-quota object-ladders (${theme}, ${vp.name}): ${JSON.stringify(
+          blocking.map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.length })),
+        )}`,
+      ).toEqual([]);
+
+      const filename =
+        theme === "dark"
+          ? `engines-quota-object-ladders-${vp.name}.png`
+          : `engines-quota-object-ladders-light-${vp.name}.png`;
+      const outPath = path.join(SCREENSHOTS_DIR, filename);
+      await page.screenshot({ path: outPath, fullPage: true });
+      recordScreenshotManifestEntry({
+        screenshotsDir: SCREENSHOTS_DIR,
+        filename,
+        viewportOrDevice: vp.name,
+        scale: `${vp.fontScalePct}%`,
+        axeViolations: blocking.length,
+        overflow: overflow.scrollWidth > overflow.clientWidth,
+      });
+    });
+  }
+}
