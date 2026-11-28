@@ -1,4 +1,4 @@
-import { Badge, GlassCard, Icon } from "../../design";
+import { Badge, EmptyState, GlassCard, Icon } from "../../design";
 import type { TokenSavingsTonight } from "../../bridge/types";
 
 interface TokenSavingsCardProps {
@@ -7,6 +7,8 @@ interface TokenSavingsCardProps {
 
 export function TokenSavingsCard({ savings }: TokenSavingsCardProps) {
   const hasWarnings = savings.warnings.length > 0;
+  const hasData =
+    savings.totalTokensSaved > 0 || savings.perTool.length > 0 || hasWarnings;
 
   return (
     <div id="token-savings-card">
@@ -14,11 +16,20 @@ export function TokenSavingsCard({ savings }: TokenSavingsCardProps) {
         title="Token optimizer savings"
         icon="Zap"
         action={
-          <Badge tone={savings.totalTokensSaved > 0 ? "success" : "neutral"}>
-            {savings.estimateLabel}
-          </Badge>
+          hasData ? (
+            <Badge tone={savings.totalTokensSaved > 0 ? "success" : "neutral"}>
+              {savings.estimateLabel}
+            </Badge>
+          ) : undefined
         }
       >
+        {!hasData ? (
+          <EmptyState
+            icon="Zap"
+            title="No data yet"
+            description="No token optimizer measurements recorded yet tonight. Enable a tool in Settings to begin A/B measurement."
+          />
+        ) : (
         <div className="flex flex-col gap-3">
           <div className="flex flex-wrap items-baseline justify-between gap-2">
             <div>
@@ -89,6 +100,7 @@ export function TokenSavingsCard({ savings }: TokenSavingsCardProps) {
             </div>
           )}
         </div>
+        )}
       </GlassCard>
     </div>
   );

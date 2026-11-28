@@ -31,7 +31,7 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
   idle: {
     scenario: "idle",
     runState: "idle",
-    headline: "Night-Shift Desktop is ready for tonight. Select a plan to start.",
+    headline: "Night-Shift Desktop is ready for tonight.",
     activeProjectId: "nightshift-desktop",
     projects: [
       { id: "nightshift-desktop", name: "Night-Shift Desktop", repo: "owner/nightshift-desktop" },
@@ -51,7 +51,7 @@ export const SCENARIO_FIXTURES: Record<ScenarioName, AppSnapshot> = {
       project_id: "nightshift-desktop",
       project_name: "Night-Shift Desktop",
       state: "idle",
-      headline: "Night-Shift Desktop is ready for tonight. Select a plan to start.",
+      headline: "Night-Shift Desktop is ready for tonight.",
       needs_you: [],
       done_tonight: [],
       now: { phase: null, step: null, engine: null, why: null, eta: null },

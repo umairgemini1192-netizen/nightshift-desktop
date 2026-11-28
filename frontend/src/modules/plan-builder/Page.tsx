@@ -53,6 +53,7 @@ export default function PlanBuilderPage() {
   const [validationProblems, setValidationProblems] = useState<string[] | null>(null);
   const [isValidated, setIsValidated] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [customLadderNames, setCustomLadderNames] = useState<string[]>([]);
 
   // Modals
   const [showImportModal, setShowImportModal] = useState(false);
@@ -68,7 +69,13 @@ export default function PlanBuilderPage() {
   const loadPlan = useCallback(async () => {
     try {
       setLoading(true);
-      const res = await bridge.call<{ plan?: { id: string; title: string; project_id?: string; goal?: string }; phases?: PlanPhase[] }>("plan.get");
+      const [res, laddersRes] = await Promise.all([
+        bridge.call<{ plan?: { id: string; title: string; project_id?: string; goal?: string }; phases?: PlanPhase[] }>("plan.get"),
+        bridge.call<{ ladders?: Record<string, unknown> }>("engines.getLadders").catch(() => null),
+      ]);
+      if (laddersRes?.ladders) {
+        setCustomLadderNames(Object.keys(laddersRes.ladders));
+      }
       setPlan(res?.plan ?? null);
       const loaded = (res?.phases ?? []).map((phase) => ({
         ...phase,
@@ -664,7 +671,14 @@ export default function PlanBuilderPage() {
                       label="Failover ladder"
                       value={activePhase.ladder}
                       onChange={(val) => updateActivePhase({ ladder: val })}
-                      options={LADDER_OPTIONS}
+                      options={(() => {
+                        const known = new Set(LADDER_OPTIONS.map((o) => o.value));
+                        const extras = [...customLadderNames, activePhase.ladder]
+                          .filter((name): name is string => Boolean(name) && !known.has(name))
+                          .filter((name, idx, arr) => arr.indexOf(name) === idx)
+                          .map((name) => ({ value: name, label: name }));
+                        return [...LADDER_OPTIONS, ...extras];
+                      })()}
                     />
                     <TextField
                       id="phase-timeout"
