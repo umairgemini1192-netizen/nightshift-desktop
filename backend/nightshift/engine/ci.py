@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from nightshift.clock import active_time, SleepClock
 from nightshift.engine.pipeline_contracts import canonical_contract_json, provider_for_engine
 from nightshift.engine.pipeline_economics import PipelineEconomics
 from nightshift.engine.pipeline_review import (
@@ -246,7 +246,10 @@ class CiPipelineManager:
             checked_sha = str(snapshot.get("headRefOid") or "") if snapshot else ""
             if not checked_sha or self.vcs.local_head_sha(worktree_dir) != checked_sha:
                 return CiWatchResult(passed=False, detail="Local checkout does not match the PR head.", last_engine=active_engine)
+            wake_clock = SleepClock()
             passed, ci_msg = self.vcs.watch_pr_checks(repo, pr_number, worktree_dir)
+            if wake_clock.jumped() and self.scheduler.login_checker is not None:
+                self.scheduler.login_checker.check_all(repo=repo, force=True)
 
             # 1. Flaky test detector: if failed, re-run checks once before burning a fix round
             if not passed and round_num == 0:
@@ -395,9 +398,9 @@ class CiPipelineManager:
                             raw_diff=diff_text,
                             head_sha=checked_sha,
                         )
-                        rev_t0 = time.monotonic()
+                        rev_t0 = active_time()
                         rev_res = await reviewer.run(review_prompt, worktree_dir, effort="low", timeout_seconds=900)
-                        rev_elapsed = round(time.monotonic() - rev_t0, 3)
+                        rev_elapsed = round(active_time() - rev_t0, 3)
                         validated = parse_and_validate_review_output(
                             rev_res.stdout or "",
                             worktree_dir=worktree_dir,
@@ -415,9 +418,9 @@ class CiPipelineManager:
                                 head_sha=checked_sha,
                                 retry_validation_errors=retry_errors,
                             )
-                            rev_t1 = time.monotonic()
+                            rev_t1 = active_time()
                             rev_res = await reviewer.run(retry_prompt, worktree_dir, effort="low", timeout_seconds=900)
-                            rev_elapsed = round(rev_elapsed + (time.monotonic() - rev_t1), 3)
+                            rev_elapsed = round(rev_elapsed + (active_time() - rev_t1), 3)
                             validated = parse_and_validate_review_output(
                                 rev_res.stdout or "",
                                 worktree_dir=worktree_dir,
@@ -569,7 +572,7 @@ class CiPipelineManager:
                             fix_prov = provider_for_engine(active_engine)
                             if fix_prov:
                                 all_contributing_providers.add(fix_prov)
-                            fix_t0 = time.monotonic()
+                            fix_t0 = active_time()
                             fix_res = await runner_obj.run(fix_review_prompt, worktree_dir, model=choice.model or None, effort=choice.effort, timeout_seconds=timeout)
                             if task_id_val:
                                 fix_raw_out = fix_res.stdout if fix_res.rc == 0 else fix_res.stderr
@@ -582,7 +585,7 @@ class CiPipelineManager:
                                     risk_class=effective_risk_class,
                                     tokens_in=fix_tin or (len(fix_review_prompt) // 4),
                                     tokens_out=fix_tout or (len(fix_raw_out or "") // 4),
-                                    wall_seconds=round(time.monotonic() - fix_t0, 3),
+                                    wall_seconds=round(active_time() - fix_t0, 3),
                                     outcome="ok" if fix_res.rc == 0 else "retry",
                                 )
                             continue
@@ -823,7 +826,7 @@ class CiPipelineManager:
             if fix_prov:
                 all_contributing_providers.add(fix_prov)
             fix_timeout = self.scheduler.invocation_timeout_seconds(phase_id, active_engine, 2400)
-            ci_fix_t0 = time.monotonic()
+            ci_fix_t0 = active_time()
             ci_fix_res = await runner.run(
                 f"Read and fix the CI failure in .nightshift_prompt.md, commit, and push to {branch}.",
                 worktree_dir,
@@ -842,7 +845,7 @@ class CiPipelineManager:
                     risk_class=base_risk_for_routing,
                     tokens_in=ci_tin or (len(fix_prompt) // 4),
                     tokens_out=ci_tout or (len(ci_fix_raw or "") // 4),
-                    wall_seconds=round(time.monotonic() - ci_fix_t0, 3),
+                    wall_seconds=round(active_time() - ci_fix_t0, 3),
                     outcome="ok" if ci_fix_res.rc == 0 else "retry",
                 )
 
