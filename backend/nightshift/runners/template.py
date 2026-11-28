@@ -21,8 +21,11 @@ class TemplateRunner:
         quota_ledger: QuotaLedger | None = None,
         quota_patterns: list[str] | None = None,
         env: dict[str, str] | None = None,
+        default_model: str = "",
     ) -> None:
         self.name = name
+        # Model configured for this engine; used whenever a caller does not pass one.
+        self.default_model = default_model
         if isinstance(command_template, str):
             try:
                 self.template = json.loads(command_template)
@@ -46,7 +49,7 @@ class TemplateRunner:
         for token in self.template:
             sub = token.replace("{instruction}", prompt)
             sub = sub.replace("{prompt}", prompt)
-            sub = sub.replace("{model}", model or "")
+            sub = sub.replace("{model}", model or self.default_model or "")
             sub = sub.replace("{effort}", effort or "medium")
             sub = sub.replace("{workdir}", str(workdir))
             cmd.append(sub)
@@ -61,6 +64,7 @@ class TemplateRunner:
         effort: str = "medium",
         timeout_seconds: int = 3600,
     ) -> RunnerResult:
+        model = model or self.default_model or None
         cmd = self.build_command(prompt, workdir, model=model, effort=effort)
         rc, out, err, timed_out = run_subprocess_with_timeout(
             cmd, cwd=workdir, timeout_seconds=timeout_seconds, env=self._env, scrub_env=True

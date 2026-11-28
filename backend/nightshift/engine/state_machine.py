@@ -482,7 +482,8 @@ class EngineStateMachine:
                         if prior.get("status") in ("merging", "merged", "releasing", "verifying_build") or (prior.get("status") == "parked" and prior.get("pr_number")):
                             row = self._finish_merged_delivery(project, phase, merged_pr, "none")
                             summary_rows.append(row)
-                            if row["status"] == "COMPLETED":
+                            # SKIPPED = historic merge with no delivery: still a completed dependency.
+                            if row["status"] in ("COMPLETED", "SKIPPED"):
                                 completed_ids.add(phase.id)
                             else:
                                 parked_ids.add(phase.id)
@@ -1780,6 +1781,7 @@ class EngineStateMachine:
                 quota_ledger=self.quota,
                 quota_patterns=patterns,
                 env=env,
+                default_model=str(eng_row.get("model") or ""),
             )
         self.runners[engine_name] = runner_obj
         return runner_obj
