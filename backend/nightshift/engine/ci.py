@@ -242,13 +242,14 @@ class CiPipelineManager:
                     forbidden_globs=contract_forbidden_globs,
                     test_file_snapshots=test_snapshots,
                 )
-                if guard_findings:
-                    for finding in guard_findings:
+                non_split_findings = [f for f in guard_findings if f.guard != "governance_split_required"]
+                if non_split_findings:
+                    for finding in non_split_findings:
                         self.store.record_guard_result(phase_id, finding.guard, passed=False, detail=finding.message)
                     return CiWatchResult(
                         passed=False,
                         rounds_used=round_num,
-                        detail="Diff guard failed: " + "; ".join(f.message for f in guard_findings),
+                        detail="Diff guard failed: " + "; ".join(f.message for f in non_split_findings),
                         last_engine=active_engine,
                         checked_sha=checked_sha,
                         expected_base_sha=expected_base_sha,

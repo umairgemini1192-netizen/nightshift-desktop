@@ -553,3 +553,104 @@ def test_governance_split_safe_path_with_equal_stricter_assertions_and_owner_app
         reviewer_tier="standard",
     )
     assert auth_ok.allowed is True
+
+
+def test_ci_watch_defers_split_only_to_merge_gate_but_blocks_relaxation(tmp_path: Path) -> None:
+    """CiPipelineManager must not fail with diff_guard_failed on split-only feature+test diffs,
+    but must still block when assertion_relaxation is also present."""
+    from nightshift.engine.ci import CiPipelineManager
+    from nightshift.engine.pipeline_contracts import DiffPathEntry, canonical_contract_json, compute_contract_sha256
+    from nightshift.engine.scheduler import Scheduler
+    from nightshift.engine.vcs import FakeGitGh
+
+    store = Store(tmp_path / "db.sqlite")
+    store.migrate()
+    events = EventBus(store)
+    proj = store.create_project("demo", "owner/repo", str(tmp_path), ladders={"ci_fix": ["codex"]})
+    store.upsert_phase(id="p1", project_id=proj["id"], title="P1", prompt="x", branch="feat/p1", order_idx=0)
+    contract_payload = {
+        "task_id": "t-ci-split",
+        "allowed_globs": ["backend/**"],
+        "forbidden_globs": [".circleci/**"],
+        "risk_class": "business_logic",
+    }
+    canon = canonical_contract_json(contract_payload)
+    c_sha = compute_contract_sha256(canon)
+    store.create_frozen_contract(
+        contract_id="c-ci-split",
+        task_id="t-ci-split",
+        project_id=proj["id"],
+        contract_sha256=c_sha,
+        canonical_json=canon,
+        allowed_globs_json='["backend/**"]',
+        forbidden_globs_json='[".circleci/**"]',
+    )
+    task = store.create_task(
+        task_id="t-ci-split",
+        project_id=proj["id"],
+        phase_id="p1",
+        contract_id="c-ci-split",
+        contract_sha256=c_sha,
+        status="VERIFYING",
+    )
+
+    vcs = FakeGitGh()
+    vcs.pr_checks["owner/repo#1"] = [
+        {"name": "ci/circleci: desktop-backend", "bucket": "pass", "state": "SUCCESS", "link": ""}
+    ]
+    vcs.pr_details["owner/repo#1"] = {"headRefOid": "head111", "baseRefOid": "base000", "state": "OPEN"}
+    vcs.changed_entries[str(tmp_path)] = [
+        DiffPathEntry(status="M", path="backend/nightshift/foo.py"),
+        DiffPathEntry(status="M", path="backend/tests/test_foo.py"),
+    ]
+    vcs.changed_files[str(tmp_path)] = ["backend/nightshift/foo.py", "backend/tests/test_foo.py"]
+    vcs.diffs[str(tmp_path)] = "+assert 2 == 2"
+    vcs.test_snapshots[str(tmp_path)] = {
+        "backend/tests/test_foo.py": (
+            "def test_old():\n    assert 1 == 1\n",
+            "def test_old():\n    assert 1 == 1\n    assert 2 == 2\n",
+        )
+    }
+
+    ledger = QuotaLedger(store)
+    scheduler = Scheduler(store, ledger, events, runners={"codex": FakeRunner("codex", vcs)})
+    ci_mgr = CiPipelineManager(store, vcs, scheduler, events)
+
+    res_split = ci_mgr.watch_and_fix(
+        repo="owner/repo",
+        branch="feat/p1",
+        pr_number=1,
+        worktree_dir=tmp_path,
+        phase_id="p1",
+        ladder="ci_fix",
+        max_rounds=1,
+        poll_interval=0.0,
+        task_id=task["id"],
+        task_contract=store.get_frozen_contract("c-ci-split"),
+        require_codex_review=False,
+    )
+    assert res_split.block_reason != "diff_guard_failed"
+
+    # Now introduce an assertion relaxation alongside the split -> MUST block with diff_guard_failed
+    vcs.test_snapshots[str(tmp_path)] = {
+        "backend/tests/test_foo.py": (
+            "def test_old():\n    assert 1 == 1\n",
+            "def test_old():\n    pass\n",
+        )
+    }
+    res_relax = ci_mgr.watch_and_fix(
+        repo="owner/repo",
+        branch="feat/p1",
+        pr_number=1,
+        worktree_dir=tmp_path,
+        phase_id="p1",
+        ladder="ci_fix",
+        max_rounds=1,
+        poll_interval=0.0,
+        task_id=task["id"],
+        task_contract=store.get_frozen_contract("c-ci-split"),
+        require_codex_review=False,
+    )
+    assert res_relax.passed is False
+    assert res_relax.block_reason == "diff_guard_failed"
+

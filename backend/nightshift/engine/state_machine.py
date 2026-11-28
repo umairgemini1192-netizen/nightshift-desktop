@@ -1063,11 +1063,22 @@ class EngineStateMachine:
                 if effective_size != phase.size:
                     self.store.update_phase(phase.id, size=effective_size)
 
+                non_split_findings = [f for f in findings if f.guard != "governance_split_required"]
                 for f in findings:
-                    self.store.record_guard_result(phase.id, f.guard, passed=False, detail=f.message)
+                    deferred_split = f.guard == "governance_split_required" and not non_split_findings
+                    self.store.record_guard_result(
+                        phase.id,
+                        f.guard,
+                        passed=deferred_split,
+                        detail=(
+                            "Combined feature+test PR deferred to MergeGate owner approval"
+                            if deferred_split
+                            else f.message
+                        ),
+                    )
 
                 elapsed_min = max(0.01, (time.time() - t0) / 60.0)
-                attempt_ok = bool(res.rc == 0 and ok_deliv and not findings)
+                attempt_ok = bool(res.rc == 0 and ok_deliv and not non_split_findings)
                 self.economics.record_ledger_event(
                     task_id=task_id,
                     role="coder",
@@ -1105,11 +1116,11 @@ class EngineStateMachine:
 
                 # Failure, diff-guard finding, or quota exhaustion -> self-heal / mid-phase handoff
                 self.store.update_engine_stats(active_runner_name, effective_size, success=False, minutes=elapsed_min)
-                failure_reason = "Diff guard failed: " + "; ".join(f.message for f in findings) if findings else deliv_reason if not ok_deliv else res.stderr[:200]
+                failure_reason = "Diff guard failed: " + "; ".join(f.message for f in non_split_findings) if non_split_findings else deliv_reason if not ok_deliv else res.stderr[:200]
                 self.store.update_step(step_id, rc=res.rc, verified=0, detail=failure_reason)
-                if findings:
+                if non_split_findings:
                     diff_guard_retries += 1
-                    findings_summary = "\n".join(f"- [{f.guard}] {f.message}" for f in findings)
+                    findings_summary = "\n".join(f"- [{f.guard}] {f.message}" for f in non_split_findings)
                     prompt_path.write_text(
                         guardrail_header + phase.prompt + f"\n\nDIFF GUARD FINDINGS TO FIX:\n{findings_summary}\n",
                         encoding="utf-8",
@@ -1188,11 +1199,12 @@ class EngineStateMachine:
                 forbidden_globs=contract_forbidden_globs,
                 test_file_snapshots=cur_snapshots,
             )
-            if not findings:
+            non_split_findings = [f for f in findings if f.guard != "governance_split_required"]
+            if not non_split_findings:
                 return None
-            for finding in findings:
+            for finding in non_split_findings:
                 self.store.record_guard_result(phase.id, finding.guard, passed=False, detail=finding.message)
-            reason = "Diff guard failed: " + "; ".join(f.message for f in findings)
+            reason = "Diff guard failed: " + "; ".join(f.message for f in non_split_findings)
             self._park_phase(project.id, phase, reason=reason, next_step="Fix the diff guard findings")
             return {"phase_id": phase.id, "title": phase.title, "runner": active_runner_name, "status": "PARKED", "detail": reason}
 
