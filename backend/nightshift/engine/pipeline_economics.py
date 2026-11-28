@@ -45,6 +45,7 @@ EST_TOKEN_RATES_PER_MILLION: dict[str, tuple[float, float]] = {
     "codex": (1.10, 4.40),
     "claude": (3.00, 15.00),
     "qwen": (0.0, 0.0),
+    "zai-glm-flash": (0.0, 0.0),
     "deepseek": (0.14, 0.28),
     "kimi": (0.20, 0.60),
     "glm": (0.15, 0.45),
@@ -55,6 +56,7 @@ EST_TOKEN_RATES_PER_MILLION: dict[str, tuple[float, float]] = {
 FREE_ONLY_ALLOWED_ENGINES: frozenset[str] = frozenset(
     {
         "qwen",
+        "zai-glm-flash",
         "agy",
         "antigravity",
         "gemini",

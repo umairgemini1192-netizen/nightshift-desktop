@@ -31,6 +31,7 @@ ENGINE_PROVIDER_MAP: dict[str, str] = {
     "deepseek": "deepseek",
     "kimi": "moonshot",
     "glm": "zhipu",
+    "zai-glm-flash": "zhipu",
     "minimax": "minimax",
     "script": "local",
 }

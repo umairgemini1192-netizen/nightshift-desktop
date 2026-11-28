@@ -11,6 +11,8 @@ function statusBadgeProps(
       return { tone: "success", label: "Enabled" };
     case "auto_disabled":
       return { tone: "danger", label: "Auto-disabled" };
+    case "not_installed":
+      return { tone: "neutral", label: "Not installed" };
     case "hash_mismatch":
       return { tone: "danger", label: "SHA-256 mismatch" };
     case "isolation_blocked":
@@ -73,6 +75,19 @@ export function TokenOptimizerSettingsCard() {
         description: String(err),
         tone: "danger",
       });
+    } finally {
+      setTogglingTool(null);
+    }
+  };
+
+  const handleInstall = async (tool: TokenOptimizerToolItem) => {
+    setTogglingTool(tool.name);
+    try {
+      const res = await bridge.call<TokenOptimizerState & { installResult?: { ok: boolean; warning: string } }>("token_optimizer.installTool", { tool: tool.name });
+      setState(res);
+      pushToast({ title: res.installResult?.ok ? `${tool.displayName} installed` : `Could not install ${tool.displayName}`, description: res.installResult?.warning, tone: res.installResult?.ok ? "success" : "danger" });
+    } catch (err) {
+      pushToast({ title: `Could not install ${tool.displayName}`, description: String(err), tone: "danger" });
     } finally {
       setTogglingTool(null);
     }
@@ -184,6 +199,7 @@ export function TokenOptimizerSettingsCard() {
               const toggleDisabled =
                 tool.catalogueOnly ||
                 tool.status === "hash_mismatch" ||
+                tool.status === "not_installed" ||
                 (tool.isolationGateRequired && !tool.isolationPassed) ||
                 togglingTool === tool.name;
 
@@ -234,6 +250,9 @@ export function TokenOptimizerSettingsCard() {
                       disabled={toggleDisabled}
                       onChange={(checked) => void handleToggle(tool, checked)}
                     />
+                    {tool.status === "not_installed" && (
+                      <Button size="sm" variant="secondary" loading={togglingTool === tool.name} onClick={() => void handleInstall(tool)}>Install</Button>
+                    )}
                     {tool.isolationGateRequired && (
                       <Button
                         size="sm"

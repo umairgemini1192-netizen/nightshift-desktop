@@ -123,7 +123,7 @@ class BridgeAPI:
         if PipelineEconomics(self._store).is_free_only_mode() and not is_free_only_engine(engine_id, runner=runner, cost_tier=tier):
             return "Unavailable (free-only mode)"
         if runner == "claude-compatible" or engine_id in ("deepseek", "kimi", "glm", "minimax"):
-            has_cred = bool(
+            has_cred = bool(os.environ.get("ZAI_API_KEY")) if engine_id == "zai-glm-flash" else bool(
                 self._creds.get_secret(f"api_key_{engine_id}")
                 or self._creds.get_secret(engine_id)
                 or os.environ.get(f"{engine_id.upper()}_API_KEY")

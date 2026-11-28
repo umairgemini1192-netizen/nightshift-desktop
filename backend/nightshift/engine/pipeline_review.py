@@ -34,6 +34,7 @@ ENGINE_TIER_MAP: dict[str, str] = {
     "deepseek": "economy",
     "kimi": "economy",
     "glm": "economy",
+    "zai-glm-flash": "economy",
     "minimax": "economy",
 }
 
@@ -49,6 +50,7 @@ DEFAULT_REVIEWER_ORDER: tuple[str, ...] = (
     "deepseek",
     "kimi",
     "glm",
+    "zai-glm-flash",
     "minimax",
 )
 

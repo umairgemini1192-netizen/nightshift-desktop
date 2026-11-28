@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from nightshift.engine.credentials import get_credential_store, redact_known_secrets
+from nightshift.engine.credentials import get_credential_store, redact_known_secrets, _register_secret_for_redaction
 from nightshift.engine.pipeline_contracts import provider_for_engine
 from nightshift.engine.pipeline_economics import (
     PipelineEconomics,
@@ -60,6 +60,7 @@ DEFAULT_BASE_URLS: dict[str, str] = {
     "deepseek": "https://api.deepseek.com/anthropic",
     "kimi": "https://api.moonshot.ai/anthropic",
     "glm": "https://open.bigmodel.cn/api/anthropic",
+    "zai-glm-flash": "https://api.z.ai/api/anthropic",
     "minimax": "https://api.minimax.io/anthropic",
 }
 
@@ -164,6 +165,17 @@ SEED_ENGINES: list[dict[str, Any]] = [
         "budget": {},
         "command_template": ["claude", "-p", "{instruction}", "--permission-mode", "bypassPermissions", "--output-format", "text"],
         "quota_patterns": ["rate limit", "quota error"],
+    },
+    {
+        "id": "zai-glm-flash",
+        "runner": "claude-compatible",
+        "model": "GLM-4.7-Flash",
+        "effort": "medium",
+        "cost_tier": TIER_ECONOMY,
+        "skills": {"docs": 4, "review": 3, "backend": 3, "plan": 2, "ui": 2, "fix_ci": 2},
+        "budget": {},
+        "command_template": ["claude", "-p", "{instruction}", "--permission-mode", "bypassPermissions", "--output-format", "text"],
+        "quota_patterns": ["rate limit", "quota error", "429"],
     },
     {
         "id": "minimax",
@@ -337,10 +349,11 @@ class Router:
 
         # Check required API key for claude-compatible economy engines
         if runner == "claude-compatible":
-            key = self.cred_store.get_secret(f"api_key_{eng_id}") or self.cred_store.get_secret(f"api_key_{model}")
+            key = (os.environ.get("ZAI_API_KEY") if eng_id == "zai-glm-flash" else
+                   self.cred_store.get_secret(f"api_key_{eng_id}") or self.cred_store.get_secret(f"api_key_{model}"))
             if not key:
                 # If no custom key set, only available if generic ANTHROPIC_AUTH_TOKEN exists
-                if not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+                if eng_id == "zai-glm-flash" or not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
                     return False, f"No API key configured for {eng_id}"
 
         return True, "Available"
@@ -632,7 +645,8 @@ class Router:
         eng = self.store.get_engine(engine_id) or {}
         env: dict[str, str] = {}
         if eng.get("runner") == "claude-compatible":
-            api_key = self.cred_store.get_secret(f"api_key_{engine_id}") or self.cred_store.get_secret(f"api_key_{eng.get('model')}")
+            api_key = (os.environ.get("ZAI_API_KEY") if engine_id == "zai-glm-flash" else
+                       self.cred_store.get_secret(f"api_key_{engine_id}") or self.cred_store.get_secret(f"api_key_{eng.get('model')}"))
             base_url = (
                 eng.get("base_url")
                 or self.store.get_setting(f"engine.{engine_id}.base_url")
@@ -640,6 +654,7 @@ class Router:
             )
 
             if api_key:
+                _register_secret_for_redaction(api_key)
                 env["ANTHROPIC_AUTH_TOKEN"] = api_key
             if base_url:
                 env["ANTHROPIC_BASE_URL"] = base_url
