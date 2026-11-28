@@ -1485,12 +1485,26 @@ class SubprocessGitGh:
     ) -> str | None:
         if branch.strip().lower() in ("main", "master"):
             raise ValueError(f"Hard guard violation: direct push to protected branch '{branch}' is forbidden.")
-        run_subprocess_with_timeout(["git", "add", "-A"], cwd=worktree_dir, timeout_seconds=60)
-        rc_c, _, _, _ = run_subprocess_with_timeout(["git", "commit", "-m", message], cwd=worktree_dir, timeout_seconds=60)
-        if rc_c == 0:
-            run_subprocess_with_timeout(["git", "push", "origin", branch], cwd=worktree_dir, timeout_seconds=120)
-            return self.local_head_sha(worktree_dir)
-        return None
+        def git(args: list[str], timeout: int = 60) -> tuple[int, str, str, bool]:
+            return run_subprocess_with_timeout(["git", *args], cwd=worktree_dir, timeout_seconds=timeout)
+
+        rc, current, err, _ = git(["branch", "--show-current"])
+        if rc != 0 or current.strip() != branch:
+            raise RuntimeError(f"Cannot checkpoint: worktree is not on {branch}: {err or current}")
+        rc, _, err, _ = git(["add", "-A"])
+        if rc != 0:
+            raise RuntimeError(f"Cannot stage checkpoint: {err}")
+        rc, _, err, _ = git(["diff", "--cached", "--quiet"])
+        if rc == 1:
+            rc, _, err, _ = git(["commit", "-m", message])
+            if rc != 0:
+                raise RuntimeError(f"Cannot commit checkpoint: {err}")
+        elif rc != 0:
+            raise RuntimeError(f"Cannot inspect checkpoint: {err}")
+        rc, _, err, _ = git(["push", "origin", branch], timeout=120)
+        if rc != 0:
+            raise RuntimeError(f"Cannot push checkpoint: {err}")
+        return self.local_head_sha(worktree_dir)
 
     def merge_main_into_branch(self, worktree_dir: Path) -> tuple[bool, str]:
         run_subprocess_with_timeout(["git", "fetch", "origin", "main"], cwd=worktree_dir, timeout_seconds=60)
