@@ -82,11 +82,15 @@ class CiPipelineManager:
         store: Store,
         scheduler: Scheduler,
         runners: dict[str, Runner],
+        runner_resolver: Callable[[str], Runner | None] | None = None,
     ) -> None:
         self.vcs = vcs
         self.store = store
         self.scheduler = scheduler
         self.runners = runners
+        # Lazily constructs a configured engine's runner (the engine only instantiates the
+        # implementer it picked), so availability reflects configuration, not history.
+        self.runner_resolver = runner_resolver
         self.economics = PipelineEconomics(store)
         if self.scheduler.router is not None and runners:
             self.scheduler.router.register_runners(runners)
@@ -148,6 +152,48 @@ class CiPipelineManager:
         if chosen and runner:
             return chosen, runner
         return None, None
+
+    def select_required_codex_reviewer(
+        self,
+        *,
+        contributing_providers: set[str] | None = None,
+        risk_class: str = "business_logic",
+        task_id: str | None = None,
+    ) -> tuple[str | None, Runner | None, str]:
+        """Select Codex as the required reviewer, enforcing every routing safeguard.
+
+        Returns (engine, runner, "") when Codex may review, else (None, None, reason).
+        Never invokes an ineligible (disabled, cooling down, over budget, logged out) engine.
+        """
+        excluded = {provider_for_engine(p) for p in (contributing_providers or set()) if p}
+        if "openai" in excluded:
+            return None, None, "Codex (openai) contributed to this branch, so it cannot review it independently"
+        chosen = "codex"
+        if self.scheduler.router is not None:
+            route = self.scheduler.router.route_pipeline_task(
+                role="reviewer",
+                risk_class=risk_class,
+                contributing_providers=excluded,
+                task_id=task_id,
+                allowed_engines={"codex"},
+            )
+            if route.blocked or not route.chosen_id:
+                why = route.reason or "blocked by routing safeguards"
+                return None, None, f"Codex is not eligible to review: {why}"
+            chosen = route.chosen_id
+        elif not self.scheduler.is_engine_available("codex"):
+            return None, None, "Codex is unavailable (disabled, cooling down, over budget or logged out)"
+        runner = self.runners.get(chosen) or self.runners.get("codex")
+        if runner is None and self.runner_resolver is not None:
+            try:
+                runner = self.runner_resolver(chosen)
+            except Exception:
+                runner = None
+            if runner is not None:
+                self.runners[chosen] = runner
+        if runner is None:
+            return None, None, "Codex is configured but its runner could not be created"
+        return chosen, runner, ""
 
     async def watch_and_heal(
         self,
@@ -281,14 +327,18 @@ class CiPipelineManager:
 
                     if must_codex_review or (require_independent_reviewer and classification.requires_independent_review):
                         if must_codex_review:
-                            codex_runner = self.runners.get("codex")
-                            if "openai" in all_contributing_providers or codex_runner is None:
+                            codex_name, codex_runner, codex_why = self.select_required_codex_reviewer(
+                                contributing_providers=all_contributing_providers,
+                                risk_class=effective_risk_class,
+                                task_id=task_id_val,
+                            )
+                            if codex_runner is None or codex_name is None:
                                 return CiWatchResult(
                                     passed=False,
                                     rounds_used=round_num,
                                     detail=(
                                         "Owner merge rule requires an independent Codex review on this exact head; "
-                                        "Codex is unavailable or contributed to this branch."
+                                        f"{codex_why}."
                                     ),
                                     last_engine=active_engine,
                                     checked_sha=checked_sha,
@@ -297,7 +347,7 @@ class CiPipelineManager:
                                     effective_risk_class=effective_risk_class,
                                     block_reason="codex_review_required",
                                 )
-                            rev_engine_name, reviewer = "codex", codex_runner
+                            rev_engine_name, reviewer = codex_name, codex_runner
                         else:
                             rev_engine_name, reviewer = self.select_reviewer(
                                 active_engine,

@@ -178,6 +178,23 @@ def deterministic_triage_fallback(failing_log: str, *, job_name: str = "CI") -> 
     )
 
 
+def _has_engine_credentials(engine_id: str, eng: dict[str, Any] | None) -> bool:
+    """Same credential sources the Router uses: the app's credential store (``api_key_<engine>``
+    or ``api_key_<model>``), then the process environment."""
+    import os
+
+    from nightshift.engine.credentials import get_credential_store
+
+    try:
+        cred = get_credential_store()
+        model = str((eng or {}).get("model") or "")
+        if cred.get_secret(f"api_key_{engine_id}") or (model and cred.get_secret(f"api_key_{model}")):
+            return True
+    except Exception:
+        pass
+    return bool(os.environ.get(f"{engine_id.upper()}_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+
+
 def _filter_small_job_candidates(
     candidates: list[str],
     store: Store | None,
@@ -201,9 +218,7 @@ def _filter_small_job_candidates(
         if free_only and not is_free_only_engine(cand, runner=runner, cost_tier=tier):
             continue
         if runner == "claude-compatible" or cand in ("deepseek", "kimi", "glm", "minimax"):
-            import os
-            env_key = f"{cand.upper()}_API_KEY"
-            if not os.environ.get(env_key):
+            if not _has_engine_credentials(cand, eng):
                 continue
         login = latest_logins.get(cand) or (latest_logins.get(runner) if runner else None)
         if login and str(login.get("state") or "") in ("Logged out", "Not installed", "Disabled by owner"):

@@ -272,6 +272,7 @@ class EngineStateMachine:
             store=store,
             scheduler=self.scheduler,
             runners=self.runners,
+            runner_resolver=self._resolve_runner,
         )
         self.release_mgr = ReleaseManager(vcs=self.vcs, smoke_runner=smoke_runner)
 
@@ -396,6 +397,7 @@ class EngineStateMachine:
                     depends_on_json=json.dumps(p.depends_on),
                     size=p.size, ladder=p.ladder, timeout_minutes=p.timeout_minutes,
                     auto_merge=p.auto_merge, release_after_merge=p.release_after_merge, force_rerun=p.force_rerun,
+                    require_codex_review=bool(p.require_codex_review),
                     position=p.position,
                     status=previous.get("status", "pending"),
                     attempt=previous.get("attempt", 0),
@@ -899,36 +901,9 @@ class EngineStateMachine:
                     return {"phase_id": phase.id, "title": phase.title, "runner": "none", "status": "PARKED", "detail": f"No eligible engine available (earliest reset {earliest_str})"}
 
                 active_runner_name = choice.engine
-                runner_obj = self.runners.get(active_runner_name)
+                runner_obj = self.runners.get(active_runner_name) or self._resolve_runner(active_runner_name)
                 if not runner_obj:
-                    eng_row = next(
-                        (e for e in self.store.list_engines() if e["id"] == active_runner_name),
-                        None,
-                    ) or next(
-                        (e for e in self.store.list_engines() if e["runner"] == active_runner_name),
-                        None,
-                    )
-                    if eng_row:
-                        runner_type = eng_row.get("runner", "")
-                        if runner_type and runner_type in self.runners:
-                            runner_obj = self.runners[runner_type]
-                            self.runners[active_runner_name] = runner_obj
-                        else:
-                            env = self.scheduler.router.build_isolated_environment(eng_row["id"])
-                            try:
-                                patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
-                            except Exception:
-                                patterns = []
-                            runner_obj = TemplateRunner(
-                                eng_row["runner"],
-                                eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
-                                quota_ledger=self.quota,
-                                quota_patterns=patterns,
-                                env=env,
-                            )
-                            self.runners[active_runner_name] = runner_obj
-                    else:
-                        raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
+                    raise RuntimeError(f"No runner available for engine '{active_runner_name}'")
 
                 # Record step in SQLite before execution
                 step_id = self.store.record_step(phase.id, "implement", active_runner_name)
@@ -1778,6 +1753,36 @@ class EngineStateMachine:
             "status": "COMPLETED",
             "detail": detail,
         }
+
+    def _resolve_runner(self, engine_name: str) -> Runner | None:
+        """Return (constructing and caching if needed) the runner for a configured engine."""
+        runner_obj = self.runners.get(engine_name)
+        if runner_obj:
+            return runner_obj
+        engines = self.store.list_engines()
+        eng_row = next((e for e in engines if e["id"] == engine_name), None) or next(
+            (e for e in engines if e["runner"] == engine_name), None
+        )
+        if not eng_row:
+            return None
+        runner_type = eng_row.get("runner", "")
+        if runner_type and runner_type in self.runners:
+            runner_obj = self.runners[runner_type]
+        else:
+            env = self.scheduler.router.build_isolated_environment(eng_row["id"])
+            try:
+                patterns = json.loads(eng_row.get("quota_patterns_json") or "[]")
+            except Exception:
+                patterns = []
+            runner_obj = TemplateRunner(
+                eng_row["runner"],
+                eng_row.get("command_template") or [eng_row["runner"], "-p", "{instruction}"],
+                quota_ledger=self.quota,
+                quota_patterns=patterns,
+                env=env,
+            )
+        self.runners[engine_name] = runner_obj
+        return runner_obj
 
     @staticmethod
     def _uses_circleci_main_check(project: ProjectConfig) -> bool:

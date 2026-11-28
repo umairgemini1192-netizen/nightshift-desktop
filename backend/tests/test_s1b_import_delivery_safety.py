@@ -713,3 +713,86 @@ async def test_triage_uses_the_tasks_own_project_ladder(tmp_path: Path, monkeypa
         failing_log="E   AssertionError", workdir=tmp_path, runners={}, store=store, task_id="task-p1",
     )
     assert seen == ["owner/repo"]
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 2 on PR #35 (96bad76): regression tests
+# ---------------------------------------------------------------------------
+
+def _ci_manager_with_router(store: Store, runners: dict[str, Any], resolver: Any = None):
+    from nightshift.engine.ci import CiPipelineManager
+    from nightshift.engine.router import Router
+    from nightshift.engine.scheduler import Scheduler
+
+    quota = QuotaLedger(store)
+    router = Router(store, quota)
+    router.is_engine_installed = lambda _runner: True  # type: ignore[method-assign]
+    sched = Scheduler(store, quota, router=router)
+    return CiPipelineManager(FakeGitGh(), store, sched, runners, runner_resolver=resolver)
+
+
+def test_required_codex_reviewer_is_constructed_lazily_when_configured(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    created: list[str] = []
+    codex = FakeRunner.success("codex", stdout="LGTM\n")
+
+    def _resolve(name: str):
+        created.append(name)
+        return codex
+
+    ci_mgr = _ci_manager_with_router(store, {"agy": FakeRunner.success("agy")}, resolver=_resolve)
+    name, runner, why = ci_mgr.select_required_codex_reviewer(contributing_providers={"google"})
+    assert why == ""
+    assert runner is codex and name is not None
+    assert created  # built on demand, not required to be pre-registered
+
+
+def test_required_codex_reviewer_respects_routing_safeguards(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    store.upsert_engine("codex", "codex", "o3-mini", enabled=0)  # owner disabled Codex
+    invoked: list[str] = []
+
+    def _resolve(name: str):
+        invoked.append(name)
+        return FakeRunner.success("codex")
+
+    ci_mgr = _ci_manager_with_router(store, {"agy": FakeRunner.success("agy")}, resolver=_resolve)
+    name, runner, why = ci_mgr.select_required_codex_reviewer(contributing_providers={"google"})
+    assert runner is None and name is None
+    assert "not eligible" in why
+    assert invoked == []  # a disabled Codex is never constructed or run
+
+
+def test_required_codex_reviewer_refuses_when_codex_contributed(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    ci_mgr = _ci_manager_with_router(store, {"codex": FakeRunner.success("codex")})
+    name, runner, why = ci_mgr.select_required_codex_reviewer(contributing_providers={"openai"})
+    assert runner is None and "contributed" in why
+
+
+def test_run_start_preserves_phase_codex_preference() -> None:
+    import inspect
+
+    from nightshift.engine import state_machine as sm_mod
+
+    src = inspect.getsource(sm_mod.EngineStateMachine.execute_plan)
+    upsert = src[src.index("self.store.upsert_phase("):]
+    upsert = upsert[: upsert.index("\n                )")]
+    assert "require_codex_review=bool(p.require_codex_review)" in upsert
+
+
+def test_triage_accepts_engine_key_saved_in_app_credential_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from nightshift.engine import credentials, pipeline_triage
+
+    store = _make_store(tmp_path)
+    store.set_setting("pipeline.freeOnlyMode", "0")
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    mem = credentials.MemoryCredentialStore()
+    credentials.set_credential_store(mem)
+    try:
+        assert "deepseek" not in pipeline_triage._filter_small_job_candidates(["deepseek"], store)
+        mem.set_secret("api_key_deepseek", "test-key-not-real")
+        assert "deepseek" in pipeline_triage._filter_small_job_candidates(["deepseek"], store)
+    finally:
+        credentials.set_credential_store(None)
