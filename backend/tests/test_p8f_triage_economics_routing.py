@@ -733,12 +733,14 @@ async def test_lazy_runners_stay_eligible_for_subsequent_phase_and_failover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """P1 regression: lazily cached runners in self.runners must not become an allowlist."""
-    from nightshift.engine.logins import LoginHealthChecker
+    from nightshift.engine.logins import LoginCheckResult, LoginHealthChecker
     from nightshift.engine.planner import PhaseDefinition
     from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig
     from nightshift.engine.vcs import FakeGitGh
     from nightshift.events import EventBus
     from nightshift.runners.base import RunnerResult
+
+    monkeypatch.setattr("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "worktrees")
 
     store = Store(tmp_path / "nightshift.db")
     store.migrate()
@@ -750,6 +752,11 @@ async def test_lazy_runners_stay_eligible_for_subsequent_phase_and_failover(
     vcs.branches["feat/p1"] = "sha-p1"
     vcs.branches["feat/p2"] = "sha-p2"
     logins = LoginHealthChecker(store=store, quota_ledger=quota)
+    monkeypatch.setattr(
+        logins,
+        "check_tool",
+        lambda tool, **_kwargs: LoginCheckResult(tool=tool, state="Ready", detail="stub"),
+    )
 
     # Normal desktop startup: runners=None (empty cache, lazily populated)
     engine = EngineStateMachine(
@@ -808,10 +815,12 @@ async def test_lazy_runners_stay_eligible_for_subsequent_phase_and_failover(
 
 
 @pytest.mark.asyncio
-async def test_task_attempt_and_fix_counters_enforce_contract_budgets(tmp_path: Path) -> None:
+async def test_task_attempt_and_fix_counters_enforce_contract_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """P1 regression: attempt_count, ci_fix_rounds, and review_fix_rounds advance and enforce contract limits."""
     from nightshift.engine.ci import CiPipelineManager
-    from nightshift.engine.logins import LoginHealthChecker
+    from nightshift.engine.logins import LoginCheckResult, LoginHealthChecker
     from nightshift.engine.planner import PhaseDefinition
     from nightshift.engine.scheduler import Scheduler
     from nightshift.engine.state_machine import EngineStateMachine, ProjectConfig
@@ -819,6 +828,8 @@ async def test_task_attempt_and_fix_counters_enforce_contract_budgets(tmp_path: 
     from nightshift.engine.verify import RiskAssessment
     from nightshift.events import EventBus
     from nightshift.runners.base import RunnerResult
+
+    monkeypatch.setattr("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "worktrees")
 
     # 1. Coder max_attempts=1 stops before 2nd attempt even when scheduler allows 3
     store, task_coder = _make_store_with_task(
@@ -833,6 +844,11 @@ async def test_task_attempt_and_fix_counters_enforce_contract_budgets(tmp_path: 
     vcs = FakeGitGh()
     vcs.branches["feat/t-cap-coder"] = "sha1"
     logins = LoginHealthChecker(store=store, quota_ledger=quota)
+    monkeypatch.setattr(
+        logins,
+        "check_tool",
+        lambda tool, **_kwargs: LoginCheckResult(tool=tool, state="Ready", detail="stub"),
+    )
 
     coder_calls = 0
 

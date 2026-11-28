@@ -269,9 +269,9 @@ class Router:
         seed_default_engines(store)
 
     def register_runners(self, runners: dict[str, Any]) -> None:
-        """Register injected FakeRunner instances so offline tests do not depend on host PATH."""
+        """Register injected FakeRunner instances (and subclasses) so offline tests do not depend on host PATH."""
         for key, runner_obj in (runners or {}).items():
-            if type(runner_obj).__name__ == "FakeRunner":
+            if any(cls.__name__ == "FakeRunner" for cls in type(runner_obj).__mro__):
                 self._fake_runners.add(str(key))
                 r_name = getattr(runner_obj, "name", "")
                 if r_name:
