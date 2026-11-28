@@ -68,29 +68,30 @@ class TokenOptimizerService:
             auto_disabled = bool(db_state.get("auto_disabled", 0)) if db_state else False
             warning = str(db_state.get("warning", "")) if db_state else ""
 
+            verification = None
+            if not spec.catalogue_only and not spec.isolation_gate_required:
+                verification = self._manager.verify_installed(spec.name)
+                db_state = self._store.get_token_tool_state(spec.name) if self._store is not None else None
+                enabled = bool(db_state.get("enabled", 0)) if db_state else False
+                sha_ok = bool(db_state.get("sha256_verified", 0)) if db_state else verification.ok
+                warning = str(db_state.get("warning", "")) if db_state else ""
+
             if spec.catalogue_only:
                 status = "catalogue_only"
-                enabled = False
-                if not warning:
-                    warning = "Catalogue entry only (disabled). Enable later if ccusage shows search is a top cost."
+            elif verification and verification.actual_sha256 and verification.actual_sha256 != verification.expected_sha256:
+                status = "hash_mismatch"
+                warning = verification.warning
+            elif verification and (not verification.installed_path or (verification.ok and (verification.executable_path is None or not verification.executable_path.exists()))):
+                status = "not_installed"
             elif auto_disabled:
                 status = "auto_disabled"
             elif spec.isolation_gate_required and not iso_passed:
                 status = "isolation_blocked"
-                enabled = False
-            elif warning and not sha_ok:
-                status = "hash_mismatch"
-                enabled = False
-            elif enabled:
-                status = "enabled"
-                # Verify tool installation (P1 fix: ensure tools are installed before marking enabled)
-                if spec.name != "agy-fast":
-                    verify_res = self._manager.verify_installed(spec.name)
-                    if not verify_res.ok:
-                        warning = verify_res.warning or "Tool verification failed after enable"
-                        status = "hash_mismatch"
-            else:
+            elif verification and not verification.ok:
                 status = "disabled"
+                warning = verification.warning
+            else:
+                status = "enabled" if enabled else "disabled"
 
             if warning and warning not in warnings and not spec.catalogue_only:
                 warnings.append(warning)
@@ -175,6 +176,26 @@ class TokenOptimizerService:
                 )
             )
         return self.get_state()
+
+    def install_tool(self, tool_name: str) -> dict[str, Any]:
+        spec = self._manager.get_spec(tool_name)
+        if spec is None:
+            raise ValueError(f"Unknown token optimizer tool: {tool_name}")
+        result = self._manager.ensure_installed(tool_name)
+        usable = result.ok and result.executable_path is not None and result.executable_path.exists()
+        warning = result.warning
+        if result.ok and not usable:
+            warning = f"{spec.display_name} was downloaded and verified, but its executable is not available."
+        if usable:
+            for dependency in spec.requires_tools:
+                dep = self._manager.ensure_installed(dependency)
+                if not dep.ok or dep.executable_path is None or not dep.executable_path.exists():
+                    usable = False
+                    warning = dep.warning or f"Could not install {dependency}."
+                    break
+        state = self.get_state()
+        state["installResult"] = {"ok": usable, "warning": warning}
+        return state
 
     def verify_tools(self) -> dict[str, Any]:
         """Verify SHA-256 hashes of all installed tools against tools.lock.json."""
@@ -275,6 +296,7 @@ class Module(ModuleBase):
                 str(args.get("tool", "")),
                 bool(args.get("enabled", False)),
             ),
+            "installTool": lambda args: self.service.install_tool(str(args.get("tool", ""))),
             "verifyTools": lambda _args: self.service.verify_tools(),
             "runIsolationProbe": lambda _args: self.service.run_isolation_probe(),
             "evaluateAb": lambda args: self.service.evaluate_ab(

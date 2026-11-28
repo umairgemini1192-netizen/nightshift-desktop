@@ -381,3 +381,15 @@ def test_escalation_with_checkpoint_handoff_economy_standard_gold(
         assert handoffs[0]["to_engine"] == dec2.chosen_id
         assert handoffs[1]["to_engine"] == "claude"
         assert (wt / ".nightshift" / "handoff.md").exists()
+
+
+def test_zai_flash_env_key_is_process_scoped_and_redacted(test_store: Store, quota_ledger: QuotaLedger, monkeypatch: pytest.MonkeyPatch) -> None:
+    seed_default_engines(test_store)
+    monkeypatch.setenv("ZAI_API_KEY", "test-zai-secret-value")
+    router = Router(test_store, quota_ledger)
+    env = router.build_isolated_environment("zai-glm-flash")
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "test-zai-secret-value"
+    assert env["ANTHROPIC_MODEL"] == "GLM-4.7-Flash"
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
+    assert "test-zai-secret-value" not in redact_known_secrets("test-zai-secret-value")
+    assert "test-zai-secret-value" not in str(test_store.get_engine("zai-glm-flash"))
