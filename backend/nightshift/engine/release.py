@@ -419,6 +419,15 @@ class ReleaseManager:
         timeout_seconds: int = 120,
     ) -> SmokeTestResult:
         """Run mandatory post-release smoke test and persist ``release_verifications`` + ``evidence_records``."""
+        existing = store.get_release_verification(repo, tag)
+        if existing and str(existing.get("smoke_status") or "") == "rolled_back":
+            return SmokeTestResult(
+                passed=False,
+                status="rolled_back",
+                detail=f"Release {tag} was already rolled back and will not be re-verified.",
+                command=smoke_command or "",
+            )
+
         artifact_sha = compute_sha256(artifact_path) if artifact_path.exists() else ""
         prev_good = store.get_latest_good_release(repo, exclude_tag=tag)
         previous_good_tag = str(prev_good["tag"]) if prev_good else None
@@ -495,6 +504,13 @@ class ReleaseManager:
                 ok=False,
                 faulty_tag=faulty_tag,
                 detail=f"Release verification record not found for {repo} tag '{faulty_tag}'.",
+            )
+        if str(faulty.get("smoke_status") or "") == "rolled_back":
+            return RollbackResult(
+                ok=False,
+                faulty_tag=faulty_tag,
+                restored_tag=str(faulty.get("previous_good_tag") or "").strip() or None,
+                detail=f"Release '{faulty_tag}' for {repo} was already rolled back.",
             )
 
         prev_tag = str(faulty.get("previous_good_tag") or "").strip()
@@ -591,10 +607,10 @@ class ReleaseManager:
         finally:
             shutil.rmtree(tmp_restore, ignore_errors=True)
 
-        # 3. Optionally open a revert PR on main for the faulty merge_sha
+        # 3. Optionally open a revert PR on main for the faulty merge_sha (left open for review & MergeGate)
         revert_created = False
         if open_revert_pr and local_repo is not None and faulty.get("merge_sha"):
-            rev_ok, rev_msg = self.vcs.revert_via_pr(repo, local_repo, str(faulty["merge_sha"]))
+            rev_ok, rev_msg = self.vcs.open_revert_pr(repo, local_repo, str(faulty["merge_sha"]))
             if not rev_ok:
                 return RollbackResult(
                     ok=False,
@@ -606,19 +622,35 @@ class ReleaseManager:
                 )
             revert_created = True
 
-        # 4. Update release_verifications record
+        # 4. Update release_verifications record (and associated blocked task if applicable)
         store.update_release_verification(
             repo,
             faulty_tag,
             smoke_status="rolled_back",
             rolled_back_at=_utc_now(),
         )
+        linked_task_id = str(faulty.get("task_id") or "").strip()
+        if linked_task_id and hasattr(store, "get_task") and hasattr(store, "update_task_fields"):
+            linked_task = store.get_task(linked_task_id)
+            if (
+                linked_task
+                and linked_task.get("status") == "BLOCKED"
+                and str(linked_task.get("release_tag") or "") == faulty_tag
+                and str(linked_task.get("block_reason") or "") == "smoke_test_failed"
+            ):
+                store.update_task_fields(
+                    linked_task_id,
+                    block_reason="release_rolled_back",
+                    block_detail=f"Release {faulty_tag} was rolled back to verified release {prev_tag}.",
+                    next_step=f"Ship a new fix and release tag (previous good release {prev_tag} restored).",
+                )
 
+        revert_note = " Revert PR opened for review." if revert_created else ""
         return RollbackResult(
             ok=True,
             faulty_tag=faulty_tag,
             restored_tag=prev_tag,
             restored_files=restored_files,
             revert_pr_created=revert_created,
-            detail=f"Rolled back {faulty_tag} to verified release {prev_tag} ({len(restored_files)} files restored).",
+            detail=f"Rolled back {faulty_tag} to verified release {prev_tag} ({len(restored_files)} files restored).{revert_note}",
         )

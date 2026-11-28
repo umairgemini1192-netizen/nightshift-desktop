@@ -628,14 +628,14 @@ class CiPipelineManager:
         failure_log: str,
         repo: str,
     ) -> tuple[bool, str]:
-        """Automatic revert PR on main build failure per BLUEPRINT 5d."""
-        ok, msg = self.vcs.revert_via_pr(repo, local_repo, merge_commit_sha)
+        """Open a revert PR on main build failure without auto-merging (must pass review & MergeGate)."""
+        ok, msg = self.vcs.open_revert_pr(repo, local_repo, merge_commit_sha)
         if ok:
-            # Re-queue phase with failure log
+            # Park phase with failure log; revert PR stays open for review & MergeGate
             self.store.park_phase(
                 phase_id=phase_id,
                 reason=f"Post-merge main build failed: {failure_log[:200]}",
-                next_step="Investigate main build failure and rebase phase branch onto reverted main.",
+                next_step="Review and merge the opened revert PR via MergeGate, then rebase phase branch.",
             )
-            return True, f"Reverted {merge_commit_sha[:7]} on main and re-queued phase {phase_id}."
-        return False, f"Failed to revert {merge_commit_sha[:7]}: {msg}"
+            return True, f"Reverted {merge_commit_sha[:7]} via open revert PR (awaiting review and MergeGate) and parked phase {phase_id}."
+        return False, f"Failed to open revert PR for {merge_commit_sha[:7]}: {msg}"

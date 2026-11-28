@@ -13,6 +13,7 @@ Covers docs/AGENT_PIPELINE.md sections 1, 2, 6.1, 9.2, 9.3, and 12.1 Phase 8e:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import zipfile
 from pathlib import Path
@@ -1997,5 +1998,333 @@ def test_smoke_test_resolves_relative_artifact_path_and_supports_builtin_alias(
         assert r.passed is False
         assert r.status == "failed"
         assert "NightShift.exe not found" in r.detail
+
+
+def test_open_revert_pr_leaves_pr_open_and_never_auto_merges(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P1 regression: SubprocessGitGh.open_revert_pr and rollback_release(open_revert_pr=True)
+    must leave the revert PR open for review and MergeGate, never calling merge_pr or watch_pr_checks.
+    """
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    # 1. SubprocessGitGh.open_revert_pr must create PR on isolated branch and NEVER merge or watch checks
+    sub_vcs = SubprocessGitGh()
+    calls: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> tuple[int, str, str, bool]:
+        calls.append(list(cmd))
+        return 0, "ok", "", False
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+    monkeypatch.setattr(sub_vcs, "prepare_worktree", lambda *args, **kwargs: tmp_path)
+    monkeypatch.setattr(sub_vcs, "find_merged_pr", lambda *args, **kwargs: None)
+    open_snapshots = iter([None, {"number": 77, "headRefOid": "sha_rev_1"}])
+    monkeypatch.setattr(sub_vcs, "find_open_pr", lambda *args, **kwargs: next(open_snapshots))
+    monkeypatch.setattr(sub_vcs, "watch_pr_checks", lambda *args, **kwargs: pytest.fail("must not watch/auto-merge"))
+    monkeypatch.setattr(sub_vcs, "merge_pr", lambda *args, **kwargs: pytest.fail("must not auto-merge revert PR"))
+    monkeypatch.setattr(sub_vcs, "remove_worktree", lambda *args, **kwargs: None)
+
+    ok, msg = sub_vcs.open_revert_pr("owner/repo", tmp_path, "deadbeef1234")
+    assert ok is True
+    assert "#77" in msg
+    assert calls[0] == ["git", "revert", "-m", "1", "deadbeef1234", "--no-edit"]
+    assert calls[1] == ["git", "push", "-u", "origin", "nightshift/revert-deadbeef1234"]
+    assert calls[2][:3] == ["gh", "pr", "create"]
+    assert not any("merge" in c for c in calls)
+
+    # 2. ReleaseManager.rollback_release(open_revert_pr=True) and pipeline.rollbackRelease(openRevertPr=True)
+    with Store(tmp_path / "rb_open_pr.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        monkeypatch.setattr(vcs, "merge_pr", lambda *args, **kwargs: pytest.fail("rollback must NEVER auto-merge"))
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+        store.create_project("proj-1", "App", "owner/repo", str(tmp_path), output_dir=str(out_dir))
+
+        good_bytes = b"good-v1-bytes"
+        good_sha = hashlib.sha256(good_bytes).hexdigest()
+        v1_tmp = tmp_path / "v1"
+        v1_tmp.mkdir()
+        v1_art = v1_tmp / "app.zip"
+        v1_art.write_bytes(good_bytes)
+        v1_sums = v1_tmp / "SHA256SUMS.txt"
+        v1_sums.write_text(f"{good_sha}  app.zip\n", encoding="utf-8")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.1", "v1", "ok", [v1_art, v1_sums])
+
+        bad_tmp = tmp_path / "v2"
+        bad_tmp.mkdir()
+        bad_art = bad_tmp / "app.zip"
+        bad_art.write_bytes(b"bad-v2-bytes")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.2", "v2", "bad", [bad_art])
+
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_v1",
+            artifact_sha256=good_sha,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_v2_bad",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256=hashlib.sha256(b"bad-v2-bytes").hexdigest(),
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        class _DummyEngine:
+            def __init__(self, v: FakeGitGh) -> None:
+                self.vcs = v
+                self.release_mgr = ReleaseManager(v)
+                self.is_running = False
+                self.stop_requested = False
+
+        bridge = BridgeAPI(store, EventBus(store), ModuleRegistry(), engine=_DummyEngine(vcs))
+        res = bridge.call(
+            "pipeline.rollbackRelease",
+            {
+                "projectId": "proj-1",
+                "tag": "v1.0.0-preview.2",
+                "openRevertPr": True,
+            },
+        )
+        assert res["ok"] is True
+        assert res["data"]["revert_pr_created"] is True
+        revert_branch = "nightshift/revert-sha_v2_bad"
+        # Revert PR MUST remain OPEN and MUST NOT be merged
+        assert revert_branch in vcs.prs
+        assert revert_branch not in vcs.merged_prs
+        assert (out_dir / "app.zip").read_bytes() == good_bytes
+
+        # Second rollback attempt on an already rolled_back release must fail closed
+        second = bridge.call(
+            "pipeline.rollbackRelease",
+            {
+                "projectId": "proj-1",
+                "tag": "v1.0.0-preview.2",
+                "openRevertPr": True,
+            },
+        )
+        assert second["ok"] is False
+        assert "already rolled back" in second["error"].lower()
+
+
+def test_post_merge_failure_opens_revert_pr_without_auto_merge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Audit regression: handle_post_merge_failure must open a revert PR for review and NEVER auto-merge."""
+    with Store(tmp_path / "pm_revert.db") as store:
+        store.migrate()
+        vcs = FakeGitGh()
+        monkeypatch.setattr(vcs, "merge_pr", lambda *args, **kwargs: pytest.fail("post-merge revert must NEVER auto-merge"))
+        quota = QuotaLedger(store)
+        sched = Scheduler(store, quota)
+
+        store.create_project("proj-1", "Test", "owner/repo", str(tmp_path))
+        store.create_plan("plan-1", "proj-1", "Plan")
+        store.upsert_phase("p1", "plan-1", "Phase 1", "feat/p1")
+
+        ci_mgr = CiPipelineManager(vcs, store, sched, {})
+        ok, msg = ci_mgr.handle_post_merge_failure(
+            local_repo=tmp_path,
+            merge_commit_sha="sha_merge_broken",
+            phase_id="p1",
+            failure_log="Main CI failed",
+            repo="owner/repo",
+        )
+        assert ok is True
+        assert "open revert PR" in msg
+        revert_branch = "nightshift/revert-sha_merge_broken"
+        assert revert_branch in vcs.prs
+        assert revert_branch not in vcs.merged_prs
+
+
+@pytest.mark.asyncio
+async def test_e2e_delivery_reconciliation_preserves_rolled_back_release(tmp_path: Path) -> None:
+    """P2 regression: rerunning a plan after rolling back a smoke-failed release must preserve
+    smoke_status='rolled_back' (never reverifying, never overwriting to failed/passed, never
+    marking the task RELEASED, never re-advertising rollback, and preserving the restored artifact).
+    """
+    with Store(tmp_path / "e2e_preserve_rb.db") as store:
+        store.migrate()
+        store.set_setting("pipeline.conditionalAutoMerge", "1")
+        events = EventBus(store)
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+
+        # 1. Seed a verified previous good release v1
+        good_bytes = b"PK\x03\x04verified_good_v1"
+        good_sha = hashlib.sha256(good_bytes).hexdigest()
+        v1_tmp = tmp_path / "v1_seed"
+        v1_tmp.mkdir()
+        v1_art = v1_tmp / "NightShift-windows.zip"
+        v1_art.write_bytes(good_bytes)
+        v1_sums = v1_tmp / "SHA256SUMS.txt"
+        v1_sums.write_text(f"{good_sha}  NightShift-windows.zip\n", encoding="utf-8")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.1", "v1", "good v1", [v1_art, v1_sums])
+        store.record_release_verification(
+            repo="owner/repo",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_good_v1",
+            artifact_sha256=good_sha,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+
+        # 2. Set up project, plan, phase, and merged PR whose v2 release fails smoke test
+        store.create_project(
+            "proj-rb",
+            "RollbackTest",
+            "owner/repo",
+            str(tmp_path),
+            artifact_glob="*.zip",
+            output_dir=str(out_dir),
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        store.create_plan("plan-rb", "proj-rb", "Rollback Plan")
+        phase = PhaseDefinition(
+            id="p-rb",
+            title="Release v2",
+            branch="feat/p-rb",
+            prompt="Implement feature",
+            auto_merge=True,
+            release_after_merge=True,
+        )
+        store.upsert_phase(
+            phase.id,
+            "plan-rb",
+            phase.title,
+            phase.branch,
+            prompt=phase.prompt,
+            status="merged",
+            auto_merge=True,
+            release_after_merge=True,
+        )
+        vcs.artifacts_to_create = ["NightShift-windows.zip"]
+        vcs.commit_ci_checks["sha_merge_v2"] = _make_valid_jobs("sha_merge_v2", branch="main")
+        vcs.merged_prs[phase.branch] = {
+            "number": 202,
+            "url": "https://github.com/owner/repo/pull/202",
+            "state": "MERGED",
+            "headRefOid": "sha_head_v2",
+            "mergeCommit": {"oid": "sha_merge_v2"},
+        }
+        store.create_task_with_contract(
+            task_id="task-p-rb",
+            phase_id=phase.id,
+            plan_id="plan-rb",
+            title=phase.title,
+            branch=phase.branch,
+            risk_class="business_logic",
+        )
+        store.update_task_fields(
+            "task-p-rb",
+            status="MERGED",
+            head_sha="sha_head_v2",
+            merge_sha="sha_merge_v2",
+            pr_number=202,
+        )
+
+        proj_cfg = ProjectConfig.from_dict(store.get_project("proj-rb") or {})
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+
+        def failing_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            return SmokeTestResult(passed=False, status="failed", detail="v2 crashed on startup", command=cmd)
+
+        sm_fail = EngineStateMachine(store, events, quota, vcs=vcs, runners={}, login_checker=logins)
+        sm_fail.release_mgr = ReleaseManager(vcs, smoke_runner=failing_smoke)
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            res1 = await sm_fail.execute_plan(proj_cfg, [phase], plan_id="plan-rb")
+        assert res1[0]["status"] == "PARKED"
+        v2_tag = store.get_task("task-p-rb")["release_tag"]
+        assert v2_tag == "v1.0.0-preview.2"
+        assert store.get_release_verification("owner/repo", v2_tag)["smoke_status"] == "failed"
+
+        # 3. Roll back v2 via bridge -> restores v1 artifact and marks v2 rolled_back
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=sm_fail)
+        rb_res = bridge.call(
+            "pipeline.rollbackRelease",
+            {"projectId": "proj-rb", "tag": v2_tag, "openRevertPr": False},
+        )
+        assert rb_res["ok"] is True
+        assert compute_sha256(out_dir / "NightShift-windows.zip") == good_sha
+        rb_row = store.get_release_verification("owner/repo", v2_tag)
+        assert rb_row is not None and rb_row["smoke_status"] == "rolled_back"
+        original_rb_at = rb_row["rolled_back_at"]
+        assert original_rb_at is not None
+
+        # 4. Rerun the plan even with a PASSING smoke runner: must NOT re-verify, overwrite, or mark RELEASED
+        smoke_invocations: list[str] = []
+
+        def passing_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            smoke_invocations.append(tag)
+            return SmokeTestResult(passed=True, status="passed", detail="OK", command=cmd, verified_at="2026-11-28T09:00:00Z")
+
+        sm_retry = EngineStateMachine(store, events, quota, vcs=vcs, runners={}, login_checker=logins)
+        sm_retry.release_mgr = ReleaseManager(vcs, smoke_runner=passing_smoke)
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            res2 = await sm_retry.execute_plan(proj_cfg, [phase], plan_id="plan-rb")
+        assert res2[0]["status"] == "PARKED"
+        assert "rolled back" in res2[0]["detail"].lower()
+        assert smoke_invocations == []
+
+        # Verification row MUST still be rolled_back with original timestamp
+        rb_row_after = store.get_release_verification("owner/repo", v2_tag)
+        assert rb_row_after is not None
+        assert rb_row_after["smoke_status"] == "rolled_back"
+        assert rb_row_after["rolled_back_at"] == original_rb_at
+
+        # Task MUST stay BLOCKED (never RELEASED) and output_dir MUST still hold restored v1 artifact
+        task_after = store.get_task("task-p-rb")
+        assert task_after is not None
+        assert task_after["status"] == "BLOCKED"
+        assert task_after["block_reason"] == "release_rolled_back"
+        assert compute_sha256(out_dir / "NightShift-windows.zip") == good_sha
+
+        # Deck must NOT advertise rollback_release again
+        deck = generate_deck_data(store, project_id="proj-rb")
+        assert not any(item.get("action_kind") == "rollback_release" for item in deck["needs_you"])
+
+        # Defense-in-depth: direct verify_and_record_release and store.record_release_verification refuse overwrite
+        direct_res = ReleaseManager(vcs, smoke_runner=passing_smoke).verify_and_record_release(
+            store=store,
+            repo="owner/repo",
+            tag=v2_tag,
+            merge_sha="sha_merge_v2",
+            artifact_path=out_dir / "NightShift-windows.zip",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        assert direct_res.passed is False
+        assert direct_res.status == "rolled_back"
+        assert smoke_invocations == []
+
+        with pytest.raises(ValueError, match="already rolled_back"):
+            store.record_release_verification(
+                repo="owner/repo",
+                tag=v2_tag,
+                merge_sha="sha_merge_v2",
+                artifact_sha256=good_sha,
+                smoke_command=DESKTOP_SELFTEST_SMOKE,
+                smoke_status="passed",
+            )
+
 
 

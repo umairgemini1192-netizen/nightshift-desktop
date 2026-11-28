@@ -1720,6 +1720,26 @@ class EngineStateMachine:
             if ok is False:
                 reverted, revert_msg = self.ci_pipeline.handle_post_merge_failure(project.local_path, merge_sha, phase.id, msg, project.repo)
                 if reverted:
+                    if task is not None and effective_lease:
+                        post_fail_updates = {
+                            "blocked_from_status": "MERGED",
+                            "merge_sha": str(merge_sha),
+                            "block_reason": "post_merge_failed",
+                            "block_detail": revert_msg,
+                            "next_step": "Review and merge the opened revert PR via MergeGate, then ship a new fix",
+                        }
+                        cur_pm = self.store.get_task(str(task["id"]))
+                        if cur_pm and cur_pm["status"] == "BLOCKED":
+                            self.store.update_task_fields(str(task["id"]), **post_fail_updates)
+                        else:
+                            self._safe_task_transition(
+                                str(task["id"]),
+                                "BLOCKED",
+                                idempotency_key=f"post-merge-failed:{task['id']}:{merge_sha}",
+                                reason=revert_msg,
+                                updates=post_fail_updates,
+                                lease_token=effective_lease,
+                            )
                     return {"phase_id": phase.id, "title": phase.title, "runner": runner, "status": "PARKED", "detail": revert_msg}
                 raise RuntimeError(f"Main build failed: {msg}")
             if ok is not True or run_id is None:
@@ -1833,6 +1853,53 @@ class EngineStateMachine:
                         None,
                     )
                     existing_ver = self.store.get_release_verification(project.repo, adopted_tag)
+                    if existing_ver and str(existing_ver.get("smoke_status") or "") == "rolled_back":
+                        prev_good_tag = str(existing_ver.get("previous_good_tag") or "").strip()
+                        rb_detail = (
+                            f"Release {adopted_tag} was already rolled back"
+                            + (f" to {prev_good_tag}" if prev_good_tag else "")
+                            + "; preserving rollback decision without re-verifying or marking RELEASED."
+                        )
+                        rb_next_step = "Ship a new fix and release tag rather than re-verifying a rolled-back release"
+                        rb_updates = {
+                            "blocked_from_status": "MERGED",
+                            "release_tag": adopted_tag,
+                            "block_reason": "release_rolled_back",
+                            "block_detail": rb_detail,
+                            "next_step": rb_next_step,
+                        }
+                        cur_before_rb = self.store.get_task(t_id)
+                        if cur_before_rb and cur_before_rb["status"] == "BLOCKED":
+                            self.store.update_task_fields(t_id, **rb_updates)
+                        else:
+                            self._safe_task_transition(
+                                t_id,
+                                "BLOCKED",
+                                idempotency_key=f"release-rolled-back:{t_id}:{adopted_tag}",
+                                reason=rb_detail,
+                                updates=rb_updates,
+                                lease_token=effective_lease,
+                            )
+                        self.events.emit(Event(
+                            kind="release.rolled_back_preserved",
+                            plain_text=rb_detail,
+                            level="warn",
+                            phase_id=phase.id,
+                            payload={"project_id": project.id, "tag": adopted_tag},
+                        ))
+                        self._park_phase(
+                            project.id,
+                            phase,
+                            reason=rb_detail,
+                            next_step=rb_next_step,
+                        )
+                        return {
+                            "phase_id": phase.id,
+                            "title": phase.title,
+                            "runner": runner,
+                            "status": "PARKED",
+                            "detail": rb_detail,
+                        }
                     expected_art_sha = (
                         expected_checksums.get(primary_artifact.name, "")
                         if primary_artifact is not None

@@ -2132,6 +2132,11 @@ class Store:
         norm_tag = str(tag or "").strip()
         if not norm_repo or not norm_tag:
             raise ValueError("Both repo and tag are required for release_verifications.")
+        existing = self.get_release_verification(norm_repo, norm_tag)
+        if existing is not None and str(existing.get("smoke_status") or "") == "rolled_back":
+            raise ValueError(
+                f"Release verification for {norm_repo}@{norm_tag} is already rolled_back and cannot be overwritten."
+            )
         with self._conn:
             self._conn.execute(
                 """

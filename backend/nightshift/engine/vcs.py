@@ -310,6 +310,8 @@ class GitGhClient(Protocol):
 
     def revert_via_pr(self, repo: str, local_repo: Path, commit_sha: str) -> tuple[bool, str]: ...
 
+    def open_revert_pr(self, repo: str, local_repo: Path, commit_sha: str) -> tuple[bool, str]: ...
+
     def check_branch_protection(self, repo: str, branch: str = "main") -> bool: ...
 
     def get_diff(self, worktree_dir: Path, base: str = "origin/main") -> str: ...
@@ -1496,6 +1498,71 @@ class SubprocessGitGh:
             if worktree.exists():
                 self.remove_worktree(local_repo, worktree)
 
+    def open_revert_pr(self, repo: str, local_repo: Path, commit_sha: str) -> tuple[bool, str]:
+        """Create a revert PR on an isolated branch and leave it open for review and MergeGate (never auto-merge)."""
+        branch = f"nightshift/revert-{commit_sha}"
+        if branch.strip().lower() in ("main", "master"):
+            raise ValueError(f"Hard guard violation: direct push to protected branch '{branch}' is forbidden.")
+        if self.find_merged_pr(repo, branch):
+            return True, f"Revert PR for {commit_sha[:7]} is already merged."
+        existing_open = self.find_open_pr(repo, branch)
+        if existing_open:
+            return True, f"Revert PR #{existing_open['number']} is already open for review."
+        worktree = local_repo.parent / f"nightshift-revert-{commit_sha}"
+        try:
+            self.prepare_worktree(local_repo, worktree, branch)
+            rc, out, err, _ = run_subprocess_with_timeout(
+                ["git", "revert", "-m", "1", commit_sha, "--no-edit"],
+                cwd=worktree,
+                timeout_seconds=60,
+            )
+            if rc != 0 and "not a merge" in (err or out).lower():
+                rc, out, err, _ = run_subprocess_with_timeout(
+                    ["git", "revert", commit_sha, "--no-edit"],
+                    cwd=worktree,
+                    timeout_seconds=60,
+                )
+            if rc != 0:
+                return False, out or err
+            rc, out, err, _ = run_subprocess_with_timeout(
+                ["git", "push", "-u", "origin", branch],
+                cwd=worktree,
+                timeout_seconds=120,
+            )
+            if rc != 0:
+                return False, out or err
+            rc, out, err, _ = run_subprocess_with_timeout(
+                [
+                    "gh",
+                    "pr",
+                    "create",
+                    "--repo",
+                    repo,
+                    "--base",
+                    "main",
+                    "--head",
+                    branch,
+                    "--title",
+                    f"Revert {commit_sha[:7]}",
+                    "--body",
+                    (
+                        f"Revert `{commit_sha}` following post-release or post-merge verification failure.\n\n"
+                        "Left open intentionally for independent review and MergeGate approval."
+                    ),
+                ],
+                cwd=worktree,
+                timeout_seconds=60,
+            )
+            if rc != 0:
+                return False, out or err
+            pr = self.find_open_pr(repo, branch)
+            if not pr or not pr.get("headRefOid"):
+                return False, "Could not verify opened revert PR"
+            return True, f"Opened revert PR #{pr['number']} on branch {branch} for review."
+        finally:
+            if worktree.exists():
+                self.remove_worktree(local_repo, worktree)
+
     def check_branch_protection(self, repo: str, branch: str = "main") -> bool:
         rc, out, _, _ = run_subprocess_with_timeout(
             ["gh", "api", f"repos/{repo}/branches/{branch}/protection"],
@@ -2052,6 +2119,15 @@ class FakeGitGh:
         if not passed:
             return False, msg
         return self.merge_pr(repo, pr["number"], local_repo)
+
+    def open_revert_pr(self, repo: str, local_repo: Path, commit_sha: str) -> tuple[bool, str]:
+        """Open a revert PR without auto-merging it (must go through normal review and MergeGate)."""
+        branch = f"nightshift/revert-{commit_sha}"
+        if self.find_merged_pr(repo, branch):
+            return True, f"Revert PR for {commit_sha[:7]} is already merged."
+        pr = self.find_open_pr(repo, branch) or self.add_pr(branch)
+        self.reverts.append({"commit_sha": commit_sha, "branch": branch, "pr_number": pr["number"], "merged": False})
+        return True, f"Opened revert PR #{pr['number']} on branch {branch} for review."
 
     def check_branch_protection(self, repo: str, branch: str = "main") -> bool:
         return self.branch_protection.get(branch, True)
