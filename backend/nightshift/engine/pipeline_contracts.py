@@ -453,6 +453,40 @@ def detect_python_assertion_relaxation(
     before_counts, before_broad, before_skips = _analyze_python_tests(before_source or "")
     after_counts, after_broad, after_skips = _analyze_python_tests(after_source or "")
 
+    # A matching count does not prove that a replacement is as strict.  Only
+    # accept assertions whose AST is preserved; additional assertions may make
+    # the test stricter.  Unprovable replacements require a separate change.
+    def assertions(source: str) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return result
+        def visit(node: ast.AST, prefix: str = "") -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    visit(child, prefix + child.name + ".")
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = prefix + child.name
+                    if child.name.startswith("test_"):
+                        result[name] = [ast.dump(item.test, include_attributes=False)
+                                        for item in ast.walk(child) if isinstance(item, ast.Assert)]
+                    visit(child, name + ".")
+                else:
+                    visit(child, prefix)
+        visit(tree)
+        return result
+
+    before_assertions = assertions(before_source or "")
+    after_assertions = assertions(after_source or "")
+    for name, old in before_assertions.items():
+        remaining = list(after_assertions.get(name, []))
+        for assertion in old:
+            if assertion not in remaining:
+                findings.append(GuardFinding(guard="assertion_relaxation", message=f"Changed or removed assertion in '{name}' in '{path}'.", path=path))
+                break
+            remaining.remove(assertion)
+
     for fn_name, prev_n in before_counts.items():
         if fn_name not in after_counts:
             findings.append(

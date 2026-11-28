@@ -1,0 +1,16 @@
+{
+  "build_id": "b1",
+  "commit_sha": "sha1",
+  "renderer": "manual-upload",
+  "schema_version": 1,
+  "screenshots": [
+    {
+      "axe_violations": 0,
+      "file": "page.png",
+      "overflow": false,
+      "scale": "100%",
+      "sha256": "f4fcfd6a05defbcd6226154c1f88dd0e4063b6bc2579dec0abdd3c4e6203144b",
+      "viewport_or_device": "1440x900"
+    }
+  ]
+}
