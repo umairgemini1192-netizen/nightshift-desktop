@@ -2037,3 +2037,570 @@ def test_persist_ci_evidence_and_merge_gate_enforce_exact_sha_and_build_binding(
         )
         assert res_bad.allowed is False
         assert res_bad.block_reason == "missing_verified_screenshots"
+
+
+# ---------------------------------------------------------------------------
+# 7. Round 4 regression tests: authoritative CI evidence field binding
+# ---------------------------------------------------------------------------
+
+
+def test_subprocess_git_gh_rejects_circleci_job_with_mismatched_authoritative_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P1 regression: statuses for required jobs linking to a different CircleCI job must fail closed."""
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    wf_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    pipe_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    backend_uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+    slug = "circleci/org123/proj456"
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (0, json.dumps({"check_runs": []}), "", False)
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "sha": "sha_spoof_1",
+                        "statuses": [
+                            {
+                                "id": 9001,
+                                "context": "ci/circleci: desktop-backend",
+                                "state": "success",
+                                "target_url": f"https://app.circleci.com/workflow/{wf_id}/job/{backend_uuid}",
+                            },
+                            {
+                                "id": 9002,
+                                "context": "ci/circleci: desktop-gates",
+                                "state": "success",
+                                "target_url": f"https://app.circleci.com/workflow/{wf_id}/job/{backend_uuid}",
+                            },
+                            {
+                                "id": 9003,
+                                "context": "ci/circleci: desktop-frontend",
+                                "state": "success",
+                                "target_url": f"https://app.circleci.com/pipelines/{slug}/10/workflows/{wf_id}/jobs/200",
+                            },
+                            {
+                                "id": 9004,
+                                "context": "ci/circleci: desktop-package",
+                                "state": "success",
+                                "target_url": "https://circleci.com/gh/owner/nightshift-desktop/201",
+                            },
+                        ],
+                    }
+                ),
+                "",
+                False,
+            )
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    http_calls: list[str] = []
+
+    def fake_http_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any] | None:
+        http_calls.append(url)
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}":
+            return {"id": wf_id, "pipeline_id": pipe_id}
+        if url == f"https://circleci.com/api/v2/pipeline/{pipe_id}":
+            return {"id": pipe_id, "vcs": {"revision": "sha_spoof_1"}}
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}/job":
+            return {
+                "items": [
+                    {
+                        "id": backend_uuid,
+                        "job_number": 200,
+                        "name": "desktop-backend",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "stopped_at": "2026-11-27T10:02:00Z",
+                    }
+                ]
+            }
+        if url == "https://circleci.com/api/v2/project/gh/owner/nightshift-desktop/job/201":
+            return {
+                "name": "desktop-backend",
+                "number": 201,
+                "status": "success",
+                "started_at": "2026-11-27T10:00:00Z",
+                "stopped_at": "2026-11-27T10:02:00Z",
+                "pipeline": {"id": pipe_id},
+            }
+        if url == f"https://circleci.com/api/v2/project/{slug}/200/artifacts":
+            return {"items": [{"path": "backend.log", "size_bytes": 128, "url": "https://output.circle-artifacts.com/b.log"}]}
+        return None
+
+    vcs = SubprocessGitGh(http_json_get=fake_http_json, http_artifact_size=lambda *_: 128)
+    jobs = vcs.get_commit_ci_checks("owner/nightshift-desktop", "sha_spoof_1", branch="feat/p8d")
+    by_name = {j.name: j for j in jobs}
+
+    # Legitimate desktop-backend succeeds.
+    assert by_name["desktop-backend"].status == "success"
+    assert by_name["desktop-backend"].build_id == "200"
+    assert by_name["desktop-backend"].commit_sha == "sha_spoof_1"
+    assert by_name["desktop-backend"].duration_seconds == 120.0
+
+    # All three spoofed statuses (workflow/job UUID, pipeline/jobs number, legacy URL) fail closed.
+    for spoofed in ("desktop-gates", "desktop-frontend", "desktop-package"):
+        assert by_name[spoofed].status == "failed"
+        assert by_name[spoofed].build_id == ""
+        assert by_name[spoofed].commit_sha == ""
+        assert by_name[spoofed].duration_seconds == 0.0
+        assert by_name[spoofed].artifacts == []
+
+    # Artifacts were never fetched for legacy build 201.
+    assert not any("/201/artifacts" in u for u in http_calls)
+
+    ev = validate_ci_evidence(
+        expected_commit_sha="sha_spoof_1",
+        required_jobs=["desktop-gates", "desktop-backend", "desktop-frontend", "desktop-package"],
+        observed_jobs=jobs,
+    )
+    assert ev.verified is False
+
+
+def test_subprocess_git_gh_preserves_zero_and_unknown_authoritative_circleci_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """P2 regression: CircleCI check-runs with 0s or unknown API duration must never fall back to GitHub timestamps."""
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    wf_id = "12121212-1212-4121-8121-121212121212"
+    pipe_id = "34343434-3434-4343-8343-343434343434"
+    zero_uuid = "56565656-5656-4565-8565-565656565656"
+    unknown_uuid = "78787878-7878-4787-8787-787878787878"
+    slug = "circleci/org123/proj456"
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "check_runs": [
+                            {
+                                "id": 1111,
+                                "name": "ci/circleci: desktop-backend",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_dur_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",  # 120s on GitHub!
+                                "details_url": f"https://app.circleci.com/workflow/{wf_id}/job/{zero_uuid}",
+                            },
+                            {
+                                "id": 2222,
+                                "name": "ci/circleci: desktop-gates",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_dur_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",  # 120s on GitHub!
+                                "details_url": f"https://app.circleci.com/workflow/{wf_id}/job/{unknown_uuid}",
+                            },
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (0, json.dumps({"sha": "sha_dur_1", "statuses": []}), "", False)
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    def fake_http_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any] | None:
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}":
+            return {"id": wf_id, "pipeline_id": pipe_id}
+        if url == f"https://circleci.com/api/v2/pipeline/{pipe_id}":
+            return {"id": pipe_id, "vcs": {"revision": "sha_dur_1"}}
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}/job":
+            return {
+                "items": [
+                    {
+                        "id": zero_uuid,
+                        "job_number": 301,
+                        "name": "desktop-backend",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "stopped_at": "2026-11-27T10:00:00Z",  # Authoritative 0.0s
+                    },
+                    {
+                        "id": unknown_uuid,
+                        "job_number": 302,
+                        "name": "desktop-gates",
+                        "project_slug": slug,
+                        "status": "success",
+                        # Missing started_at / stopped_at
+                    },
+                ]
+            }
+        if url == f"https://circleci.com/api/v2/project/{slug}/job/302":
+            return {
+                "name": "desktop-gates",
+                "number": 302,
+                "status": "success",
+                "duration": 0,  # Authoritative 0ms
+                "latest_workflow": {"id": wf_id},
+            }
+        if url.endswith("/artifacts"):
+            return {"items": []}
+        return None
+
+    vcs = SubprocessGitGh(http_json_get=fake_http_json, http_artifact_size=lambda *_: 0)
+    jobs = vcs.get_commit_ci_checks("owner/nightshift-desktop", "sha_dur_1", branch="feat/p8d")
+    by_name = {j.name: j for j in jobs}
+
+    # Both must preserve 0.0s rather than falling back to GitHub's 120.0s check-run timestamps.
+    assert by_name["desktop-backend"].duration_seconds == 0.0
+    assert by_name["desktop-gates"].duration_seconds == 0.0
+
+    ev = validate_ci_evidence(
+        expected_commit_sha="sha_dur_1",
+        required_jobs=["desktop-backend", "desktop-gates"],
+        observed_jobs=jobs,
+    )
+    assert ev.verified is False
+    assert ev.rejection_reason == "suspicious_zero_duration_check"
+
+
+def test_subprocess_git_gh_circleci_fails_closed_on_missing_fields_and_mismatched_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit regression: missing CircleCI job UUID, build_number, status, workflow_id mismatch,
+    cross-repo slug, or missing CircleCI URL must fail closed without GitHub fallbacks."""
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    wf_id = "90909090-9090-4909-8909-909090909090"
+    wf_bad_id = "80808080-8080-4808-8808-808080808080"
+    pipe_id = "70707070-7070-4707-8707-707070707070"
+    slug = "circleci/org123/proj456"
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "check_runs": [
+                            {
+                                # 1. Job UUID not found in workflow jobs list
+                                "id": 4001,
+                                "name": "ci/circleci: missing-uuid-job",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_audit_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",
+                                "details_url": f"https://app.circleci.com/workflow/{wf_id}/job/deadbeef-0000-4000-8000-000000000000",
+                            },
+                            {
+                                # 2. Missing authoritative job_number (build_id)
+                                "id": 4002,
+                                "name": "ci/circleci: missing-buildnum-job",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_audit_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",
+                                "details_url": f"https://app.circleci.com/workflow/{wf_id}/job/11111111-0000-4000-8000-000000000001",
+                            },
+                            {
+                                # 3. Missing authoritative status
+                                "id": 4003,
+                                "name": "ci/circleci: missing-status-job",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_audit_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",
+                                "details_url": f"https://app.circleci.com/workflow/{wf_id}/job/22222222-0000-4000-8000-000000000002",
+                            },
+                            {
+                                # 4. Workflow metadata returns mismatched workflow id
+                                "id": 4004,
+                                "name": "ci/circleci: bad-workflow-job",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_audit_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",
+                                "details_url": f"https://app.circleci.com/workflow/{wf_bad_id}/job/33333333-0000-4000-8000-000000000003",
+                            },
+                            {
+                                # 5. Claims ci/circleci: but has no CircleCI URL
+                                "id": 4005,
+                                "name": "ci/circleci: no-url-job",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_audit_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",
+                                "details_url": "",
+                            },
+                            {
+                                # 6. Cross-repo CircleCI gh/ slug
+                                "id": 4006,
+                                "name": "ci/circleci: cross-repo-job",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_audit_1",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:02:00Z",
+                                "details_url": "https://circleci.com/gh/evil-org/other-repo/999",
+                            },
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (0, json.dumps({"sha": "sha_audit_1", "statuses": []}), "", False)
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    http_calls: list[str] = []
+
+    def fake_http_json(url: str, headers: dict[str, str], timeout: int) -> dict[str, Any] | None:
+        http_calls.append(url)
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}":
+            return {"id": wf_id, "pipeline_id": pipe_id}
+        if url == f"https://circleci.com/api/v2/workflow/{wf_bad_id}":
+            return {"id": "different-workflow-id", "pipeline_id": pipe_id}
+        if url == f"https://circleci.com/api/v2/pipeline/{pipe_id}":
+            return {"id": pipe_id, "vcs": {"revision": "sha_audit_1"}}
+        if url == f"https://circleci.com/api/v2/workflow/{wf_id}/job":
+            return {
+                "items": [
+                    {
+                        "id": "11111111-0000-4000-8000-000000000001",
+                        "name": "missing-buildnum-job",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "stopped_at": "2026-11-27T10:02:00Z",
+                        # job_number omitted
+                    },
+                    {
+                        "id": "22222222-0000-4000-8000-000000000002",
+                        "job_number": 502,
+                        "name": "missing-status-job",
+                        "project_slug": slug,
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "stopped_at": "2026-11-27T10:02:00Z",
+                        # status omitted
+                    },
+                ]
+            }
+        if url == f"https://circleci.com/api/v2/workflow/{wf_bad_id}/job":
+            return {
+                "items": [
+                    {
+                        "id": "33333333-0000-4000-8000-000000000003",
+                        "job_number": 503,
+                        "name": "bad-workflow-job",
+                        "project_slug": slug,
+                        "status": "success",
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "stopped_at": "2026-11-27T10:02:00Z",
+                    }
+                ]
+            }
+        return None
+
+    vcs = SubprocessGitGh(http_json_get=fake_http_json, http_artifact_size=lambda *_: 0)
+    jobs = vcs.get_commit_ci_checks("owner/nightshift-desktop", "sha_audit_1", branch="feat/p8d")
+    by_name = {j.name: j for j in jobs}
+
+    for jname in (
+        "missing-uuid-job",
+        "missing-buildnum-job",
+        "missing-status-job",
+        "bad-workflow-job",
+        "no-url-job",
+        "cross-repo-job",
+    ):
+        assert by_name[jname].status == "failed", jname
+        assert by_name[jname].build_id == "", jname
+        assert by_name[jname].duration_seconds == 0.0, jname
+        assert by_name[jname].artifacts == [], jname
+
+    # Artifacts endpoint must never be queried for any unverified job.
+    assert not any("/artifacts" in u for u in http_calls)
+    # Cross-repo slug must never even be queried.
+    assert not any("evil-org/other-repo" in u for u in http_calls)
+
+
+def test_subprocess_git_gh_gha_status_and_check_run_bind_authoritative_name_ids_and_repo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Audit regression: GHA commit statuses and check-runs enforce authoritative job name, id, run_id, and repo."""
+    from nightshift.engine.vcs import SubprocessGitGh
+
+    def fake_run(cmd: list[str], cwd: Any = None, timeout_seconds: int = 60) -> tuple[int, str, str, bool]:
+        if cmd[:2] == ["gh", "api"] and "/check-runs" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "check_runs": [
+                            {
+                                # Check-run whose details_url points to a different job id (999 != 8801)
+                                "id": 8801,
+                                "name": "android-lint",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_gha_audit",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:01:00Z",
+                                "details_url": "https://github.com/owner/drivelift/actions/runs/9911/job/999",
+                            },
+                            {
+                                # Check-run whose details_url points to a different repo
+                                "id": 8802,
+                                "name": "cross-repo-check",
+                                "status": "completed",
+                                "conclusion": "success",
+                                "head_sha": "sha_gha_audit",
+                                "started_at": "2026-11-27T10:00:00Z",
+                                "completed_at": "2026-11-27T10:01:00Z",
+                                "details_url": "https://github.com/other/repo/actions/runs/9911/job/8802",
+                            },
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and "/status" in cmd[2]:
+            return (
+                0,
+                json.dumps(
+                    {
+                        "sha": "sha_gha_audit",
+                        "statuses": [
+                            {
+                                # Spoofed GHA status: context says "android-ui" but job 601 is "android-build"
+                                "id": 701,
+                                "context": "android-ui",
+                                "state": "success",
+                                "target_url": "https://github.com/owner/drivelift/actions/runs/600/job/601",
+                            },
+                            {
+                                # Mismatched run_id: URL says 600, API says 699
+                                "id": 702,
+                                "context": "android-run-mismatch",
+                                "state": "success",
+                                "target_url": "https://github.com/owner/drivelift/actions/runs/600/job/602",
+                            },
+                            {
+                                # Authentic GHA status matching name, id, run_id, head_sha, status
+                                "id": 703,
+                                "context": "android-build",
+                                "state": "success",
+                                "target_url": "https://github.com/owner/drivelift/actions/runs/600/job/601",
+                            },
+                        ],
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and cmd[2] == "repos/owner/drivelift/actions/jobs/601":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "id": 601,
+                        "run_id": 600,
+                        "name": "android-build",
+                        "head_sha": "sha_gha_audit",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "completed_at": "2026-11-27T10:03:00Z",
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and cmd[2] == "repos/owner/drivelift/actions/jobs/602":
+            return (
+                0,
+                json.dumps(
+                    {
+                        "id": 602,
+                        "run_id": 699,
+                        "name": "android-run-mismatch",
+                        "head_sha": "sha_gha_audit",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "started_at": "2026-11-27T10:00:00Z",
+                        "completed_at": "2026-11-27T10:03:00Z",
+                    }
+                ),
+                "",
+                False,
+            )
+        if cmd[:2] == ["gh", "api"] and cmd[2].startswith("repos/owner/drivelift/actions/runs/600/artifacts"):
+            return (
+                0,
+                json.dumps(
+                    {
+                        "artifacts": [
+                            {
+                                "name": "app-debug.apk",
+                                "size_in_bytes": 10_000_000,
+                                "expired": False,
+                                "archive_download_url": "https://api.github.com/repos/owner/drivelift/actions/artifacts/1/zip",
+                                "workflow_run": {"id": 600, "head_sha": "sha_gha_audit"},
+                            }
+                        ]
+                    }
+                ),
+                "",
+                False,
+            )
+        raise AssertionError(f"Unexpected command: {cmd}")
+
+    monkeypatch.setattr("nightshift.engine.vcs.run_subprocess_with_timeout", fake_run)
+
+    vcs = SubprocessGitGh(http_json_get=lambda *_: None, http_artifact_size=lambda *_: 0)
+    jobs = vcs.get_commit_ci_checks("owner/drivelift", "sha_gha_audit", branch="feat/android")
+    by_name = {j.name: j for j in jobs}
+
+    # Check-runs with mismatched job_id or cross-repo URL do not get workflow-run artifacts attached.
+    assert by_name["android-lint"].workflow_run_id == ""
+    assert by_name["android-lint"].artifacts == []
+    assert by_name["cross-repo-check"].workflow_run_id == ""
+    assert by_name["cross-repo-check"].artifacts == []
+
+    # Spoofed GHA status name fails closed.
+    assert by_name["android-ui"].status == "failed"
+    assert by_name["android-ui"].build_id == ""
+    assert by_name["android-ui"].commit_sha == ""
+    assert by_name["android-ui"].duration_seconds == 0.0
+    assert by_name["android-ui"].artifacts == []
+
+    # Mismatched run_id fails closed.
+    assert by_name["android-run-mismatch"].status == "failed"
+    assert by_name["android-run-mismatch"].build_id == ""
+    assert by_name["android-run-mismatch"].duration_seconds == 0.0
+    assert by_name["android-run-mismatch"].artifacts == []
+
+    # Authentic GHA status succeeds with authoritative job id, duration, and artifacts.
+    assert by_name["android-build"].status == "success"
+    assert by_name["android-build"].build_id == "601"
+    assert by_name["android-build"].workflow_run_id == "600"
+    assert by_name["android-build"].duration_seconds == 180.0
+    assert len(by_name["android-build"].artifacts) == 1
+    assert isinstance(by_name["android-build"].artifacts[0], CiArtifact)
+    assert by_name["android-build"].artifacts[0].build_id == "workflow-run:600"
