@@ -32,7 +32,12 @@ from nightshift.engine.pipeline_evidence import (
     validate_ci_evidence,
     validate_screenshot_manifest,
 )
-from nightshift.engine.pipeline_orchestrator import LeaseHeartbeat, TaskOrchestrator, is_process_alive
+from nightshift.engine.pipeline_orchestrator import (
+    InvalidTransitionError,
+    LeaseHeartbeat,
+    TaskOrchestrator,
+    is_process_alive,
+)
 from nightshift.engine.planner import PhaseDefinition, get_runnable_phases, resolve_base_branch, validate_plan_dag
 from nightshift.engine.release import ReleaseManager, SmokeRunnerFn
 from nightshift.engine.scheduler import Scheduler
@@ -1857,24 +1862,29 @@ class EngineStateMachine:
                                 if smoke_res.status == "unavailable"
                                 else "smoke_test_failed"
                             )
-                            self._safe_task_transition(
-                                t_id,
-                                "BLOCKED",
-                                idempotency_key=f"smoke-blocked:{t_id}:{adopted_tag}:{smoke_block}",
-                                reason=smoke_res.detail,
-                                updates={
-                                    "blocked_from_status": "MERGED",
-                                    "release_tag": adopted_tag,
-                                    "block_reason": smoke_block,
-                                    "block_detail": smoke_res.detail,
-                                    "next_step": (
-                                        "Configure project smoke_command and re-verify release"
-                                        if smoke_block == "smoke_test_unavailable"
-                                        else "Roll back release to previous good tag and investigate smoke failure"
-                                    ),
-                                },
-                                lease_token=effective_lease,
-                            )
+                            smoke_updates = {
+                                "blocked_from_status": "MERGED",
+                                "release_tag": adopted_tag,
+                                "block_reason": smoke_block,
+                                "block_detail": smoke_res.detail,
+                                "next_step": (
+                                    "Configure project smoke_command and re-verify release"
+                                    if smoke_block == "smoke_test_unavailable"
+                                    else "Roll back release to previous good tag and investigate smoke failure"
+                                ),
+                            }
+                            cur_before_block = self.store.get_task(t_id)
+                            if cur_before_block and cur_before_block["status"] == "BLOCKED":
+                                self.store.update_task_fields(t_id, **smoke_updates)
+                            else:
+                                self._safe_task_transition(
+                                    t_id,
+                                    "BLOCKED",
+                                    idempotency_key=f"smoke-blocked:{t_id}:{adopted_tag}:{smoke_block}",
+                                    reason=smoke_res.detail,
+                                    updates=smoke_updates,
+                                    lease_token=effective_lease,
+                                )
                             self.events.emit(Event(
                                 kind=f"release.{smoke_block}",
                                 plain_text=f"Release {adopted_tag} blocked: {smoke_res.detail}",
@@ -1901,8 +1911,35 @@ class EngineStateMachine:
                         if already_smoke_passed and existing_ver and existing_ver.get("verified_at")
                         else datetime.now(timezone.utc).isoformat()
                     )
+                    if (
+                        cur_t
+                        and cur_t["status"] == "BLOCKED"
+                        and cur_t.get("blocked_from_status") == "MERGED"
+                        and cur_t.get("block_reason") in ("smoke_test_unavailable", "smoke_test_failed")
+                    ):
+                        try:
+                            cur_t = self.task_orchestrator.resume_from_blocked(
+                                t_id,
+                                current_merge_sha=str(merge_sha),
+                                actor="engine",
+                                idempotency_key=f"resume-smoke:{t_id}:{adopted_tag}:{merge_sha}",
+                            )
+                        except InvalidTransitionError as exc:
+                            self._park_phase(
+                                project.id,
+                                phase,
+                                reason=str(exc),
+                                next_step="Revalidate task contract and merge SHA before completing release",
+                            )
+                            return {
+                                "phase_id": phase.id,
+                                "title": phase.title,
+                                "runner": runner,
+                                "status": "PARKED",
+                                "detail": str(exc),
+                            }
                     if cur_t and cur_t["status"] == "MERGED":
-                        self._safe_task_transition(
+                        cur_t = self._safe_task_transition(
                             t_id,
                             "RELEASED",
                             idempotency_key=f"released:{t_id}:{adopted_tag}",
@@ -1910,6 +1947,24 @@ class EngineStateMachine:
                             updates={"release_tag": adopted_tag, "smoke_verified_at": verified_ts},
                             lease_token=effective_lease,
                         )
+                    if cur_t is None or cur_t["status"] != "RELEASED":
+                        block_msg = (
+                            f"Cannot complete adopted release {adopted_tag}: "
+                            f"task {t_id} is {cur_t['status'] if cur_t else 'missing'}, not RELEASED."
+                        )
+                        self._park_phase(
+                            project.id,
+                            phase,
+                            reason=block_msg,
+                            next_step="Resolve blocking task state before completing release",
+                        )
+                        return {
+                            "phase_id": phase.id,
+                            "title": phase.title,
+                            "runner": runner,
+                            "status": "PARKED",
+                            "detail": block_msg,
+                        }
                     self.store.unpark_phase(phase.id)
                     self.store.update_phase(phase.id, status="completed")
                     self.events.emit(Event(

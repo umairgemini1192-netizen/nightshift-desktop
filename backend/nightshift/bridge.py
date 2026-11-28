@@ -1364,6 +1364,8 @@ class BridgeAPI:
                     )
                 except InvalidTransitionError as exc:
                     return {"ok": False, "error": str(exc)}
+                if updated.get("status") != "BLOCKED" and updated.get("phase_id"):
+                    self._store.unpark_phase(str(updated["phase_id"]))
             self._events.emit(
                 Event(
                     kind="pipeline.owner_approved",

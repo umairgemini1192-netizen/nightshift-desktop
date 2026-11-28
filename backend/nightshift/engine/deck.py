@@ -25,8 +25,9 @@ def generate_deck_data(
 
     # 1. Inspect parked phases, blocked pipeline tasks, and failed release smoke tests for 'needs_you'
     parked = store.list_parked()
-    needs_you: list[dict[str, str]] = []
+    needs_you: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    proj_repo = str(proj.get("repo") or "").strip() if proj else ""
 
     for task in store.list_tasks(status="BLOCKED"):
         if len(needs_you) >= 3:
@@ -34,48 +35,90 @@ def generate_deck_data(
         block_reason = str(task.get("block_reason") or "")
         phase_id = str(task.get("phase_id") or task.get("id") or "")
         if block_reason == "awaiting_owner_approval":
-            risk_label = str(task.get("risk_class") or "high_risk").replace("_", " ").capitalize()
+            risk_class = str(task.get("risk_class") or "high_risk")
+            risk_label = risk_class.replace("_", " ").capitalize()
             pr_num = task.get("pr_number")
             pr_str = f" PR #{pr_num}" if pr_num else ""
-            needs_you.append({
-                "phase_id": phase_id,
-                "task_id": str(task["id"]),
-                "headline": f"{risk_label}{pr_str} needs your approval before merge",
-                "detail": str(task.get("block_detail") or "Explicit owner approval is required for this risk class."),
-                "action": "Review & Approve",
-            })
+            head_sha = str(task.get("head_sha") or "").strip()
+            if head_sha:
+                item: dict[str, Any] = {
+                    "phase_id": phase_id,
+                    "task_id": str(task["id"]),
+                    "head_sha": head_sha,
+                    "risk_class": risk_class,
+                    "headline": f"{risk_label}{pr_str} needs your approval before merge",
+                    "detail": str(task.get("block_detail") or "Explicit owner approval is required for this risk class."),
+                    "action": "Review & Approve",
+                    "action_kind": "approve_task",
+                }
+                if pr_num is not None:
+                    item["pr_number"] = int(pr_num)
+            else:
+                item = {
+                    "phase_id": phase_id,
+                    "task_id": str(task["id"]),
+                    "risk_class": risk_class,
+                    "headline": f"{risk_label}{pr_str} needs your approval before merge",
+                    "detail": str(task.get("block_detail") or "Commit SHA is missing; inspect run logs before approving."),
+                    "action": "Inspect runs",
+                    "action_kind": "open_runs",
+                }
+            needs_you.append(item)
             seen_ids.add(phase_id)
         elif block_reason in ("smoke_test_failed", "smoke_test_unavailable"):
-            tag = str(task.get("release_tag") or "")
+            tag = str(task.get("release_tag") or "").strip()
             tag_str = f" ({tag})" if tag else ""
-            needs_you.append({
+            rel_rec = store.get_release_verification(proj_repo, tag) if (proj_repo and tag) else None
+            if block_reason == "smoke_test_failed" and rel_rec and str(rel_rec.get("smoke_status") or "") == "rolled_back":
+                if proj_repo and tag:
+                    seen_ids.add(f"release:{proj_repo}:{tag}")
+                seen_ids.add(phase_id)
+                continue
+            prev_tag = str(rel_rec.get("previous_good_tag") or "").strip() if rel_rec else ""
+            can_rollback = bool(block_reason == "smoke_test_failed" and proj_repo and tag and prev_tag)
+            item = {
                 "phase_id": phase_id,
                 "task_id": str(task["id"]),
+                "project_id": project_id,
                 "headline": f"Release smoke test blocked{tag_str}",
                 "detail": str(task.get("block_detail") or "Post-release verification did not pass."),
-                "action": "Roll back release" if block_reason == "smoke_test_failed" else "Configure smoke test",
-            })
+                "action": "Roll back release" if can_rollback else "Configure smoke test",
+                "action_kind": "rollback_release" if can_rollback else "configure_smoke_test",
+            }
+            if proj_repo:
+                item["repo"] = proj_repo
+            if tag:
+                item["release_tag"] = tag
+            if prev_tag:
+                item["previous_good_tag"] = prev_tag
+            needs_you.append(item)
             seen_ids.add(phase_id)
+            if proj_repo and tag:
+                seen_ids.add(f"release:{proj_repo}:{tag}")
 
-    proj_repo = str(proj.get("repo") or "").strip() if proj else ""
     for rel in store.list_release_verifications(repo=proj_repo or None, limit=5):
         if len(needs_you) >= 3:
             break
         if str(rel.get("smoke_status") or "") == "failed":
             rel_key = f"release:{rel['repo']}:{rel['tag']}"
             if rel_key not in seen_ids:
-                prev_tag = rel.get("previous_good_tag")
+                prev_tag = str(rel.get("previous_good_tag") or "").strip()
                 detail = str(rel.get("smoke_detail") or "Post-release smoke test failed.")
                 if prev_tag:
                     detail += f" Previous good release: {prev_tag}."
-                needs_you.append({
+                item = {
                     "phase_id": rel_key,
+                    "project_id": project_id,
                     "repo": str(rel["repo"]),
                     "release_tag": str(rel["tag"]),
                     "headline": f"Release {rel['tag']} failed launch smoke test",
                     "detail": detail,
-                    "action": "Roll back release",
-                })
+                    "action": "Roll back release" if prev_tag else "Configure smoke test",
+                    "action_kind": "rollback_release" if prev_tag else "configure_smoke_test",
+                }
+                if prev_tag:
+                    item["previous_good_tag"] = prev_tag
+                needs_you.append(item)
                 seen_ids.add(rel_key)
 
     for p in parked:
@@ -89,6 +132,7 @@ def generate_deck_data(
             "headline": f"Phase {p['phase_id']} is parked",
             "detail": str(p.get("reason", "Needs attention")),
             "action": str(p.get("next_step", "Inspect logs and resume")),
+            "action_kind": "open_runs",
         })
         seen_ids.add(pid)
 
@@ -153,6 +197,7 @@ def generate_deck_data(
             "headline": "Token optimizer warning",
             "detail": str(warn),
             "action": "Open Settings",
+            "action_kind": "open_settings",
         })
 
     # 5. One-line plain English headline

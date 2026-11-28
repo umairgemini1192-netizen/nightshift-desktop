@@ -1369,3 +1369,263 @@ def test_merge_gate_review_evidence_tier_and_unverified_rollback_fail_closed(tmp
         )
         assert rb.ok is False
         assert "not a verified passed release" in rb.detail
+
+
+def test_smoke_test_missing_executable_exit_code_127_is_unavailable(tmp_path: Path) -> None:
+    """Missing smoke executable returning rc=127 from run_subprocess_with_timeout must be 'unavailable', not 'failed'."""
+    vcs = FakeGitGh()
+    rel_mgr = ReleaseManager(vcs)
+    art = tmp_path / "app.apk"
+    art.write_bytes(b"fake-apk")
+
+    res = rel_mgr.run_launch_smoke_test(
+        artifact_path=art,
+        tag="v1.0.0-preview.9",
+        smoke_command="definitely_missing_smoke_runner_xyz_999 --apk {artifact}",
+        timeout_seconds=10,
+    )
+    assert res.passed is False
+    assert res.status == "unavailable"
+    assert "not found" in res.detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_e2e_adopted_release_resumes_smoke_blocked_task_without_manual_resume(tmp_path: Path) -> None:
+    """Rerunning a plan after configuring smoke_command must resume the smoke-blocked task to RELEASED automatically."""
+    with Store(tmp_path / "e2e_adopt_resume.db") as store:
+        store.migrate()
+        store.set_setting("pipeline.conditionalAutoMerge", "1")
+        events = EventBus(store)
+        quota = QuotaLedger(store)
+        vcs = FakeGitGh()
+        vcs.artifacts_to_create = ["NightShift-windows.zip"]
+
+        def on_code(prompt: str, wd: Path, model: str | None, effort: str) -> None:
+            (wd / "src").mkdir(parents=True, exist_ok=True)
+            (wd / "src" / "feature.py").write_text("def ok():\n    return True\n", encoding="utf-8")
+            vcs.add_pr("feat/p8e-adopt-resume", number=909, head_sha="sha_909")
+            vcs.changed_files["feat/p8e-adopt-resume"] = ["src/feature.py"]
+            vcs.diffs["feat/p8e-adopt-resume"] = (
+                "diff --git a/src/feature.py b/src/feature.py\n@@ -0,0 +1,2 @@\n+def ok():\n+    return True\n"
+            )
+            vcs.commit_ci_checks["sha_909"] = _make_valid_jobs("sha_909", branch="feat/p8e-adopt-resume")
+            vcs.commit_ci_checks["sha_merge_123"] = _make_valid_jobs("sha_merge_123", branch="main")
+
+        runners = {
+            "agy": FakeRunner(name="agy", on_call=on_code),
+            "codex": FakeRunner(name="codex", responses=[RunnerResult(rc=0, stdout=_approve_json(), stderr="")]),
+        }
+        logins = LoginHealthChecker(store=store, quota_ledger=quota, command_runner=_ok_login_runner)
+
+        project_no_smoke = ProjectConfig(
+            id="proj_adopt",
+            name="NightShift Adopt",
+            repo="owner/repo",
+            local_path=tmp_path / "repo",
+            output_dir=tmp_path / "out",
+            artifact_glob="*.zip",
+            smoke_command="",
+        )
+        project_no_smoke.local_path.mkdir()
+        phases = [
+            PhaseDefinition(
+                id="p1",
+                title="Adopt Resume Feature",
+                branch="feat/p8e-adopt-resume",
+                prompt="Implement logic",
+                allowed_globs=["src/**"],
+                auto_merge=True,
+                release_after_merge=True,
+            )
+        ]
+
+        engine_no_smoke = EngineStateMachine(store, events, quota, vcs=vcs, runners=runners, login_checker=logins)
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            rows1 = await engine_no_smoke.execute_plan(project_no_smoke, phases, plan_id="plan_adopt")
+
+        assert rows1[0]["status"] == "PARKED"
+        task_blocked = store.get_task_by_branch("feat/p8e-adopt-resume")
+        assert task_blocked is not None
+        assert task_blocked["status"] == "BLOCKED"
+        assert task_blocked["blocked_from_status"] == "MERGED"
+        assert task_blocked["block_reason"] == "smoke_test_unavailable"
+        assert task_blocked["smoke_verified_at"] is None
+
+        # Rerun directly WITHOUT calling TaskOrchestrator.resume_from_blocked manually
+        def pass_smoke(cmd: str, art: Path, tag: str, timeout: int) -> SmokeTestResult:
+            return SmokeTestResult(
+                passed=True,
+                status="passed",
+                detail="OK",
+                command=cmd,
+                verified_at="2026-11-28T03:00:00Z",
+            )
+
+        engine_with_smoke = EngineStateMachine(
+            store,
+            events,
+            quota,
+            vcs=vcs,
+            runners=runners,
+            login_checker=logins,
+            smoke_runner=pass_smoke,
+        )
+        project_with_smoke = ProjectConfig(
+            id="proj_adopt",
+            name="NightShift Adopt",
+            repo="owner/repo",
+            local_path=project_no_smoke.local_path,
+            output_dir=project_no_smoke.output_dir,
+            artifact_glob="*.zip",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+        )
+        with patch("nightshift.engine.state_machine.WORKTREE_ROOT", tmp_path / "wt"), patch(
+            "nightshift.engine.logins.resolve_bin", return_value="tool.exe"
+        ), patch(
+            "nightshift.engine.state_machine.shutil.disk_usage",
+            return_value=(20 * 1024**3, 10 * 1024**3, 10 * 1024**3),
+        ):
+            rows2 = await engine_with_smoke.execute_plan(project_with_smoke, phases, plan_id="plan_adopt")
+
+        assert rows2[0]["status"] == "COMPLETED"
+        task_released = store.get_task(task_blocked["id"])
+        assert task_released is not None
+        assert task_released["status"] == "RELEASED"
+        assert task_released["block_reason"] == ""
+        assert task_released["smoke_verified_at"] is not None
+        assert store.list_parked() == []
+
+
+def test_deck_governance_actions_map_to_working_bridge_methods(tmp_path: Path) -> None:
+    """Every governance action advertised by generate_deck_data must include valid bridge parameters and work end-to-end."""
+    with Store(tmp_path / "deck_gov.db") as store:
+        store.migrate()
+        events = EventBus(store)
+        vcs = FakeGitGh()
+        out_dir = tmp_path / "dist"
+        out_dir.mkdir()
+        store.create_project("proj-gov", "NightShift", "owner/repo", str(tmp_path), output_dir=str(out_dir))
+        store.create_plan("plan-gov", "proj-gov", "Plan")
+        store.upsert_phase("p-gov", "plan-gov", "Gov Phase", "feat/gov-deck")
+        store.park_phase("p-gov", "Awaiting owner approval", "Approve PR")
+
+        _, contract = store.create_task_with_contract(
+            task_id="t-gov-deck",
+            phase_id="p-gov",
+            plan_id="plan-gov",
+            title="Gov Task",
+            branch="feat/gov-deck",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-gov-deck",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_gov_deck_1",
+            review_sha="sha_gov_deck_1",
+            pr_number=42,
+            block_reason="awaiting_owner_approval",
+        )
+        store.record_evidence(
+            task_id="t-gov-deck",
+            contract_sha256=contract["contract_sha256"],
+            commit_sha="sha_gov_deck_1",
+            kind="ci_check",
+            source="circleci:desktop-gates",
+            build_id="b-1",
+            duration_seconds=12.0,
+            verified=True,
+        )
+
+        # Release with verified previous_good_tag -> advertises rollback_release
+        good_file = tmp_path / "app.zip"
+        good_file.write_bytes(b"good-zip-v1")
+        good_sums = tmp_path / "SHA256SUMS.txt"
+        good_sha = compute_sha256(good_file)
+        good_sums.write_text(f"{good_sha}  app.zip\n", encoding="utf-8")
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.1", "v1", "Good", [good_file, good_sums])
+        vcs.create_github_release("owner/repo", "v1.0.0-preview.2", "v2", "Bad", [good_file, good_sums])
+        store.record_release_verification(
+            tag="v1.0.0-preview.1",
+            repo="owner/repo",
+            merge_sha="sha_1",
+            artifact_sha256=good_sha,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            tag="v1.0.0-preview.2",
+            repo="owner/repo",
+            merge_sha="sha_2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="deadbeef",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        # Release without previous_good_tag -> must NOT advertise rollback_release
+        store.record_release_verification(
+            tag="v1.0.0-preview.3",
+            repo="owner/repo",
+            merge_sha="sha_3",
+            previous_good_tag=None,
+            artifact_sha256="cafebabe",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        deck = generate_deck_data(store, "proj-gov")
+        approve_item = next(i for i in deck["needs_you"] if i.get("action_kind") == "approve_task")
+        assert approve_item["action"] == "Review & Approve"
+        assert approve_item["task_id"] == "t-gov-deck"
+        assert approve_item["head_sha"] == "sha_gov_deck_1"
+        assert approve_item["pr_number"] == 42
+
+        rb_item = next(i for i in deck["needs_you"] if i.get("release_tag") == "v1.0.0-preview.2")
+        assert rb_item["action"] == "Roll back release"
+        assert rb_item["action_kind"] == "rollback_release"
+        assert rb_item["repo"] == "owner/repo"
+        assert rb_item["previous_good_tag"] == "v1.0.0-preview.1"
+
+        no_prev_item = next(i for i in deck["needs_you"] if i.get("release_tag") == "v1.0.0-preview.3")
+        assert no_prev_item["action_kind"] == "configure_smoke_test"
+        assert no_prev_item["action"] != "Roll back release"
+
+        class _StubEngine:
+            def __init__(self, vcs_obj: FakeGitGh) -> None:
+                self.vcs = vcs_obj
+                self.release_mgr = ReleaseManager(vcs_obj)
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_StubEngine(vcs))
+
+        # Execute advertised approve action through bridge using deck payload fields
+        approve_res = bridge.call(
+            "pipeline.approveTask",
+            {"taskId": approve_item["task_id"], "headSha": approve_item["head_sha"], "approvedBy": "owner"},
+        )
+        assert approve_res["ok"] is True
+        assert approve_res["data"]["status"] == "APPROVED"
+        assert store.list_parked() == []
+
+        # Execute advertised rollback action through bridge using deck payload fields
+        rb_res = bridge.call(
+            "pipeline.rollbackRelease",
+            {
+                "tag": rb_item["release_tag"],
+                "repo": rb_item["repo"],
+                "projectId": rb_item["project_id"],
+            },
+        )
+        assert rb_res["ok"] is True
+        assert rb_res["data"]["restored_tag"] == "v1.0.0-preview.1"
+
+        # After both actions succeed, neither item remains in needs_you
+        deck_after = generate_deck_data(store, "proj-gov")
+        assert not any(i.get("task_id") == "t-gov-deck" for i in deck_after["needs_you"])
+        assert not any(i.get("release_tag") == "v1.0.0-preview.2" for i in deck_after["needs_you"])
+

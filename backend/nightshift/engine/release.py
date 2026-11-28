@@ -301,7 +301,7 @@ class ReleaseManager:
                 cwd=tmp_dir,
                 timeout_seconds=timeout_seconds,
             )
-            if rc == -1 and "Executable not found" in (err or ""):
+            if rc in (127, -1) and "Executable not found" in (err or ""):
                 return SmokeTestResult(
                     passed=False,
                     status="unavailable",

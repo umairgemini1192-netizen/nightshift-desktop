@@ -55,6 +55,7 @@ const DEFAULT_PROJECT: ProjectConfigItem = {
   build_rules: "npm run lint && npm test",
   artifact_glob: "*.apk",
   output_dir: "",
+  smoke_command: "",
 };
 
 export default function SettingsPage() {
@@ -810,6 +811,14 @@ export default function SettingsPage() {
                   helperText="Destination for downloaded artifacts"
                 />
               </div>
+
+              <TextField
+                id="proj-smoke-command"
+                label="Post-release smoke command"
+                value={editingProject.smoke_command || ""}
+                onChange={(e) => setEditingProject((p) => ({ ...p, smoke_command: e.target.value }))}
+                helperText="Required before a release passes (e.g. builtin:desktop-zip-selftest or a launch command)."
+              />
 
               <CodeEditor
                 id="proj-build-rules"
