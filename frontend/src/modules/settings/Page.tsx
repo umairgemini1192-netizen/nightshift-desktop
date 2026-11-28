@@ -37,6 +37,7 @@ const ECONOMY_KEY_ENGINES = [
   { id: "deepseek", label: "DeepSeek", runner: "claude-compatible", model: "deepseek-chat" },
   { id: "kimi", label: "Kimi K2", runner: "claude-compatible", model: "kimi-k2" },
   { id: "glm", label: "GLM", runner: "claude-compatible", model: "glm-4" },
+  { id: "zai-glm-flash", label: "Z.ai GLM-4.7-flash (ZAI_API_KEY)", runner: "claude-compatible", model: "glm-4.7-flash" },
   { id: "minimax", label: "MiniMax", runner: "claude-compatible", model: "minimax-text-01" },
 ] as const;
 

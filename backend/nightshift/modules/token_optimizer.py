@@ -68,27 +68,26 @@ class TokenOptimizerService:
             auto_disabled = bool(db_state.get("auto_disabled", 0)) if db_state else False
             warning = str(db_state.get("warning", "")) if db_state else ""
 
+            verification = None
+            if not spec.catalogue_only and spec.name != "agy-fast":
+                verification = self._manager.verify_installed(spec.name)
+                db_state = self._store.get_token_tool_state(spec.name) if self._store is not None else None
+                enabled = bool(db_state.get("enabled", 0)) if db_state else False
+                sha_ok = bool(verification.ok)
+                warning = verification.warning
+
             if spec.catalogue_only:
                 status = "catalogue_only"
-                enabled = False
-                if not warning:
-                    warning = "Catalogue entry only (disabled). Enable later if ccusage shows search is a top cost."
-            elif auto_disabled:
-                status = "auto_disabled"
             elif spec.isolation_gate_required and not iso_passed:
                 status = "isolation_blocked"
-                enabled = False
-            elif warning and not sha_ok:
+            elif verification and verification.actual_sha256 and verification.actual_sha256 != verification.expected_sha256:
                 status = "hash_mismatch"
-                enabled = False
+            elif verification and verification.installed_path is None:
+                status = "not_installed"
+            elif auto_disabled:
+                status = "auto_disabled"
             elif enabled:
                 status = "enabled"
-                # Verify tool installation (P1 fix: ensure tools are installed before marking enabled)
-                if spec.name != "agy-fast":
-                    verify_res = self._manager.verify_installed(spec.name)
-                    if not verify_res.ok:
-                        warning = verify_res.warning or "Tool verification failed after enable"
-                        status = "hash_mismatch"
             else:
                 status = "disabled"
 
@@ -174,6 +173,12 @@ class TokenOptimizerService:
                     payload={"tool": tool_name, "enabled": enabled},
                 )
             )
+        return self.get_state()
+
+    def install_tool(self, tool_name: str) -> dict[str, Any]:
+        if self._manager.get_spec(tool_name) is None:
+            raise ValueError(f"Unknown token optimizer tool: {tool_name}")
+        self._manager.ensure_installed(tool_name)
         return self.get_state()
 
     def verify_tools(self) -> dict[str, Any]:
@@ -275,6 +280,7 @@ class Module(ModuleBase):
                 str(args.get("tool", "")),
                 bool(args.get("enabled", False)),
             ),
+            "installTool": lambda args: self.service.install_tool(str(args.get("tool", ""))),
             "verifyTools": lambda _args: self.service.verify_tools(),
             "runIsolationProbe": lambda _args: self.service.run_isolation_probe(),
             "evaluateAb": lambda args: self.service.evaluate_ab(

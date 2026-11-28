@@ -11,6 +11,8 @@ function statusBadgeProps(
       return { tone: "success", label: "Enabled" };
     case "auto_disabled":
       return { tone: "danger", label: "Auto-disabled" };
+    case "not_installed":
+      return { tone: "neutral", label: "Not installed" };
     case "hash_mismatch":
       return { tone: "danger", label: "SHA-256 mismatch" };
     case "isolation_blocked":
@@ -73,6 +75,18 @@ export function TokenOptimizerSettingsCard() {
         description: String(err),
         tone: "danger",
       });
+    } finally {
+      setTogglingTool(null);
+    }
+  };
+
+  const handleInstall = async (tool: TokenOptimizerToolItem) => {
+    setTogglingTool(tool.name);
+    try {
+      const res = await bridge.call<TokenOptimizerState>("token_optimizer.installTool", { tool: tool.name });
+      if (res && Array.isArray(res.tools)) setState(res);
+    } catch (err) {
+      pushToast({ title: `Could not install ${tool.displayName}`, description: String(err), tone: "danger" });
     } finally {
       setTogglingTool(null);
     }
@@ -234,6 +248,9 @@ export function TokenOptimizerSettingsCard() {
                       disabled={toggleDisabled}
                       onChange={(checked) => void handleToggle(tool, checked)}
                     />
+                    {tool.status === "not_installed" && (
+                      <Button size="sm" variant="secondary" loading={togglingTool === tool.name} onClick={() => void handleInstall(tool)}>Install</Button>
+                    )}
                     {tool.isolationGateRequired && (
                       <Button
                         size="sm"

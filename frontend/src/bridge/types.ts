@@ -324,6 +324,7 @@ export interface TokenOptimizerToolItem {
     | "disabled"
     | "auto_disabled"
     | "isolation_blocked"
+    | "not_installed"
     | "hash_mismatch"
     | "catalogue_only";
   warning: string;
