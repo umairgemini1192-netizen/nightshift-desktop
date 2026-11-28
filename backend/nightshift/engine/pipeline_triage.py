@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nightshift.clock import active_time
 from nightshift.engine.pipeline_contracts import provider_for_engine
 from nightshift.engine.pipeline_economics import PipelineEconomics, is_free_only_engine
 from nightshift.engine.verify import redact_secrets
@@ -313,9 +313,9 @@ async def run_triage_stage(
         if runner is None:
             continue
 
-        t0 = time.monotonic()
+        t0 = active_time()
         res = await runner.run(prompt, workdir, timeout_seconds=timeout_seconds)
-        elapsed = round(time.monotonic() - t0, 3)
+        elapsed = round(active_time() - t0, 3)
         parsed = parse_triage_output(res.stdout) if res.rc == 0 else None
         model_name = route.model or getattr(runner, "model", "") or candidate
 

@@ -21,6 +21,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from nightshift.clock import SleepClock
+
 # The packaged app is windowed (no console). Without this flag every CLI it starts
 # (gh, git, agy, claude, ...) pops up its own console window on the owner's screen.
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -279,7 +281,17 @@ def run_subprocess_with_timeout(
     job_handle = _attach_windows_kill_on_close_job(proc.pid)
 
     try:
-        out, err = proc.communicate(timeout=timeout_seconds)
+        clock = SleepClock()
+        while True:
+            remaining = timeout_seconds - clock.elapsed()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(cmd, timeout_seconds)
+            try:
+                out, err = proc.communicate(timeout=min(remaining, 5.0))
+                break
+            except subprocess.TimeoutExpired:
+                if clock.elapsed() >= timeout_seconds:
+                    raise
         if strip_output:
             raw_out = (out or "").strip()
             raw_err = (err or "").strip()

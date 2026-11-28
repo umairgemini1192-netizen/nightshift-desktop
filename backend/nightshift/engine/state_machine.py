@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from nightshift.clock import active_time, SleepClock
 from nightshift.engine.ci import CiPipelineManager, CiWatchResult
 from nightshift.engine.deck import generate_deck_data, write_morning_digest
 from nightshift.engine.logins import LoginHealthChecker
@@ -250,7 +251,7 @@ class EngineStateMachine:
         # Post-merge CircleCI main check polling (injectable for tests).
         self._ci_poll_seconds = 30.0
         self._ci_poll_sleep: Callable[[float], None] = time.sleep
-        self._ci_clock: Callable[[], float] = time.monotonic
+        self._ci_clock: Callable[[], float] = active_time
         # Single mandatory merge-gate chokepoint (AGENT_PIPELINE §1).
         # Conditional auto-merge for eligible classes unlocks when pipeline.conditionalAutoMerge is enabled.
         if merge_gate is not None:
@@ -716,6 +717,7 @@ class EngineStateMachine:
         task_id = str(pipeline_task["id"])
         active_runner_name = "unknown"
         t0 = time.time()
+        phase_clock = SleepClock()
         contract_allowed_globs = json.loads(str(pipeline_contract.get("allowed_globs_json") or "[]"))
         contract_forbidden_globs = json.loads(str(pipeline_contract.get("forbidden_globs_json") or "[]"))
 
@@ -935,7 +937,7 @@ class EngineStateMachine:
                 inv_timeout = self.scheduler.invocation_timeout_seconds(
                     phase.id, active_runner_name, min(phase.timeout_minutes, int(self.store.get_setting("guard.runnerTimeoutMinutes", "90") or "90")) * 60
                 )
-                attempt_t0 = time.monotonic()
+                attempt_t0 = active_time()
                 res = await runner_obj.run(
                     instruction,
                     wt_dir,
@@ -943,7 +945,10 @@ class EngineStateMachine:
                     effort=choice.effort,
                     timeout_seconds=inv_timeout,
                 )
-                attempt_wall_s = round(max(0.01, time.monotonic() - attempt_t0), 3)
+                attempt_wall_s = round(max(0.01, active_time() - attempt_t0), 3)
+
+                if phase_clock.jumped():
+                    self.logins.check_all(repo=project.repo, force=True)
 
                 # Misconfigured CLI argument error -> mark misconfigured & skip without burning an attempt
                 combined_err = f"{res.stdout}\n{res.stderr}".lower()
@@ -1058,7 +1063,7 @@ class EngineStateMachine:
                         ),
                     )
 
-                elapsed_min = max(0.01, (time.time() - t0) / 60.0)
+                elapsed_min = max(0.01, phase_clock.elapsed() / 60.0)
                 attempt_ok = bool(res.rc == 0 and ok_deliv and not non_split_findings)
                 self.economics.record_ledger_event(
                     task_id=task_id,
@@ -1074,7 +1079,7 @@ class EngineStateMachine:
                 if attempt_ok:
                     delivered = True
                     self.store.update_step(step_id, rc=0, verified=1, detail=deliv_reason)
-                    self.store.record_duration("implement", active_runner_name, time.time() - t0)
+                    self.store.record_duration("implement", active_runner_name, phase_clock.elapsed())
                     self.store.update_engine_stats(active_runner_name, effective_size, success=True, minutes=elapsed_min)
 
                     # Evaluate A/B results for enabled tools (BLUEPRINT 5g)
@@ -1817,8 +1822,11 @@ class EngineStateMachine:
         if not required:
             return None, "No required CircleCI jobs configured for this project"
         start = self._ci_clock()
+        wake_clock = SleepClock()
         pending: list[str] = list(required)
         while True:
+            if wake_clock.jumped():
+                self.logins.check_all(repo=project.repo, force=True)
             try:
                 observed = self.vcs.get_commit_ci_checks(project.repo, merge_sha, branch="main")
             except Exception as exc:  # transient API/network error: keep waiting
