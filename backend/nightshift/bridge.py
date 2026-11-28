@@ -1285,12 +1285,12 @@ class BridgeAPI:
             deck = generate_deck_data(self._store, project_id=active_project_id or "nightshift-desktop")
             is_running = bool(self._engine and getattr(self._engine, "is_running", False))
             stop_armed = bool(getattr(self._engine, "stop_requested", self._stop_armed))
-            parked = self._store.list_parked()
+            parked = self._store.list_parked(project_id=active_project_id) if active_project_id else []
 
             run_state = "running" if is_running else ("failed" if deck.get("needs_you") else "idle")
             scenario = "empty" if not projects else ("running" if is_running else ("failure" if parked else "idle"))
 
-            phases = self._store.list_phases()
+            phases = self._store.list_phases(project_id=active_project_id) if active_project_id else []
             done_count = len([ph for ph in phases if ph.get("status") in ("merged", "completed")])
 
             badges = {
@@ -1328,11 +1328,23 @@ class BridgeAPI:
 
         # Pipeline governance controls (Phase 8e: owner approval, assertion waiver, release rollback)
         if method == "pipeline.listTasks":
-            status_filter = payload.get("status")
-            plan_filter = payload.get("planId")
+            status_filter = str(payload.get("status") or "").strip() or None
+            plan_filter = str(payload.get("planId") or "").strip() or None
+            project_filter = str(payload.get("projectId") or "").strip() or None
+            if project_filter:
+                if self._store.get_project(project_filter) is None:
+                    return {"ok": False, "error": f"Unknown project: {project_filter}"}
+                if plan_filter:
+                    plan_row = self._store.get_plan(plan_filter)
+                    if plan_row is None or str(plan_row.get("project_id") or "") != project_filter:
+                        return {
+                            "ok": False,
+                            "error": f"Plan '{plan_filter}' does not belong to project '{project_filter}'.",
+                        }
             tasks = self._store.list_tasks(
-                status=str(status_filter) if status_filter else None,
-                plan_id=str(plan_filter) if plan_filter else None,
+                status=status_filter,
+                plan_id=plan_filter,
+                project_id=project_filter,
             )
             return {"ok": True, "data": tasks}
 
@@ -1341,11 +1353,30 @@ class BridgeAPI:
             head_sha = str(payload.get("headSha") or "").strip()
             approved_by = str(payload.get("approvedBy") or "owner").strip() or "owner"
             resume = bool(payload.get("resume", True))
+            req_project_id = str(payload.get("projectId") or "").strip()
+            req_repo = str(payload.get("repo") or "").strip()
             if not task_id or not head_sha:
                 return {"ok": False, "error": "taskId and exact headSha are required to approve a task."}
             task = self._store.get_task(task_id)
             if task is None:
                 return {"ok": False, "error": f"Task not found: {task_id}"}
+            task_project_id = self._store.get_task_project_id(task_id)
+            if not task_project_id:
+                return {"ok": False, "error": f"Task '{task_id}' has no owning project."}
+            expected_project_id = req_project_id or (self._active_project_id or "")
+            if expected_project_id and task_project_id != expected_project_id:
+                return {
+                    "ok": False,
+                    "error": f"Task '{task_id}' does not belong to project '{expected_project_id}'.",
+                }
+            if req_repo:
+                owning_proj = self._store.get_project(task_project_id)
+                owning_repo = str(owning_proj.get("repo") or "").strip() if owning_proj else ""
+                if owning_repo != req_repo:
+                    return {
+                        "ok": False,
+                        "error": f"Task '{task_id}' does not belong to repository '{req_repo}'.",
+                    }
             if task.get("head_sha") and str(task["head_sha"]) != head_sha:
                 return {
                     "ok": False,
@@ -1380,8 +1411,30 @@ class BridgeAPI:
             task_id = str(payload.get("taskId") or "").strip()
             head_sha = str(payload.get("headSha") or "").strip()
             reason = str(payload.get("reason") or "").strip()
+            req_project_id = str(payload.get("projectId") or "").strip()
+            req_repo = str(payload.get("repo") or "").strip()
             if not task_id or not head_sha or not reason:
                 return {"ok": False, "error": "taskId, exact headSha, and written rationale are required."}
+            task = self._store.get_task(task_id)
+            if task is None:
+                return {"ok": False, "error": f"Task not found: {task_id}"}
+            task_project_id = self._store.get_task_project_id(task_id)
+            if not task_project_id:
+                return {"ok": False, "error": f"Task '{task_id}' has no owning project."}
+            expected_project_id = req_project_id or (self._active_project_id or "")
+            if expected_project_id and task_project_id != expected_project_id:
+                return {
+                    "ok": False,
+                    "error": f"Task '{task_id}' does not belong to project '{expected_project_id}'.",
+                }
+            if req_repo:
+                owning_proj = self._store.get_project(task_project_id)
+                owning_repo = str(owning_proj.get("repo") or "").strip() if owning_proj else ""
+                if owning_repo != req_repo:
+                    return {
+                        "ok": False,
+                        "error": f"Task '{task_id}' does not belong to repository '{req_repo}'.",
+                    }
             try:
                 updated = self._store.record_task_assertion_waiver(task_id, head_sha, reason)
             except KeyError as exc:
@@ -1397,10 +1450,22 @@ class BridgeAPI:
             return {"ok": True, "data": updated}
 
         if method == "pipeline.listReleaseVerifications":
-            repo_filter = payload.get("repo")
+            repo_filter = str(payload.get("repo") or "").strip() or None
+            project_filter = str(payload.get("projectId") or "").strip() or None
             limit = int(payload.get("limit") or 20)
+            if project_filter:
+                proj = self._store.get_project(project_filter)
+                if proj is None:
+                    return {"ok": False, "error": f"Unknown project: {project_filter}"}
+                proj_repo = str(proj.get("repo") or "").strip()
+                if repo_filter and repo_filter != proj_repo:
+                    return {
+                        "ok": False,
+                        "error": f"Repository '{repo_filter}' does not belong to project '{project_filter}'.",
+                    }
             rows = self._store.list_release_verifications(
-                repo=str(repo_filter) if repo_filter else None,
+                repo=repo_filter,
+                project_id=project_filter,
                 limit=limit,
             )
             return {"ok": True, "data": rows}
@@ -1412,14 +1477,37 @@ class BridgeAPI:
             faulty_tag = str(payload.get("tag") or payload.get("faultyTag") or "").strip()
             if not faulty_tag:
                 return {"ok": False, "error": "Release tag is required for rollback."}
-            project_id = str(payload.get("projectId") or self._active_project_id or "")
-            proj = self._store.get_project(project_id) if project_id else None
-            repo = str(payload.get("repo") or (proj.get("repo") if proj else "") or "").strip()
+            req_project_id = str(payload.get("projectId") or "").strip()
+            req_repo = str(payload.get("repo") or "").strip()
+            project_id = req_project_id or (self._active_project_id or "")
+            proj: dict[str, Any] | None = None
+            if project_id:
+                proj = self._store.get_project(project_id)
+                if proj is None:
+                    return {"ok": False, "error": f"Unknown project: {project_id}"}
+                proj_repo = str(proj.get("repo") or "").strip()
+                if not proj_repo:
+                    return {"ok": False, "error": f"Project '{project_id}' has no configured repository."}
+                if req_repo and req_repo != proj_repo:
+                    return {
+                        "ok": False,
+                        "error": f"Repository '{req_repo}' does not belong to project '{project_id}'.",
+                    }
+                repo = proj_repo
+            else:
+                repo = req_repo
             if not repo:
                 return {"ok": False, "error": "Repository (repo or projectId) is required for rollback."}
             rel_rec = self._store.get_release_verification(repo, faulty_tag)
             if rel_rec is None:
                 return {"ok": False, "error": f"Unknown release tag '{faulty_tag}' for repository '{repo}'."}
+            if project_id and rel_rec.get("task_id"):
+                rel_task_proj = self._store.get_task_project_id(str(rel_rec["task_id"]))
+                if rel_task_proj is not None and rel_task_proj != project_id:
+                    return {
+                        "ok": False,
+                        "error": f"Release '{faulty_tag}' belongs to project '{rel_task_proj}', not '{project_id}'.",
+                    }
             if proj is None and repo:
                 proj = next((p for p in self._store.list_projects() if p.get("repo") == repo), None)
             out_dir = Path(

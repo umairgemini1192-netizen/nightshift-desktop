@@ -92,6 +92,7 @@ describe("Phase 8e governance UI handlers", () => {
       expect(callSpy).toHaveBeenCalledWith("pipeline.approveTask", {
         taskId: "t-gov-1",
         headSha: "abc1234deadbeef",
+        projectId: "proj-gov",
         approvedBy: "owner",
         resume: true,
       });
@@ -165,8 +166,9 @@ describe("Phase 8e governance UI handlers", () => {
     await user.click(editButtons[0]);
 
     const smokeInput = await screen.findByLabelText("Post-release smoke command");
+    expect(screen.getByText(/nightshift-desktop-selftest/i)).toBeInTheDocument();
     await user.clear(smokeInput);
-    await user.type(smokeInput, "builtin:desktop-zip-selftest");
+    await user.type(smokeInput, "nightshift-desktop-selftest");
     await user.click(screen.getByRole("button", { name: "Save changes" }));
 
     await waitFor(() => {
@@ -174,7 +176,7 @@ describe("Phase 8e governance UI handlers", () => {
         "settings.saveProject",
         expect.objectContaining({
           project: expect.objectContaining({
-            smoke_command: "builtin:desktop-zip-selftest",
+            smoke_command: "nightshift-desktop-selftest",
           }),
         }),
       );

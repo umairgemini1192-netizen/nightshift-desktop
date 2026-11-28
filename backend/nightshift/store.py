@@ -895,8 +895,34 @@ class Store:
         row = self._conn.execute("SELECT * FROM phases WHERE id = ?", (phase_id,)).fetchone()
         return dict(row) if row is not None else None
 
-    def list_phases(self, plan_id: str | None = None) -> list[dict[str, Any]]:
-        if plan_id:
+    def list_phases(
+        self,
+        plan_id: str | None = None,
+        *,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if project_id is not None:
+            if plan_id:
+                rows = self._conn.execute(
+                    """
+                    SELECT ph.* FROM phases ph
+                    INNER JOIN plans pl ON ph.plan_id = pl.id
+                    WHERE pl.project_id = ? AND ph.plan_id = ?
+                    ORDER BY ph.position ASC, ph.id ASC
+                    """,
+                    (project_id, plan_id),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT ph.* FROM phases ph
+                    INNER JOIN plans pl ON ph.plan_id = pl.id
+                    WHERE pl.project_id = ?
+                    ORDER BY ph.position ASC, ph.id ASC
+                    """,
+                    (project_id,),
+                ).fetchall()
+        elif plan_id:
             rows = self._conn.execute(
                 "SELECT * FROM phases WHERE plan_id = ? ORDER BY position ASC, id ASC", (plan_id,)
             ).fetchall()
@@ -1056,8 +1082,20 @@ class Store:
         row = self._conn.execute("SELECT * FROM parked WHERE phase_id = ?", (phase_id,)).fetchone()
         return dict(row) if row is not None else None
 
-    def list_parked(self) -> list[dict[str, Any]]:
-        rows = self._conn.execute("SELECT * FROM parked ORDER BY parked_at ASC").fetchall()
+    def list_parked(self, *, project_id: str | None = None) -> list[dict[str, Any]]:
+        if project_id is not None:
+            rows = self._conn.execute(
+                """
+                SELECT pk.* FROM parked pk
+                INNER JOIN phases ph ON pk.phase_id = ph.id
+                INNER JOIN plans pl ON ph.plan_id = pl.id
+                WHERE pl.project_id = ?
+                ORDER BY pk.parked_at ASC
+                """,
+                (project_id,),
+            ).fetchall()
+        else:
+            rows = self._conn.execute("SELECT * FROM parked ORDER BY parked_at ASC").fetchall()
         return [dict(r) for r in rows]
 
     def record_login_check(
@@ -1696,25 +1734,52 @@ class Store:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_task_project_id(self, task_id: str) -> str | None:
+        """Return the owning ``project_id`` for ``task_id`` via its plan, or None if not found."""
+        row = self._conn.execute(
+            """
+            SELECT pl.project_id FROM tasks t
+            INNER JOIN plans pl ON t.plan_id = pl.id
+            WHERE t.id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+        return str(row["project_id"]) if row is not None and row["project_id"] is not None else None
+
     def list_tasks(
         self,
         *,
         status: str | None = None,
         plan_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if status is not None:
-            clauses.append("status = ?")
+            clauses.append("t.status = ?")
             params.append(status)
         if plan_id is not None:
-            clauses.append("plan_id = ?")
+            clauses.append("t.plan_id = ?")
             params.append(plan_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM tasks {where} ORDER BY created_at ASC",
-            params,
-        ).fetchall()
+        if project_id is not None:
+            clauses.append("pl.project_id = ?")
+            params.append(project_id)
+            where = f"WHERE {' AND '.join(clauses)}"
+            rows = self._conn.execute(
+                f"""
+                SELECT t.* FROM tasks t
+                INNER JOIN plans pl ON t.plan_id = pl.id
+                {where}
+                ORDER BY t.created_at ASC
+                """,
+                params,
+            ).fetchall()
+        else:
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = self._conn.execute(
+                f"SELECT t.* FROM tasks t {where} ORDER BY t.created_at ASC",
+                params,
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def list_task_transitions(self, task_id: str) -> list[dict[str, Any]]:
@@ -2139,12 +2204,24 @@ class Store:
         self,
         *,
         repo: str | None = None,
+        project_id: str | None = None,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
-        if repo:
+        effective_repo = (repo or "").strip() if repo is not None else None
+        if project_id is not None:
+            proj = self.get_project(project_id)
+            proj_repo = str(proj.get("repo") or "").strip() if proj else ""
+            if not proj_repo:
+                return []
+            if effective_repo is not None and effective_repo != proj_repo:
+                return []
+            effective_repo = proj_repo
+        if effective_repo is not None:
+            if not effective_repo:
+                return []
             rows = self._conn.execute(
                 "SELECT * FROM release_verifications WHERE repo = ? ORDER BY rowid DESC LIMIT ?",
-                (repo, limit),
+                (effective_repo, limit),
             ).fetchall()
         else:
             rows = self._conn.execute(

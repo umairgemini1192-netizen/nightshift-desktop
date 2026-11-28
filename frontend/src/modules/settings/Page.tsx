@@ -817,7 +817,7 @@ export default function SettingsPage() {
                 label="Post-release smoke command"
                 value={editingProject.smoke_command || ""}
                 onChange={(e) => setEditingProject((p) => ({ ...p, smoke_command: e.target.value }))}
-                helperText="Required before a release passes (e.g. builtin:desktop-zip-selftest or a launch command)."
+                helperText="Required before a release passes (e.g. nightshift-desktop-selftest or a launch command)."
               />
 
               <CodeEditor

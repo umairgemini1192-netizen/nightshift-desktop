@@ -1629,3 +1629,373 @@ def test_deck_governance_actions_map_to_working_bridge_methods(tmp_path: Path) -
         assert not any(i.get("task_id") == "t-gov-deck" for i in deck_after["needs_you"])
         assert not any(i.get("release_tag") == "v1.0.0-preview.2" for i in deck_after["needs_you"])
 
+
+def test_two_projects_deck_and_store_isolation(tmp_path: Path) -> None:
+    """Blocked tasks, parked phases, and releases from project A must never leak into project B's deck."""
+    with Store(tmp_path / "two_proj_deck.db") as store:
+        store.migrate()
+        store.create_project("proj-a", "Project A", "owner/repo-a", str(tmp_path / "a"), output_dir=str(tmp_path / "dist-a"))
+        store.create_project("proj-b", "Project B", "owner/repo-b", str(tmp_path / "b"), output_dir=str(tmp_path / "dist-b"))
+
+        store.create_plan("plan-a", "proj-a", "Plan A")
+        store.create_plan("plan-b", "proj-b", "Plan B")
+
+        store.upsert_phase("phase-a-smoke", "plan-a", "Phase A Smoke", "feat/a-smoke", status="parked")
+        store.upsert_phase("phase-a-gov", "plan-a", "Phase A Gov", "feat/a-gov", status="parked")
+        store.upsert_phase("phase-b-done", "plan-b", "Phase B Done", "feat/b-done", status="merged")
+        store.park_phase("phase-a-smoke", "Smoke test failed", "Roll back")
+
+        # Project A: failed smoke test task for tag v1.0.0-preview.2 and governance task awaiting approval
+        store.create_task_with_contract(
+            task_id="t-a-smoke",
+            phase_id="phase-a-smoke",
+            plan_id="plan-a",
+            title="A Smoke Task",
+            branch="feat/a-smoke",
+            risk_class="business_logic",
+        )
+        store.update_task_fields(
+            "t-a-smoke",
+            status="BLOCKED",
+            blocked_from_status="MERGED",
+            block_reason="smoke_test_failed",
+            block_detail="Project A smoke test crashed.",
+            release_tag="v1.0.0-preview.2",
+        )
+        store.create_task_with_contract(
+            task_id="t-a-gov",
+            phase_id="phase-a-gov",
+            plan_id="plan-a",
+            title="A Gov Task",
+            branch="feat/a-gov",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-a-gov",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_a_gov",
+            block_reason="awaiting_owner_approval",
+        )
+
+        # Project A releases: v1 passed, v2 failed
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_a1",
+            artifact_sha256="a" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.2",
+            task_id="t-a-smoke",
+            merge_sha="sha_a2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="b" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+
+        # Project B releases: SAME tags v1 and v2, BOTH healthy/passing!
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_b1",
+            artifact_sha256="c" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.2",
+            merge_sha="sha_b2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="d" * 64,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T02:00:00Z",
+        )
+
+        # Project B deck must have ZERO needs_you items (no leakage of A's failed task or rollback of B's passing v2!)
+        deck_b = generate_deck_data(store, "proj-b")
+        assert deck_b["needs_you"] == []
+        assert deck_b["state"] == "good"
+        assert [p["phase_id"] for p in deck_b["done_tonight"]] == ["phase-b-done"]
+
+        # Project A deck surfaces ONLY Project A's items with proj-a / owner/repo-a metadata
+        deck_a = generate_deck_data(store, "proj-a")
+        assert len(deck_a["needs_you"]) == 2
+        assert all(item.get("project_id") == "proj-a" for item in deck_a["needs_you"])
+        assert all(item.get("repo") == "owner/repo-a" for item in deck_a["needs_you"])
+        assert deck_a["done_tonight"] == []
+
+        # Unknown project fails closed: zero tasks, zero releases, zero parked phases
+        deck_unknown = generate_deck_data(store, "proj-nonexistent")
+        assert deck_unknown["needs_you"] == []
+        assert deck_unknown["done_tonight"] == []
+
+        # Store queries scoped by project_id stay strictly isolated
+        assert {t["id"] for t in store.list_tasks(project_id="proj-a")} == {"t-a-smoke", "t-a-gov"}
+        assert store.list_tasks(project_id="proj-b") == []
+        assert [p["phase_id"] for p in store.list_parked(project_id="proj-a")] == ["phase-a-smoke"]
+        assert store.list_parked(project_id="proj-b") == []
+        assert [r["repo"] for r in store.list_release_verifications(project_id="proj-b")] == ["owner/repo-b", "owner/repo-b"]
+        assert store.list_release_verifications(project_id="proj-a", repo="owner/repo-b") == []
+
+
+def test_two_projects_governance_bridge_methods_fail_closed(tmp_path: Path) -> None:
+    """Every governance bridge method must verify task/release project ownership and fail closed on mismatch."""
+    with Store(tmp_path / "two_proj_bridge.db") as store:
+        store.migrate()
+        events = EventBus(store)
+        vcs = FakeGitGh()
+        out_a = tmp_path / "dist-a"
+        out_b = tmp_path / "dist-b"
+        out_a.mkdir()
+        out_b.mkdir()
+
+        store.create_project("proj-a", "Project A", "owner/repo-a", str(tmp_path / "a"), output_dir=str(out_a))
+        store.create_project("proj-b", "Project B", "owner/repo-b", str(tmp_path / "b"), output_dir=str(out_b))
+        store.create_plan("plan-a", "proj-a", "Plan A")
+        store.create_plan("plan-b", "proj-b", "Plan B")
+        store.upsert_phase("p-a", "plan-a", "Phase A", "feat/a")
+        store.upsert_phase("p-b", "plan-b", "Phase B", "feat/b")
+
+        _, contract_a = store.create_task_with_contract(
+            task_id="t-a",
+            phase_id="p-a",
+            plan_id="plan-a",
+            title="Task A",
+            branch="feat/a",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-a",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_a",
+            review_sha="sha_a",
+            block_reason="awaiting_owner_approval",
+        )
+        store.record_evidence(
+            task_id="t-a",
+            contract_sha256=contract_a["contract_sha256"],
+            commit_sha="sha_a",
+            kind="ci_check",
+            source="circleci:desktop-gates",
+            build_id="b-a1",
+            duration_seconds=12.0,
+            verified=True,
+        )
+
+        _, contract_b = store.create_task_with_contract(
+            task_id="t-b",
+            phase_id="p-b",
+            plan_id="plan-b",
+            title="Task B",
+            branch="feat/b",
+            risk_class="governance",
+        )
+        store.update_task_fields(
+            "t-b",
+            status="BLOCKED",
+            blocked_from_status="REVIEWING",
+            head_sha="sha_b",
+            review_sha="sha_b",
+            block_reason="awaiting_owner_approval",
+        )
+        store.record_evidence(
+            task_id="t-b",
+            contract_sha256=contract_b["contract_sha256"],
+            commit_sha="sha_b",
+            kind="ci_check",
+            source="circleci:desktop-gates",
+            build_id="b-b1",
+            duration_seconds=12.0,
+            verified=True,
+        )
+
+        # Releases with identical tags on BOTH repos
+        art_a = tmp_path / "app-a.zip"
+        art_a.write_bytes(b"repo-a-good-v1")
+        sha_a = compute_sha256(art_a)
+        sums_a = tmp_path / "a_sums" / "SHA256SUMS.txt"
+        sums_a.parent.mkdir()
+        sums_a.write_text(f"{sha_a}  app-a.zip\n", encoding="utf-8")
+
+        art_b = tmp_path / "app-b.zip"
+        art_b.write_bytes(b"repo-b-good-v1")
+        sha_b = compute_sha256(art_b)
+        sums_b = tmp_path / "b_sums" / "SHA256SUMS.txt"
+        sums_b.parent.mkdir()
+        sums_b.write_text(f"{sha_b}  app-b.zip\n", encoding="utf-8")
+
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.1", "A v1", "Good A", [art_a, sums_a])
+        vcs.create_github_release("owner/repo-a", "v1.0.0-preview.2", "A v2", "Bad A", [art_a, sums_a])
+        vcs.create_github_release("owner/repo-b", "v1.0.0-preview.1", "B v1", "Good B", [art_b, sums_b])
+        vcs.create_github_release("owner/repo-b", "v1.0.0-preview.2", "B v2", "Good B2", [art_b, sums_b])
+
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_a1",
+            artifact_sha256=sha_a,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-a",
+            tag="v1.0.0-preview.2",
+            task_id="t-a",
+            merge_sha="sha_a2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256="deadbeef",
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="failed",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.1",
+            merge_sha="sha_b1",
+            artifact_sha256=sha_b,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T01:00:00Z",
+        )
+        store.record_release_verification(
+            repo="owner/repo-b",
+            tag="v1.0.0-preview.2",
+            task_id="t-b",
+            merge_sha="sha_b2",
+            previous_good_tag="v1.0.0-preview.1",
+            artifact_sha256=sha_b,
+            smoke_command=DESKTOP_SELFTEST_SMOKE,
+            smoke_status="passed",
+            verified_at="2026-11-28T02:00:00Z",
+        )
+
+        class _StubEngine:
+            def __init__(self, vcs_obj: FakeGitGh) -> None:
+                self.vcs = vcs_obj
+                self.release_mgr = ReleaseManager(vcs_obj)
+
+        bridge = BridgeAPI(store, events, ModuleRegistry(), engine=_StubEngine(vcs))
+
+        # 1. pipeline.listTasks scoped by projectId and fails closed on plan/project mismatch
+        list_b = bridge.call("pipeline.listTasks", {"projectId": "proj-b"})
+        assert list_b["ok"] is True
+        assert [t["id"] for t in list_b["data"]] == ["t-b"]
+        bad_list = bridge.call("pipeline.listTasks", {"projectId": "proj-b", "planId": "plan-a"})
+        assert bad_list["ok"] is False
+
+        # 2. pipeline.approveTask fails closed on cross-project / cross-repo / active-project mismatch
+        cross_approve = bridge.call("pipeline.approveTask", {"taskId": "t-a", "headSha": "sha_a", "projectId": "proj-b"})
+        assert cross_approve["ok"] is False
+        assert store.get_task("t-a")["status"] == "BLOCKED"
+
+        cross_repo_approve = bridge.call("pipeline.approveTask", {"taskId": "t-a", "headSha": "sha_a", "repo": "owner/repo-b"})
+        assert cross_repo_approve["ok"] is False
+
+        # Active project is proj-b -> approving t-a without projectId also fails closed
+        bridge._active_project_id = "proj-b"
+        active_mismatch_approve = bridge.call("pipeline.approveTask", {"taskId": "t-a", "headSha": "sha_a"})
+        assert active_mismatch_approve["ok"] is False
+
+        # 3. pipeline.recordAssertionWaiver fails closed on cross-project / cross-repo mismatch
+        cross_waiver = bridge.call(
+            "pipeline.recordAssertionWaiver",
+            {"taskId": "t-a", "headSha": "sha_a", "reason": "Refactor", "projectId": "proj-b"},
+        )
+        assert cross_waiver["ok"] is False
+        assert store.get_task("t-a")["assertion_waiver_sha"] is None
+
+        # 4. pipeline.listReleaseVerifications fails closed on repo/project mismatch
+        bad_rel_list = bridge.call("pipeline.listReleaseVerifications", {"projectId": "proj-a", "repo": "owner/repo-b"})
+        assert bad_rel_list["ok"] is False
+        good_rel_list = bridge.call("pipeline.listReleaseVerifications", {"projectId": "proj-a"})
+        assert good_rel_list["ok"] is True
+        assert all(r["repo"] == "owner/repo-a" for r in good_rel_list["data"])
+
+        # 5. pipeline.rollbackRelease fails closed on projectId/repo mismatch and unknown projectId
+        cross_rb = bridge.call(
+            "pipeline.rollbackRelease",
+            {"tag": "v1.0.0-preview.2", "projectId": "proj-a", "repo": "owner/repo-b"},
+        )
+        assert cross_rb["ok"] is False
+        unknown_proj_rb = bridge.call(
+            "pipeline.rollbackRelease",
+            {"tag": "v1.0.0-preview.2", "projectId": "proj-unknown", "repo": "owner/repo-a"},
+        )
+        assert unknown_proj_rb["ok"] is False
+        assert store.get_release_verification("owner/repo-a", "v1.0.0-preview.2")["smoke_status"] == "failed"
+        assert store.get_release_verification("owner/repo-b", "v1.0.0-preview.2")["smoke_status"] == "passed"
+
+        # 6. Legitimate scoped calls succeed and never affect the other project
+        ok_approve_a = bridge.call(
+            "pipeline.approveTask",
+            {"taskId": "t-a", "headSha": "sha_a", "projectId": "proj-a", "approvedBy": "owner"},
+        )
+        assert ok_approve_a["ok"] is True
+        assert store.get_task("t-a")["status"] == "APPROVED"
+        assert store.get_task("t-b")["status"] == "BLOCKED"
+
+        ok_rb_a = bridge.call(
+            "pipeline.rollbackRelease",
+            {"tag": "v1.0.0-preview.2", "projectId": "proj-a", "repo": "owner/repo-a"},
+        )
+        assert ok_rb_a["ok"] is True
+        assert (out_a / "app-a.zip").read_bytes() == b"repo-a-good-v1"
+        assert not (out_b / "app-a.zip").exists()
+        assert store.get_release_verification("owner/repo-a", "v1.0.0-preview.2")["smoke_status"] == "rolled_back"
+        assert store.get_release_verification("owner/repo-b", "v1.0.0-preview.2")["smoke_status"] == "passed"
+
+
+def test_smoke_test_resolves_relative_artifact_path_and_supports_builtin_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relative {artifact} paths must be resolved before cwd changes to temp dir, and builtin alias must work."""
+    import sys
+
+    dist_dir = tmp_path / "dist"
+    dist_dir.mkdir()
+    art = dist_dir / "app.apk"
+    art.write_text("artifact-ok", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    rel_mgr = ReleaseManager(FakeGitGh())
+    cmd = (
+        f'"{sys.executable}" -c '
+        '"import pathlib, sys; p = pathlib.Path(sys.argv[1]); '
+        'assert p.is_absolute() and p.is_file(), p; print(p.read_text())" '
+        '"{artifact}"'
+    )
+    res = rel_mgr.run_launch_smoke_test(
+        artifact_path=Path("dist/app.apk"),
+        tag="v1.0.0-preview.1",
+        smoke_command=cmd,
+        timeout_seconds=15,
+    )
+    assert res.passed is True
+    assert res.status == "passed"
+    assert "artifact-ok" in res.detail
+
+    # Both canonical built-in command and legacy alias route to desktop zip selftest (not custom subprocess)
+    bad_zip = tmp_path / "NightShift-windows.zip"
+    with zipfile.ZipFile(bad_zip, "w") as zf:
+        zf.writestr("README.txt", "no exe here")
+    for cmd_name in (DESKTOP_SELFTEST_SMOKE, "builtin:desktop-zip-selftest"):
+        r = rel_mgr.run_launch_smoke_test(
+            artifact_path=bad_zip,
+            tag="v1.0.0-preview.1",
+            smoke_command=cmd_name,
+        )
+        assert r.passed is False
+        assert r.status == "failed"
+        assert "NightShift.exe not found" in r.detail
+
+

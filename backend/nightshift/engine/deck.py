@@ -24,12 +24,12 @@ def generate_deck_data(
     proj_name = proj.get("name", project_id) if proj else project_id
 
     # 1. Inspect parked phases, blocked pipeline tasks, and failed release smoke tests for 'needs_you'
-    parked = store.list_parked()
+    parked = store.list_parked(project_id=project_id)
     needs_you: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
     proj_repo = str(proj.get("repo") or "").strip() if proj else ""
 
-    for task in store.list_tasks(status="BLOCKED"):
+    for task in store.list_tasks(status="BLOCKED", project_id=project_id):
         if len(needs_you) >= 3:
             break
         block_reason = str(task.get("block_reason") or "")
@@ -44,6 +44,7 @@ def generate_deck_data(
                 item: dict[str, Any] = {
                     "phase_id": phase_id,
                     "task_id": str(task["id"]),
+                    "project_id": project_id,
                     "head_sha": head_sha,
                     "risk_class": risk_class,
                     "headline": f"{risk_label}{pr_str} needs your approval before merge",
@@ -53,16 +54,21 @@ def generate_deck_data(
                 }
                 if pr_num is not None:
                     item["pr_number"] = int(pr_num)
+                if proj_repo:
+                    item["repo"] = proj_repo
             else:
                 item = {
                     "phase_id": phase_id,
                     "task_id": str(task["id"]),
+                    "project_id": project_id,
                     "risk_class": risk_class,
                     "headline": f"{risk_label}{pr_str} needs your approval before merge",
                     "detail": str(task.get("block_detail") or "Commit SHA is missing; inspect run logs before approving."),
                     "action": "Inspect runs",
                     "action_kind": "open_runs",
                 }
+                if proj_repo:
+                    item["repo"] = proj_repo
             needs_you.append(item)
             seen_ids.add(phase_id)
         elif block_reason in ("smoke_test_failed", "smoke_test_unavailable"):
@@ -96,30 +102,31 @@ def generate_deck_data(
             if proj_repo and tag:
                 seen_ids.add(f"release:{proj_repo}:{tag}")
 
-    for rel in store.list_release_verifications(repo=proj_repo or None, limit=5):
-        if len(needs_you) >= 3:
-            break
-        if str(rel.get("smoke_status") or "") == "failed":
-            rel_key = f"release:{rel['repo']}:{rel['tag']}"
-            if rel_key not in seen_ids:
-                prev_tag = str(rel.get("previous_good_tag") or "").strip()
-                detail = str(rel.get("smoke_detail") or "Post-release smoke test failed.")
-                if prev_tag:
-                    detail += f" Previous good release: {prev_tag}."
-                item = {
-                    "phase_id": rel_key,
-                    "project_id": project_id,
-                    "repo": str(rel["repo"]),
-                    "release_tag": str(rel["tag"]),
-                    "headline": f"Release {rel['tag']} failed launch smoke test",
-                    "detail": detail,
-                    "action": "Roll back release" if prev_tag else "Configure smoke test",
-                    "action_kind": "rollback_release" if prev_tag else "configure_smoke_test",
-                }
-                if prev_tag:
-                    item["previous_good_tag"] = prev_tag
-                needs_you.append(item)
-                seen_ids.add(rel_key)
+    if proj_repo:
+        for rel in store.list_release_verifications(repo=proj_repo, limit=5):
+            if len(needs_you) >= 3:
+                break
+            if str(rel.get("smoke_status") or "") == "failed":
+                rel_key = f"release:{rel['repo']}:{rel['tag']}"
+                if rel_key not in seen_ids:
+                    prev_tag = str(rel.get("previous_good_tag") or "").strip()
+                    detail = str(rel.get("smoke_detail") or "Post-release smoke test failed.")
+                    if prev_tag:
+                        detail += f" Previous good release: {prev_tag}."
+                    item = {
+                        "phase_id": rel_key,
+                        "project_id": project_id,
+                        "repo": str(rel["repo"]),
+                        "release_tag": str(rel["tag"]),
+                        "headline": f"Release {rel['tag']} failed launch smoke test",
+                        "detail": detail,
+                        "action": "Roll back release" if prev_tag else "Configure smoke test",
+                        "action_kind": "rollback_release" if prev_tag else "configure_smoke_test",
+                    }
+                    if prev_tag:
+                        item["previous_good_tag"] = prev_tag
+                    needs_you.append(item)
+                    seen_ids.add(rel_key)
 
     for p in parked:
         if len(needs_you) >= 3:
@@ -137,7 +144,7 @@ def generate_deck_data(
         seen_ids.add(pid)
 
     # 2. Phases status for 'done_tonight' and 'next'
-    all_phases = store.list_phases()
+    all_phases = store.list_phases(project_id=project_id)
     done_tonight: list[dict[str, Any]] = []
     upcoming: list[dict[str, Any]] = []
 

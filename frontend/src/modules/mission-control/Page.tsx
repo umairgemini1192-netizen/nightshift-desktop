@@ -295,6 +295,7 @@ export default function MissionControlPage() {
       await bridge.call("pipeline.approveTask", {
         taskId: pendingApproval.task_id,
         headSha: pendingApproval.head_sha,
+        projectId: pendingApproval.project_id ?? snapshot.activeProjectId ?? undefined,
         approvedBy: "owner",
         resume: true,
       });

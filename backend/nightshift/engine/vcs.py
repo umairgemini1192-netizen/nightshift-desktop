@@ -2126,15 +2126,16 @@ class FakeGitGh:
         files: list[Path],
         prerelease: bool = True,
     ) -> tuple[bool, str]:
-        if any(str(r.get("tag") or "") == tag for r in self.releases):
-            return False, f"Release tag '{tag}' already exists; overwriting tags is forbidden."
+        if any(str(r.get("repo") or repo) == repo and str(r.get("tag") or "") == tag for r in self.releases):
+            return False, f"Release tag '{tag}' already exists for '{repo}'; overwriting tags is forbidden."
         stored_bytes: dict[str, bytes] = {}
         for f in files:
             fp = Path(f)
             if fp.exists() and fp.is_file():
                 stored_bytes[fp.name] = fp.read_bytes()
-        self.release_asset_bytes[tag] = stored_bytes
+        self.release_asset_bytes[f"{repo}::{tag}"] = stored_bytes
         rel = {
+            "repo": repo,
             "tag": tag,
             "title": title,
             "notes": notes,
@@ -2151,28 +2152,28 @@ class FakeGitGh:
         repo: str,
         tag_prefix: str = "v1.0.0-preview.",
     ) -> str:
-        num = len(self.releases) + 1
+        num = sum(1 for r in self.releases if str(r.get("repo") or repo) == repo) + 1
         return f"{tag_prefix}{num}"
 
     def list_releases(self, repo: str) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.releases]
+        return [dict(r) for r in self.releases if str(r.get("repo") or repo) == repo]
 
     def append_release_warning(self, repo: str, tag: str, warning_text: str) -> tuple[bool, str]:
         for rel in self.releases:
-            if str(rel.get("tag") or "") == tag:
+            if str(rel.get("repo") or repo) == repo and str(rel.get("tag") or "") == tag:
                 body = str(rel.get("body") or rel.get("notes") or "")
                 if warning_text.strip() not in body:
                     updated = f"{body}\n\n{warning_text}".strip()
                     rel["body"] = updated
                     rel["notes"] = updated
                 return True, f"Appended warning to {tag}"
-        return False, f"Release {tag} not found"
+        return False, f"Release {tag} not found for {repo}"
 
     def download_release_assets(self, repo: str, tag: str, dest_dir: Path) -> list[Path]:
         dest_dir.mkdir(parents=True, exist_ok=True)
-        assets = self.release_asset_bytes.get(tag)
+        assets = self.release_asset_bytes.get(f"{repo}::{tag}")
         if not assets:
-            raise RuntimeError(f"No stored assets found for release {tag}")
+            raise RuntimeError(f"No stored assets found for release {repo}@{tag}")
         written: list[Path] = []
         for name, data in assets.items():
             out_p = dest_dir / name

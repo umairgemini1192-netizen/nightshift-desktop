@@ -21,6 +21,7 @@ from nightshift.runners.base import run_subprocess_with_timeout
 
 _CHECKSUM_LINE_RE = re.compile(r"^\s*([0-9a-fA-F]{64})\s+\*?(.+?)\s*$")
 DESKTOP_SELFTEST_SMOKE = "nightshift-desktop-selftest"
+DESKTOP_SELFTEST_SMOKE_ALIASES = frozenset({DESKTOP_SELFTEST_SMOKE, "builtin:desktop-zip-selftest"})
 
 
 def _utc_now() -> str:
@@ -233,36 +234,37 @@ class ReleaseManager:
                 command="",
             )
 
-        if not artifact_path.exists() or not artifact_path.is_file():
+        resolved_artifact = artifact_path.resolve()
+        if not resolved_artifact.exists() or not resolved_artifact.is_file():
             return SmokeTestResult(
                 passed=False,
                 status="unavailable",
-                detail=f"Release artifact '{artifact_path}' is missing and cannot be smoke-tested.",
+                detail=f"Release artifact '{resolved_artifact}' is missing and cannot be smoke-tested.",
                 command=cmd_spec,
             )
 
         if self._smoke_runner is not None:
-            return self._smoke_runner(cmd_spec, artifact_path, tag, timeout_seconds)
+            return self._smoke_runner(cmd_spec, resolved_artifact, tag, timeout_seconds)
 
         # Built-in Night-Shift Desktop zip smoke test (AGENT_PIPELINE §9.3)
-        if cmd_spec == DESKTOP_SELFTEST_SMOKE:
-            return self._run_desktop_zip_selftest(artifact_path, timeout_seconds=timeout_seconds)
+        if cmd_spec in DESKTOP_SELFTEST_SMOKE_ALIASES:
+            return self._run_desktop_zip_selftest(resolved_artifact, timeout_seconds=timeout_seconds)
 
         # Custom configured launch/smoke command (parsed as argv, never shell=True)
         tmp_dir = Path(tempfile.mkdtemp(prefix="nightshift-smoke-"))
         try:
             output_file = tmp_dir / "smoke-result.txt"
             extract_dir = tmp_dir / "extracted"
-            if artifact_path.suffix.lower() == ".zip":
+            if resolved_artifact.suffix.lower() == ".zip":
                 extract_dir.mkdir(parents=True, exist_ok=True)
                 try:
-                    with zipfile.ZipFile(artifact_path, "r") as zf:
+                    with zipfile.ZipFile(resolved_artifact, "r") as zf:
                         zf.extractall(extract_dir)
                 except Exception as exc:
                     return SmokeTestResult(
                         passed=False,
                         status="failed",
-                        detail=f"Could not extract release archive '{artifact_path.name}': {exc}",
+                        detail=f"Could not extract release archive '{resolved_artifact.name}': {exc}",
                         command=cmd_spec,
                     )
 
@@ -284,7 +286,7 @@ class ReleaseManager:
                 )
 
             substitutions = {
-                "{artifact}": str(artifact_path),
+                "{artifact}": str(resolved_artifact),
                 "{extract_dir}": str(extract_dir),
                 "{output_file}": str(output_file),
                 "{tag}": tag,
