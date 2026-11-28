@@ -654,3 +654,11 @@ def test_ci_watch_defers_split_only_to_merge_gate_but_blocks_relaxation(tmp_path
     assert res_relax.passed is False
     assert res_relax.block_reason == "diff_guard_failed"
 
+
+
+def test_governance_guard_rejects_changed_assertion_of_equal_count() -> None:
+    from nightshift.engine.pipeline_contracts import detect_python_assertion_relaxation
+
+    before = 'def test_value():\n    assert value == 42\n'
+    after = 'def test_value():\n    assert value is not None\n'
+    assert detect_python_assertion_relaxation('test_example.py', before, after)
