@@ -97,6 +97,69 @@ class BridgeAPI:
         """Attach the active pywebview window for frameless titlebar controls."""
         self._window = window
 
+    @staticmethod
+    def _extract_project_evidence_kwargs(p_data: dict[str, Any]) -> dict[str, Any]:
+        """Extract optional Phase 8d evidence configuration columns from a bridge/queue payload."""
+        out: dict[str, Any] = {}
+        if "required_ci_jobs" in p_data:
+            raw_jobs = p_data["required_ci_jobs"]
+            if raw_jobs is None:
+                out["required_ci_jobs_json"] = None
+            elif isinstance(raw_jobs, list):
+                out["required_ci_jobs_json"] = json.dumps([str(j) for j in raw_jobs])
+            elif isinstance(raw_jobs, str):
+                parsed = json.loads(raw_jobs)
+                if not isinstance(parsed, list):
+                    raise ValueError("required_ci_jobs must be a JSON array")
+                out["required_ci_jobs_json"] = json.dumps([str(j) for j in parsed])
+            else:
+                raise TypeError("required_ci_jobs must be a list, JSON array string, or null")
+        elif "required_ci_jobs_json" in p_data:
+            raw_json = p_data["required_ci_jobs_json"]
+            if raw_json is None or raw_json == "":
+                out["required_ci_jobs_json"] = None
+            else:
+                parsed = json.loads(str(raw_json))
+                if not isinstance(parsed, list):
+                    raise ValueError("required_ci_jobs_json must encode a JSON array")
+                out["required_ci_jobs_json"] = json.dumps([str(j) for j in parsed])
+
+        if "required_artifacts_by_job" in p_data:
+            raw_arts = p_data["required_artifacts_by_job"]
+            if raw_arts is None:
+                out["required_artifacts_by_job_json"] = "{}"
+            elif isinstance(raw_arts, dict):
+                out["required_artifacts_by_job_json"] = json.dumps(
+                    {str(k): [str(v) for v in vals] for k, vals in raw_arts.items() if isinstance(vals, list)}
+                )
+            elif isinstance(raw_arts, str):
+                parsed = json.loads(raw_arts)
+                if not isinstance(parsed, dict):
+                    raise ValueError("required_artifacts_by_job must be a JSON object")
+                out["required_artifacts_by_job_json"] = json.dumps(
+                    {str(k): [str(v) for v in vals] for k, vals in parsed.items() if isinstance(vals, list)}
+                )
+            else:
+                raise TypeError("required_artifacts_by_job must be a dict or JSON object string")
+        elif "required_artifacts_by_job_json" in p_data:
+            raw_json = p_data["required_artifacts_by_job_json"]
+            parsed = json.loads(str(raw_json or "{}"))
+            if not isinstance(parsed, dict):
+                raise ValueError("required_artifacts_by_job_json must encode a JSON object")
+            out["required_artifacts_by_job_json"] = json.dumps(
+                {str(k): [str(v) for v in vals] for k, vals in parsed.items() if isinstance(vals, list)}
+            )
+
+        if "min_gate_duration_seconds" in p_data and p_data["min_gate_duration_seconds"] is not None:
+            out["min_gate_duration_seconds"] = float(p_data["min_gate_duration_seconds"])
+        if "min_build_duration_seconds" in p_data and p_data["min_build_duration_seconds"] is not None:
+            out["min_build_duration_seconds"] = float(p_data["min_build_duration_seconds"])
+        if "screenshot_manifest_path" in p_data and p_data["screenshot_manifest_path"] is not None:
+            out["screenshot_manifest_path"] = str(p_data["screenshot_manifest_path"])
+        if "screenshot_job_name" in p_data and p_data["screenshot_job_name"] is not None:
+            out["screenshot_job_name"] = str(p_data["screenshot_job_name"])
+        return out
+
     def _enrich_phase_with_assignment(self, ph: dict[str, Any]) -> dict[str, Any]:
         assignment = self._store.get_phase_assignment(str(ph["id"]))
         item = dict(ph)
@@ -429,6 +492,7 @@ class BridgeAPI:
                     if existing and existing["plan_id"] != imported["plan"]["id"]:
                         return {"ok": False, "error": f"Phase ID {ph.id} belongs to another plan."}
                 proj = imported["project"]
+                evidence_kwargs = self._extract_project_evidence_kwargs(proj)
                 if not self._store.get_project(proj["id"]):
                     proj = self._store.create_project(
                         proj["id"],
@@ -438,6 +502,7 @@ class BridgeAPI:
                         build_rules=proj.get("build_rules", ""),
                         artifact_glob=proj.get("artifact_glob", "*.apk"),
                         output_dir=proj.get("output_dir", ""),
+                        **evidence_kwargs,
                     )
                 else:
                     updates: dict[str, Any] = {}
@@ -451,6 +516,7 @@ class BridgeAPI:
                         updates["artifact_glob"] = proj.get("artifact_glob", "*.apk")
                     if "desktop_apk_dir" in raw_cfg:
                         updates["output_dir"] = proj.get("output_dir", "")
+                    updates.update(evidence_kwargs)
                     proj = (
                         self._store.update_project(proj["id"], **updates)
                         if updates
@@ -1035,6 +1101,11 @@ class BridgeAPI:
             if not pid or not repo:
                 return {"ok": False, "error": "Project requires an ID and GitHub repository (owner/repo)."}
 
+            try:
+                evidence_kwargs = self._extract_project_evidence_kwargs(p_data)
+            except (ValueError, TypeError) as exc:
+                return {"ok": False, "error": f"Invalid evidence configuration: {exc}"}
+
             existing = self._store.get_project(pid)
             if existing:
                 updated = self._store.update_project(
@@ -1045,6 +1116,7 @@ class BridgeAPI:
                     build_rules=build_rules,
                     artifact_glob=artifact_glob,
                     output_dir=output_dir,
+                    **evidence_kwargs,
                 )
                 return {"ok": True, "data": updated}
             else:
@@ -1056,6 +1128,7 @@ class BridgeAPI:
                     build_rules=build_rules,
                     artifact_glob=artifact_glob,
                     output_dir=output_dir,
+                    **evidence_kwargs,
                 )
                 self._store.set_setting("onboarding.completed", "1")
                 return {"ok": True, "data": created}

@@ -180,7 +180,7 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
     repo = str(cfg.get("repo", "")).strip()
     project_id = repo or "imported-project"
 
-    project = {
+    project: dict[str, Any] = {
         "id": project_id,
         "name": str(cfg.get("name") or project_id),
         "repo": repo,
@@ -190,6 +190,22 @@ def import_queue_json(data_or_str: str | dict[str, Any]) -> dict[str, Any]:
         "build_rules": str(cfg.get("build_rules", "")),
         "artifact_glob": str(cfg.get("artifact_glob", "*.apk")),
     }
+    if "required_ci_jobs" in cfg:
+        project["required_ci_jobs"] = list(cfg["required_ci_jobs"]) if cfg["required_ci_jobs"] is not None else None
+    if "required_artifacts_by_job" in cfg and isinstance(cfg["required_artifacts_by_job"], dict):
+        project["required_artifacts_by_job"] = {
+            str(k): [str(v) for v in vals]
+            for k, vals in cfg["required_artifacts_by_job"].items()
+            if isinstance(vals, list)
+        }
+    if "min_gate_duration_seconds" in cfg and cfg["min_gate_duration_seconds"] is not None:
+        project["min_gate_duration_seconds"] = float(cfg["min_gate_duration_seconds"])
+    if "min_build_duration_seconds" in cfg and cfg["min_build_duration_seconds"] is not None:
+        project["min_build_duration_seconds"] = float(cfg["min_build_duration_seconds"])
+    if "screenshot_manifest_path" in cfg and cfg["screenshot_manifest_path"] is not None:
+        project["screenshot_manifest_path"] = str(cfg["screenshot_manifest_path"])
+    if "screenshot_job_name" in cfg and cfg["screenshot_job_name"] is not None:
+        project["screenshot_job_name"] = str(cfg["screenshot_job_name"])
 
     plan_id = str(cfg.get("plan_id") or f"plan_{project_id}")
     plan = {
@@ -299,7 +315,7 @@ def export_queue_json(
     desktop_apk_dir = str(project.get("output_dir") or project.get("output_folder") or project.get("desktop_apk_dir") or "")
     artifact_glob = str(project.get("artifact_glob") or "*.apk")
 
-    return {
+    exported: dict[str, Any] = {
         "repo": str(project.get("repo", "")),
         "local_repo": local_repo,
         "desktop_apk_dir": desktop_apk_dir,
@@ -312,6 +328,31 @@ def export_queue_json(
         "failover_ladders": dict(ladders or {}),
         "phases": serialized_phases,
     }
+    raw_req_jobs = project.get("required_ci_jobs")
+    if raw_req_jobs is None and project.get("required_ci_jobs_json"):
+        try:
+            raw_req_jobs = json.loads(str(project["required_ci_jobs_json"]))
+        except Exception:
+            raw_req_jobs = None
+    if isinstance(raw_req_jobs, list):
+        exported["required_ci_jobs"] = [str(j) for j in raw_req_jobs]
+    raw_req_arts = project.get("required_artifacts_by_job")
+    if raw_req_arts is None and project.get("required_artifacts_by_job_json"):
+        try:
+            raw_req_arts = json.loads(str(project["required_artifacts_by_job_json"]))
+        except Exception:
+            raw_req_arts = None
+    if isinstance(raw_req_arts, dict) and raw_req_arts:
+        exported["required_artifacts_by_job"] = raw_req_arts
+    if project.get("min_gate_duration_seconds") is not None:
+        exported["min_gate_duration_seconds"] = float(project["min_gate_duration_seconds"])
+    if project.get("min_build_duration_seconds") is not None:
+        exported["min_build_duration_seconds"] = float(project["min_build_duration_seconds"])
+    if project.get("screenshot_manifest_path"):
+        exported["screenshot_manifest_path"] = str(project["screenshot_manifest_path"])
+    if project.get("screenshot_job_name"):
+        exported["screenshot_job_name"] = str(project["screenshot_job_name"])
+    return exported
 
 
 def get_runnable_phases(
