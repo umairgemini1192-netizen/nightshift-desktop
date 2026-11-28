@@ -73,24 +73,31 @@ class TokenOptimizerService:
                 enabled = False
                 if not warning:
                     warning = "Catalogue entry only (disabled). Enable later if ccusage shows search is a top cost."
-            elif auto_disabled:
-                status = "auto_disabled"
             elif spec.isolation_gate_required and not iso_passed:
                 status = "isolation_blocked"
-                enabled = False
-            elif warning and not sha_ok:
-                status = "hash_mismatch"
-                enabled = False
-            elif enabled:
-                status = "enabled"
-                # Verify tool installation (P1 fix: ensure tools are installed before marking enabled)
-                if spec.name != "agy-fast":
-                    verify_res = self._manager.verify_installed(spec.name)
-                    if not verify_res.ok:
-                        warning = verify_res.warning or "Tool verification failed after enable"
-                        status = "hash_mismatch"
             else:
-                status = "disabled"
+                # The persisted switch and the state of the local artifact are separate facts.
+                # Always inspect the artifact, including when the switch is off.
+                result = self._manager.verify_installed(spec.name)
+                db_state = self._store.get_token_tool_state(spec.name) if self._store is not None else None
+                enabled = bool(db_state.get("enabled", 0)) if db_state else False
+                sha_ok = result.ok
+                if not result.ok:
+                    warning = result.warning
+                    if result.actual_sha256 and result.actual_sha256 != result.expected_sha256:
+                        status = "hash_mismatch"
+                    elif not self._manager.artifact_path(spec.name).exists():
+                        status = "not_installed"
+                    else:
+                        status = "disabled"
+                elif auto_disabled:
+                    status = "auto_disabled"
+                elif spec.isolation_gate_required and not iso_passed:
+                    status = "isolation_blocked"
+                elif enabled:
+                    status = "enabled"
+                else:
+                    status = "disabled"
 
             if warning and warning not in warnings and not spec.catalogue_only:
                 warnings.append(warning)
@@ -175,6 +182,13 @@ class TokenOptimizerService:
                 )
             )
         return self.get_state()
+
+    def install_tool(self, tool_name: str) -> dict[str, Any]:
+        """Install a pinned artifact and verify its checksum before it can be enabled."""
+        result = self._manager.ensure_installed(tool_name)
+        state = self.get_state()
+        state["installResult"] = {"ok": result.ok, "warning": result.warning}
+        return state
 
     def verify_tools(self) -> dict[str, Any]:
         """Verify SHA-256 hashes of all installed tools against tools.lock.json."""
@@ -275,6 +289,7 @@ class Module(ModuleBase):
                 str(args.get("tool", "")),
                 bool(args.get("enabled", False)),
             ),
+            "installTool": lambda args: self.service.install_tool(str(args.get("tool", ""))),
             "verifyTools": lambda _args: self.service.verify_tools(),
             "runIsolationProbe": lambda _args: self.service.run_isolation_probe(),
             "evaluateAb": lambda args: self.service.evaluate_ab(

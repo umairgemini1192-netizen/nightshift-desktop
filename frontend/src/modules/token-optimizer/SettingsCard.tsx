@@ -11,6 +11,8 @@ function statusBadgeProps(
       return { tone: "success", label: "Enabled" };
     case "auto_disabled":
       return { tone: "danger", label: "Auto-disabled" };
+    case "not_installed":
+      return { tone: "neutral", label: "Not installed" };
     case "hash_mismatch":
       return { tone: "danger", label: "SHA-256 mismatch" };
     case "isolation_blocked":
@@ -27,6 +29,7 @@ export function TokenOptimizerSettingsCard() {
   const pushToast = useAppStore((s) => s.pushToast);
 
   const [state, setState] = useState<TokenOptimizerState | null>(null);
+  const [installing, setInstalling] = useState<string | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [probing, setProbing] = useState(false);
   const [togglingTool, setTogglingTool] = useState<string | null>(null);
@@ -75,6 +78,23 @@ export function TokenOptimizerSettingsCard() {
       });
     } finally {
       setTogglingTool(null);
+    }
+  };
+
+  const handleInstall = async (tool: TokenOptimizerToolItem) => {
+    setInstalling(tool.name);
+    try {
+      const res = await bridge.call<TokenOptimizerState>("token_optimizer.installTool", { tool: tool.name });
+      setState(res);
+      pushToast({
+        title: res.installResult?.ok ? `${tool.displayName} installed` : `Could not install ${tool.displayName}`,
+        description: res.installResult?.warning || "The pinned download passed its checksum check.",
+        tone: res.installResult?.ok ? "success" : "danger",
+      });
+    } catch (err) {
+      pushToast({ title: `Could not install ${tool.displayName}`, description: String(err), tone: "danger" });
+    } finally {
+      setInstalling(null);
     }
   };
 
@@ -184,6 +204,7 @@ export function TokenOptimizerSettingsCard() {
               const toggleDisabled =
                 tool.catalogueOnly ||
                 tool.status === "hash_mismatch" ||
+                tool.status === "not_installed" ||
                 (tool.isolationGateRequired && !tool.isolationPassed) ||
                 togglingTool === tool.name;
 
@@ -234,6 +255,9 @@ export function TokenOptimizerSettingsCard() {
                       disabled={toggleDisabled}
                       onChange={(checked) => void handleToggle(tool, checked)}
                     />
+                    {tool.status === "not_installed" && (
+                      <Button size="sm" variant="secondary" loading={installing === tool.name} onClick={() => void handleInstall(tool)}>Install</Button>
+                    )}
                     {tool.isolationGateRequired && (
                       <Button
                         size="sm"

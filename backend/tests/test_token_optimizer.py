@@ -634,3 +634,29 @@ def test_backend_module_discovery_and_rpc_gates(tmp_path: Path) -> None:
     rm_resp = bridge.call("token_optimizer.setToolEnabled", {"tool": "repomix", "enabled": True})
     rm_tool = next(t for t in rm_resp["data"]["tools"] if t["name"] == "repomix")
     assert rm_tool["enabled"] is True
+
+
+def test_optimizer_reports_missing_and_mismatched_artifacts(tmp_path: Path) -> None:
+    from nightshift.modules.token_optimizer import TokenOptimizerService
+
+    content = b"pinned tool"
+    lock = _write_lockfile(tmp_path, {"example": {
+        "version": "1.0.0", "artifact": "tool.bin", "executable": "tool.bin",
+        "sha256": hashlib.sha256(content).hexdigest(), "url": "https://example.com/tool.bin",
+    }})
+    store = _make_store(tmp_path)
+    service = TokenOptimizerService(store, tools_root=tmp_path / "tools", lockfile_path=lock)
+    store.upsert_token_tool_state("example", enabled=True)
+    missing = service.get_state()["tools"][0]
+    assert missing["status"] == "not_installed"
+    assert missing["enabled"] is True  # the switch reflects persisted state
+    artifact = service.manager.artifact_path("example")
+    artifact.parent.mkdir(parents=True)
+    artifact.write_bytes(b"corrupt")
+    mismatch = service.get_state()["tools"][0]
+    assert mismatch["status"] == "hash_mismatch"
+    assert mismatch["enabled"] is False
+    artifact.write_bytes(content)
+    verified = service.get_state()["tools"][0]
+    assert verified["status"] == "disabled"
+    assert verified["sha256Verified"] is True

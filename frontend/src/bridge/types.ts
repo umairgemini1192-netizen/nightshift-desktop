@@ -325,6 +325,7 @@ export interface TokenOptimizerToolItem {
     | "auto_disabled"
     | "isolation_blocked"
     | "hash_mismatch"
+    | "not_installed"
     | "catalogue_only";
   warning: string;
   tokensSavedTonight: number;
@@ -334,6 +335,7 @@ export interface TokenOptimizerToolItem {
 }
 
 export interface TokenOptimizerState {
+  installResult?: { ok: boolean; warning: string };
   tools: TokenOptimizerToolItem[];
   totalTokensSaved: number;
   estimateLabel: string;
